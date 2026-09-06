@@ -124,26 +124,6 @@ On Windows, create the environment with `py -3.13 -m venv .venv` and activate
 it with `.venv\Scripts\Activate.ps1`. The final setup command installs the
 hardware-specific libraries, builds the bundled engines, and runs diagnostics.
 
-### Build a release locally
-
-osAi does not run automatic GitHub jobs. Build and test the universal wheel on
-your own computer with the native script:
-
-```sh
-# macOS
-bash releaseScripts/macos/build.sh
-
-# Debian or Ubuntu
-bash releaseScripts/linux/build.sh
-
-# Windows PowerShell or Command Prompt
-.\releaseScripts\windows\build-windows.cmd
-```
-
-The verified wheel and its SHA-256 file are written to `release-assets/` for
-manual upload. MLX and llama.cpp remain source-bundled and are compiled for the
-user's hardware by `scripts/setup_osai.py` during installation.
-
 ## Train
 
 `--data` must point to a directory containing `train.jsonl`. Optional
