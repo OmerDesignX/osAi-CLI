@@ -1,0 +1,13 @@
+.venv/
+sessions/*
+!sessions/.gitkeep
+build/
+dist/
+osCode-Models/*
+!osCode-Models/.gitkeep
+*.egg-info/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.DS_Store

@@ -1,0 +1,8 @@
+# MLX runtime for Apple-silicon macOS 14+ and Linux CPU hosts.
+certifi>=2024.8,<2027
+numpy>=1.26,<3
+safetensors>=0.5,<1
+tomli>=2,<3; python_version < "3.11"
+mlx>=0.32.2,<0.33; platform_system == "Darwin" and platform_machine == "arm64"
+mlx[cpu]>=0.32.2,<0.33; platform_system == "Linux"
+mlx-lm[train]>=0.32,<0.33; platform_system == "Darwin" or platform_system == "Linux"

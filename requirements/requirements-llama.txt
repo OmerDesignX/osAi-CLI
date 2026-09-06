@@ -1,0 +1,5 @@
+# llama.cpp-only runtime for Windows, Intel Macs, and macOS 12-13.
+certifi>=2024.8,<2027
+numpy>=1.26,<3
+safetensors>=0.5,<1
+tomli>=2,<3; python_version < "3.11"

@@ -1,0 +1,26 @@
+[training]
+model = "../osCode-Models/GGUF/small/osCode-GGUF-Small-Q4_K_M-00001-of-00002.gguf"
+format = "gguf"
+iterations = 3
+batch_size = 1
+max_seq_length = 64
+num_layers = 1
+rank = 2
+scale = 4.0
+dropout = 0.0
+learning_rate = 0.00001
+optimizer = "sgd"
+gguf_batch_size = 8
+gguf_threads = 2
+seed = 42
+grad_checkpoint = true
+grad_accumulation_steps = 1
+mask_prompt = true
+save_every = 1
+steps_per_report = 1
+steps_per_eval = 1
+val_batches = 1
+strict_base_hash = true
+merge_model = true
+materialize_base = true
+target_modules = ["mlp.down_proj"]

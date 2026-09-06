@@ -1,0 +1,6 @@
+certifi>=2024.8,<2027
+numpy>=2,<3
+safetensors>=0.5,<1
+tomli>=2,<3; python_version < "3.11"
+mlx[cuda13]>=0.32.2,<0.33
+mlx-lm[train,cuda13]>=0.32,<0.33

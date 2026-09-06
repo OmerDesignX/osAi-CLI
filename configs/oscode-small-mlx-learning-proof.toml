@@ -1,0 +1,31 @@
+[training]
+model = "../osCode-Models/MLX/osCode-MLX-Small-Q5"
+format = "mlx"
+iterations = 120
+batch_size = 1
+max_seq_length = 64
+num_layers = 1
+rank = 4
+scale = 8.0
+learning_rate = 0.0001
+optimizer = "adamw"
+seed = 914
+grad_checkpoint = true
+grad_accumulation_steps = 1
+mask_prompt = true
+save_every = 40
+steps_per_report = 10
+steps_per_eval = 20
+val_batches = 2
+strict_base_hash = true
+merge_model = true
+materialize_base = true
+target_modules = [
+  "self_attn.q_proj",
+  "self_attn.k_proj",
+  "self_attn.v_proj",
+  "self_attn.o_proj",
+  "mlp.gate_proj",
+  "mlp.up_proj",
+  "mlp.down_proj",
+]
