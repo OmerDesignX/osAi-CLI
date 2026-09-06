@@ -3,6 +3,7 @@ sessions/*
 !sessions/.gitkeep
 build/
 dist/
+release-assets/
 osCode-Models/*
 !osCode-Models/.gitkeep
 *.egg-info/

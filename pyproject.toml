@@ -8,11 +8,10 @@ version = "0.1.0"
 description = "osAi quantization-preserving training for MLX and GGUF language models"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"
-license = {text = "Apache-2.0"}
+license = "Apache-2.0"
 authors = [{name = "osCode Project"}]
 classifiers = [
   "Development Status :: 3 - Alpha",
-  "License :: OSI Approved :: Apache Software License",
   "Operating System :: MacOS :: MacOS X",
   "Operating System :: Microsoft :: Windows :: Windows 10",
   "Operating System :: Microsoft :: Windows :: Windows 11",
@@ -28,6 +27,7 @@ classifiers = [
 dependencies = [
   "certifi>=2024.8,<2027",
   "numpy>=1.26,<3",
+  "pyyaml>=5.1,<7",
   "safetensors>=0.5,<1",
   "tomli>=2,<3; python_version < '3.11'",
 ]

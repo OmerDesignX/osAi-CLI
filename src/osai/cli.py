@@ -189,6 +189,32 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--num-layers", type=int)
     train_parser.add_argument("--max-seq-length", type=int)
     train_parser.add_argument("--learning-rate", type=float)
+    train_parser.add_argument("--dropout", type=float)
+    train_parser.add_argument("--seed", type=int)
+    train_parser.add_argument(
+        "--gradient-accumulation-steps",
+        "--grad-accumulation-steps",
+        dest="grad_accumulation_steps",
+        type=int,
+    )
+    train_parser.add_argument(
+        "--gradient-checkpointing",
+        "--grad-checkpoint",
+        dest="grad_checkpoint",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="recompute MLX activations during backward to reduce memory (default: enabled)",
+    )
+    train_parser.add_argument("--save-every", type=int)
+    train_parser.add_argument("--steps-per-report", type=int)
+    train_parser.add_argument("--steps-per-eval", type=int)
+    train_parser.add_argument("--val-batches", type=int)
+    train_parser.add_argument(
+        "--mask-prompt",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="exclude prompt tokens from supervised loss (default: enabled)",
+    )
     optimizer = train_parser.add_mutually_exclusive_group()
     optimizer.add_argument(
         "--optimizer",
@@ -898,6 +924,13 @@ def _resolve_training_settings(
         ("num_layers", "num_layers"),
         ("max_seq_length", "max_seq_length"),
         ("learning_rate", "learning_rate"),
+        ("dropout", "dropout"),
+        ("seed", "seed"),
+        ("grad_accumulation_steps", "grad_accumulation_steps"),
+        ("save_every", "save_every"),
+        ("steps_per_report", "steps_per_report"),
+        ("steps_per_eval", "steps_per_eval"),
+        ("val_batches", "val_batches"),
         ("gguf_batch_size", "gguf_batch_size"),
         ("gguf_threads", "gguf_threads"),
     ):
@@ -906,6 +939,10 @@ def _resolve_training_settings(
             overrides[field_name] = value
     if args.target_modules:
         overrides["target_modules"] = tuple(args.target_modules)
+    if args.mask_prompt is not None:
+        overrides["mask_prompt"] = args.mask_prompt
+    if args.grad_checkpoint is not None:
+        overrides["grad_checkpoint"] = args.grad_checkpoint
     if args.merge_model is not None:
         overrides["merge_model"] = args.merge_model
     if args.materialize_base is not None:

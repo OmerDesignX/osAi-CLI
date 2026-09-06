@@ -25,11 +25,36 @@ def test_train_auto_settings_and_manual_overrides_parse():
             "2",
             "--rank",
             "6",
+            "--dropout",
+            "0.1",
+            "--seed",
+            "7",
+            "--gradient-accumulation-steps",
+            "4",
+            "--no-gradient-checkpointing",
+            "--save-every",
+            "5",
+            "--steps-per-report",
+            "2",
+            "--steps-per-eval",
+            "3",
+            "--val-batches",
+            "2",
+            "--no-mask-prompt",
         ]
     )
     assert args.auto_settings is True
     assert args.batch_size == 2
     assert args.rank == 6
+    assert args.dropout == 0.1
+    assert args.seed == 7
+    assert args.grad_accumulation_steps == 4
+    assert args.grad_checkpoint is False
+    assert args.save_every == 5
+    assert args.steps_per_report == 2
+    assert args.steps_per_eval == 3
+    assert args.val_batches == 2
+    assert args.mask_prompt is False
 
 
 def test_manual_training_defaults_are_resolved_after_parsing():
@@ -201,6 +226,12 @@ def test_manual_values_override_the_auto_profile(monkeypatch, tmp_path: Path):
             "2",
             "--rank",
             "6",
+            "--dropout",
+            "0.15",
+            "--gradient-accumulation-steps",
+            "3",
+            "--no-gradient-checkpointing",
+            "--no-mask-prompt",
         ]
     )
     inspection = ModelInspection(
@@ -228,3 +259,7 @@ def test_manual_values_override_the_auto_profile(monkeypatch, tmp_path: Path):
     assert resolved.batch_size == 2
     assert resolved.rank == 6
     assert resolved.max_seq_length == 64
+    assert resolved.dropout == 0.15
+    assert resolved.grad_accumulation_steps == 3
+    assert resolved.grad_checkpoint is False
+    assert resolved.mask_prompt is False

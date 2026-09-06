@@ -124,6 +124,26 @@ On Windows, create the environment with `py -3.13 -m venv .venv` and activate
 it with `.venv\Scripts\Activate.ps1`. The final setup command installs the
 hardware-specific libraries, builds the bundled engines, and runs diagnostics.
 
+### Build a release locally
+
+osAi does not run automatic GitHub jobs. Build and test the universal wheel on
+your own computer with the native script:
+
+```sh
+# macOS
+bash releaseScripts/macos/build.sh
+
+# Debian or Ubuntu
+bash releaseScripts/linux/build.sh
+
+# Windows PowerShell or Command Prompt
+.\releaseScripts\windows\build-windows.cmd
+```
+
+The verified wheel and its SHA-256 file are written to `release-assets/` for
+manual upload. MLX and llama.cpp remain source-bundled and are compiled for the
+user's hardware by `scripts/setup_osai.py` during installation.
+
 ## Train
 
 `--data` must point to a directory containing `train.jsonl`. Optional
@@ -380,6 +400,15 @@ directly to alignment.
 | `--num-layers N` | Number of final model layers to adapt. Default: `1`. |
 | `--max-seq-length N` | Maximum token sequence length. Default: `64`. |
 | `--learning-rate NUMBER` | Override the backend learning rate. |
+| `--dropout NUMBER` | MLX LoRA dropout in the range `[0, 1)`. Default: `0`. |
+| `--seed N` | Fine-tuning random seed. Default: `0`. |
+| `--gradient-accumulation-steps N` | MLX microbatches accumulated before each optimizer update. Default: `1`. |
+| `--gradient-checkpointing`, `--no-gradient-checkpointing` | Recompute MLX activations during backward to reduce memory use, or retain them for speed. Enabled by default. |
+| `--save-every N` | Save the MLX adapter every N updates. Default: `10`. |
+| `--steps-per-report N` | Report MLX training metrics every N updates. Default: `1`. |
+| `--steps-per-eval N` | Evaluate the MLX adapter every N updates. Default: `10`. |
+| `--val-batches N` | MLX validation batches; `-1` uses the complete validation split. Default: `1`. |
+| `--mask-prompt`, `--no-mask-prompt` | Include or exclude prompt tokens from supervised loss. Masking is enabled by default. |
 | `--optimizer auto\|sgd\|adamw` | Optimizer for fine-tuning and alignment. `auto` uses AdamW with MLX and SGD with llama.cpp. |
 | `--gguf-batch-size N` | GGUF backpropagation microbatch size. Default: `8`. |
 | `--gguf-threads N` | CPU threads used by GGUF training and fusion validation. Default: `2`. |
@@ -433,3 +462,61 @@ directly to alignment.
 | `prove-learning` | `--context N` | Inference context size. Default: `128`. |
 | `prove-learning` | `--python PATH` | Python executable containing MLX. |
 | `prove-learning` | `--accelerator auto\|metal\|mps\|cuda\|vulkan\|cpu` | Probe compute backend. Default: `auto`. |
+
+### Advanced command examples
+
+Fine-tune with explicit training controls:
+
+```sh
+osai train \
+  --tier small \
+  --engine auto \
+  --accelerator auto \
+  --stage fine-tuning \
+  --data /path/to/fine-tuning-data \
+  --no-auto-settings \
+  --optimizer sgd \
+  --iterations 100 \
+  --batch-size 1 \
+  --gradient-accumulation-steps 8 \
+  --gradient-checkpointing \
+  --max-seq-length 512 \
+  --learning-rate 0.0001 \
+  --rank 8 \
+  --scale 16 \
+  --num-layers 8 \
+  --dropout 0.05 \
+  --seed 42 \
+  --save-every 20 \
+  --steps-per-report 2 \
+  --steps-per-eval 20 \
+  --val-batches 4 \
+  --target-module self_attn.q_proj \
+  --target-module self_attn.v_proj
+```
+
+Fine-tune and then align with local rollouts:
+
+```sh
+osai train \
+  --tier small \
+  --engine auto \
+  --stage fine-tune-align \
+  --data /path/to/fine-tuning-data \
+  --alignment-data /path/to/preference-data \
+  --alignment-type grpo \
+  --auto-settings \
+  --optimizer auto \
+  --iterations 100 \
+  --alignment-iterations 40 \
+  --alignment-learning-rate 0.00001 \
+  --alignment-beta 0.1 \
+  --ppo-clip 0.2 \
+  --live-rollouts \
+  --rollouts-per-prompt 4 \
+  --rollout-max-tokens 128 \
+  --rollout-temperature 0.8 \
+  --rollout-top-p 0.95 \
+  --rollout-seed 42 \
+  --multi-gpu auto
+```
