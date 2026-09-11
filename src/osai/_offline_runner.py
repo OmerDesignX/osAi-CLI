@@ -16,14 +16,18 @@ def main() -> int:
     if len(sys.argv) < 2 or sys.argv[1] not in {
         "mlx_lm",
         "probe-mlx",
+        "probe-mlx-vlm",
         "align-mlx",
         "rollout-mlx",
         "verify-mlx-fusion",
+        "train-mlx-vlm",
+        "verify-mlx-vlm-fusion",
     }:
         print(
             "usage: python -m osai._offline_runner "
-            "{probe-mlx|align-mlx CONFIG|rollout-mlx CONFIG|"
+            "{probe-mlx|probe-mlx-vlm|align-mlx CONFIG|rollout-mlx CONFIG|"
             "verify-mlx-fusion BASE ADAPTER MERGED|"
+            "train-mlx-vlm CONFIG|verify-mlx-vlm-fusion MODEL|"
             "mlx_lm [args...]}",
             file=sys.stderr,
         )
@@ -37,6 +41,21 @@ def main() -> int:
             return 2
         report = _configure_mlx()
         import mlx_lm  # noqa: F401
+
+        print(json.dumps(report, sort_keys=True))
+        return 0
+
+    if sys.argv[1] == "probe-mlx-vlm":
+        if len(sys.argv) != 2:
+            print("probe-mlx-vlm accepts no arguments", file=sys.stderr)
+            return 2
+        report = _configure_mlx()
+        import cv2  # noqa: F401
+        import miniaudio  # noqa: F401
+        import mlx_vlm  # noqa: F401
+        import torch  # noqa: F401
+        import torchvision  # noqa: F401
+        from PIL import Image  # noqa: F401
 
         print(json.dumps(report, sort_keys=True))
         return 0
@@ -73,6 +92,17 @@ def main() -> int:
         from ._mlx_fusion_verifier import run
 
         return run(sys.argv[2], sys.argv[3], sys.argv[4])
+
+    if sys.argv[1] in {"train-mlx-vlm", "verify-mlx-vlm-fusion"}:
+        if len(sys.argv) != 3:
+            print(f"{sys.argv[1]} requires one config path", file=sys.stderr)
+            return 2
+        report = _configure_mlx()
+        if not report["usable"]:
+            raise DependencyError(str(report["reason"]))
+        from ._mlx_vlm_runner import run, verify
+
+        return run(sys.argv[2]) if sys.argv[1] == "train-mlx-vlm" else verify(sys.argv[2])
 
     module = sys.argv[1]
     report = _configure_mlx()

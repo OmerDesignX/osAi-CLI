@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from .backends.mlx import MlxBackend
+from .backends.mlx_vlm import MlxVlmBackend
 from .config import ModelFormat
 from .errors import ConfigurationError, DependencyError, TrainingError, VerificationError
 from .formats import ModelInspection, inspect_model
@@ -50,6 +51,7 @@ def merge_mlx_model(
     *,
     python: str | Path | None = None,
     accelerator: str | Accelerator = Accelerator.AUTO,
+    multimodal: bool = False,
 ) -> MergedModelResult:
     if base.format is not ModelFormat.MLX:
         raise ConfigurationError("MLX merge requires an MLX base")
@@ -57,7 +59,11 @@ def merge_mlx_model(
     destination = layout.merged / "mlx"
     _require_new_destination(destination)
     stage = Path(tempfile.mkdtemp(prefix="mlx-merge-", dir=layout.work)) / "model"
-    backend = MlxBackend(python=python, accelerator=accelerator)
+    backend = (
+        MlxVlmBackend(python=python, accelerator=accelerator)
+        if multimodal
+        else MlxBackend(python=python, accelerator=accelerator)
+    )
     validation_log = layout.logs / "validate-merged-mlx.log"
     try:
         backend.preflight()

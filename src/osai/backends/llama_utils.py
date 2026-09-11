@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
 
+from ..dataset import normalize_sft_example, normalized_record_text
 from ..errors import ConfigurationError, DependencyError, TrainingError, VerificationError
 from ..formats import ModelInspection
 from ..hardware import Accelerator
@@ -183,20 +184,16 @@ def _write_corpus(
     record_separator: str = "\n\n",
 ) -> Path:
     sections: list[str] = []
-    with source.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            record = json.loads(line)
-            if isinstance(record.get("messages"), list):
-                sections.append(
-                    "\n".join(
-                        f"{message['role']}: {message['content']}"
-                        for message in record["messages"]
-                    )
-                )
-            elif isinstance(record.get("text"), str):
-                sections.append(record["text"])
-            else:
-                sections.append(f"user: {record['prompt']}\nassistant: {record['completion']}")
+    with source.open("r", encoding="utf-8-sig") as handle:
+        for line_number, line in enumerate(handle, 1):
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ConfigurationError(
+                    f"invalid JSON at {source}:{line_number}: {exc.msg}"
+                ) from exc
+            normalized = normalize_sft_example(record, source, line_number)
+            sections.append(normalized_record_text(normalized.record))
     corpus = record_separator.join(sections).strip() + "\n"
     minimum_characters = context * 16
     if repeat_to_minimum and len(corpus) < minimum_characters:

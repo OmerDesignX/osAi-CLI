@@ -68,9 +68,11 @@ def test_gguf_fusion_keeps_split_base_and_adapter_bytes(tmp_path: Path):
     first = tmp_path / "base-00001-of-00002.gguf"
     second = tmp_path / "base-00002-of-00002.gguf"
     adapter = tmp_path / "adapter.gguf"
+    projector = tmp_path / "mmproj-base.gguf"
     first.write_bytes(b"GGUF-first")
     second.write_bytes(b"GGUF-second")
     adapter.write_bytes(b"GGUF-residual")
+    projector.write_bytes(b"GGUF-projector")
 
     created = create_gguf_fusion_bundle(
         first, (first, second), adapter, tmp_path / "merged"
@@ -83,9 +85,12 @@ def test_gguf_fusion_keeps_split_base_and_adapter_bytes(tmp_path: Path):
         second.read_bytes(),
     ]
     assert resolved.adapter.read_bytes() == adapter.read_bytes()
+    assert len(resolved.projectors) == 1
+    assert resolved.projectors[0].read_bytes() == projector.read_bytes()
     manifest = json.loads(resolved.manifest.read_text(encoding="utf-8"))
     assert manifest["kind"] == GGUF_FUSION_KIND
     assert manifest["requires_full_precision_intermediate"] is False
+    assert manifest["projectors"] == ["model/mmproj-base.gguf"]
 
 
 def test_gguf_fusion_rejects_path_traversal(tmp_path: Path):

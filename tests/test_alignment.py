@@ -35,6 +35,127 @@ def test_auto_alignment_chooses_ppo_for_reward_rows(tmp_path: Path):
     assert dataset.alignment_type is AlignmentType.PPO
 
 
+def test_conversational_preference_with_explicit_prompt(tmp_path: Path):
+    write_rows(
+        tmp_path / "conversational",
+        [
+            {
+                "prompt": [
+                    {"role": "system", "content": "Be concise."},
+                    {"role": "user", "content": "Capital of France?"},
+                ],
+                "chosen": [{"role": "assistant", "content": "Paris."}],
+                "rejected": [{"role": "assistant", "content": "London."}],
+            }
+        ],
+    )
+    example = load_alignment_dataset(tmp_path / "conversational").examples[0]
+    assert example.prompt == "system: Be concise.\nuser: Capital of France?"
+    assert example.chosen == "Paris."
+    assert example.rejected == "London."
+
+
+def test_implicit_conversational_preference_extracts_shared_prompt(tmp_path: Path):
+    shared = [{"role": "user", "content": "Capital of France?"}]
+    write_rows(
+        tmp_path / "implicit",
+        [
+            {
+                "chosen": [*shared, {"role": "assistant", "content": "Paris."}],
+                "rejected": [*shared, {"role": "assistant", "content": "London."}],
+            }
+        ],
+    )
+    example = load_alignment_dataset(tmp_path / "implicit").examples[0]
+    assert example.prompt == "user: Capital of France?"
+    assert example.chosen == "Paris."
+    assert example.rejected == "London."
+
+
+def test_anthropic_transcript_preference_extracts_last_assistant_turn(tmp_path: Path):
+    write_rows(
+        tmp_path / "hh",
+        [
+            {
+                "chosen": "\n\nHuman: Capital?\n\nAssistant: Paris.",
+                "rejected": "\n\nHuman: Capital?\n\nAssistant: London.",
+            }
+        ],
+    )
+    example = load_alignment_dataset(tmp_path / "hh").examples[0]
+    assert example.prompt.endswith("Assistant:")
+    assert example.chosen == "Paris."
+    assert example.rejected == "London."
+
+
+@pytest.mark.parametrize(
+    ("row", "chosen", "rejected"),
+    [
+        (
+            {"query": "p", "preferred": "yes", "non_preferred": "no"},
+            "yes",
+            "no",
+        ),
+        (
+            {"question": "p", "winner": "yes", "loser": "no"},
+            "yes",
+            "no",
+        ),
+        (
+            {"prompt": "p", "response_j": "yes", "response_k": "no", "label": 1},
+            "yes",
+            "no",
+        ),
+        (
+            {"prompt": "p", "response_j": "no", "response_k": "yes", "label": "k"},
+            "yes",
+            "no",
+        ),
+    ],
+)
+def test_common_preference_aliases(tmp_path: Path, row: dict, chosen: str, rejected: str):
+    write_rows(tmp_path / "aliases", [row])
+    example = load_alignment_dataset(tmp_path / "aliases").examples[0]
+    assert example.chosen == chosen
+    assert example.rejected == rejected
+
+
+@pytest.mark.parametrize(
+    ("label", "reward"),
+    [
+        (True, 1.0),
+        (False, -1.0),
+        ("desirable", 1.0),
+        ("thumbs_down", -1.0),
+    ],
+)
+def test_kto_unpaired_completion_labels(tmp_path: Path, label, reward: float):
+    write_rows(
+        tmp_path / "kto-label",
+        [{"prompt": "p", "completion": "answer", "label": label}],
+    )
+    example = load_alignment_dataset(tmp_path / "kto-label", "kto").examples[0]
+    assert example.response == "answer"
+    assert example.reward == reward
+
+
+def test_scored_response_aliases(tmp_path: Path):
+    write_rows(tmp_path / "score", [{"question": "p", "answer": "a", "score": 0.75}])
+    example = load_alignment_dataset(tmp_path / "score", "ppo").examples[0]
+    assert example.prompt == "p"
+    assert example.response == "a"
+    assert example.reward == 0.75
+
+
+def test_alignment_media_is_rejected_instead_of_ignored(tmp_path: Path):
+    write_rows(
+        tmp_path / "media",
+        [{"prompt": "p", "chosen": "yes", "rejected": "no", "image": "x.png"}],
+    )
+    with pytest.raises(ConfigurationError, match="contains media fields"):
+        load_alignment_dataset(tmp_path / "media")
+
+
 @pytest.mark.parametrize(
     "method",
     [

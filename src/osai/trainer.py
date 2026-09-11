@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .backends.mlx import MlxBackend
+from .backends.mlx_vlm import MlxVlmBackend
 from .config import ModelFormat, TrainingConfig
 from .dataset import validate_dataset
 from .errors import ConfigurationError, TrainingError, VerificationError
@@ -17,6 +18,7 @@ from .gguf_adapter import GgufAdapterResult, convert_mlx_adapter
 from .hardware import Accelerator
 from .io import FileFingerprint, OutputLock, atomic_json, fingerprint
 from .merge import MergedModelResult, merge_gguf_model, merge_mlx_model
+from .multimodal import require_model_modalities
 from .session import SessionLayout, publish_base_adapter_bundle, record_dataset
 from .system import doctor, physical_memory_bytes
 
@@ -62,6 +64,12 @@ def train(
             if config.effective_format is ModelFormat.GGUF:
                 assert_compatible(training_inspection, target_inspection)
             dataset = validate_dataset(config.data)
+            multimodal = bool(set(dataset.modalities) - {"text"})
+            capabilities = (
+                require_model_modalities(dataset, config.training_model)
+                if multimodal
+                else None
+            )
             record_dataset(layout, dataset)
             _memory_guard(training_inspection)
 
@@ -76,13 +84,19 @@ def train(
                     "training_model": training_inspection.as_dict(),
                     "target_model": target_inspection.as_dict(),
                     "dataset": asdict(dataset),
+                    "multimodal_model": capabilities.as_dict() if capabilities else None,
                     "base_fingerprints_before": [asdict(item) for item in before],
                 }
             )
             manifest["dataset"]["path"] = str(dataset.path)
             atomic_json(manifest_path, manifest)
 
-            mlx_result = MlxBackend(python=python, accelerator=mlx_accelerator).train(config)
+            backend = (
+                MlxVlmBackend(python=python, accelerator=mlx_accelerator)
+                if multimodal
+                else MlxBackend(python=python, accelerator=mlx_accelerator)
+            )
+            mlx_result = backend.train(config)
             gguf_result: GgufAdapterResult | None = None
             if config.effective_format is ModelFormat.GGUF:
                 gguf_result = convert_mlx_adapter(
@@ -131,6 +145,7 @@ def train(
                             layout,
                             python=python,
                             accelerator=mlx_accelerator,
+                            multimodal=multimodal,
                         )
                     else:
                         assert gguf_result is not None

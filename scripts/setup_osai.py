@@ -311,6 +311,17 @@ def _setup_commands(
                 {},
             )
         )
+        commands.append(
+            (
+                pip_install(
+                    "--no-deps",
+                    "--no-build-isolation",
+                    "-e",
+                    str(PROJECT_ROOT / "vendor" / "mlx-vlm"),
+                ),
+                {},
+            )
+        )
     install_arguments = ["--no-deps", "--force-reinstall"]
     if install_target == PROJECT_ROOT:
         install_arguments.append("--no-build-isolation")
@@ -383,7 +394,7 @@ def _require_vendored_sources(
     plan: SetupPlan, skip_mlx_build: bool, skip_llama_build: bool
 ) -> None:
     if plan.mlx_accelerator is not None and not skip_mlx_build:
-        for name in ("mlx", "mlx-lm"):
+        for name in ("mlx", "mlx-lm", "mlx-vlm"):
             source = PROJECT_ROOT / "vendor" / name
             if not source.is_dir():
                 raise SetupError(f"missing bundled source directory: {source}")

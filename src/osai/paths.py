@@ -29,6 +29,10 @@ def mlx_lm_root() -> Path:
     return project_root() / "vendor" / "mlx-lm"
 
 
+def mlx_vlm_root() -> Path:
+    return project_root() / "vendor" / "mlx-vlm"
+
+
 def llama_binary(name: str) -> Path | None:
     root = llama_cpp_root()
     suffix = ".exe" if os.name == "nt" else ""

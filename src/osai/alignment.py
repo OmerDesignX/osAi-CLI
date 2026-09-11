@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import json
 import math
+import os
+import re
 from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from .dataset import conversation_text, normalize_conversation, value_as_text
 from .errors import ConfigurationError
 
 _PROBABILITY_EPSILON = 1e-4
@@ -384,15 +387,45 @@ def example_as_dict(example: AlignmentExample) -> dict[str, Any]:
 def _parse_example(item: Any, path: Path, line: int) -> tuple[AlignmentExample, str]:
     if not isinstance(item, dict):
         raise ConfigurationError(f"expected an alignment JSON object at {path}:{line}")
-    prompt = item.get("prompt")
-    if not isinstance(prompt, str) or not prompt.strip():
-        raise ConfigurationError(f"alignment record needs a non-empty prompt at {path}:{line}")
-    chosen = item.get("chosen")
-    rejected = item.get("rejected")
-    if all(isinstance(value, str) and value.strip() for value in (chosen, rejected)):
+    _reject_alignment_media(item, path, line)
+    prompt_value = _first_present(item, ("prompt", "question", "query", "instruction"))
+    chosen_value = _first_present(item, ("chosen", "preferred", "accepted", "winner"))
+    rejected_value = _first_present(
+        item, ("rejected", "non_preferred", "dispreferred", "unpreferred", "loser")
+    )
+
+    if chosen_value is None and rejected_value is None:
+        ranked = _ranked_pair(item)
+        if ranked is not None:
+            chosen_value, rejected_value = ranked
+
+    if chosen_value is not None and rejected_value is not None:
+        if prompt_value is None:
+            prompt, chosen, rejected = _implicit_preference(
+                chosen_value, rejected_value, path, line
+            )
+        else:
+            prompt = value_as_text(prompt_value, path, line, "prompt")
+            chosen = value_as_text(
+                chosen_value, path, line, "chosen", response=True
+            )
+            rejected = value_as_text(
+                rejected_value, path, line, "rejected", response=True
+            )
         return AlignmentExample(prompt, chosen=chosen, rejected=rejected), "preference"
-    response = item.get("response")
-    reward = item.get("reward")
+
+    if prompt_value is None:
+        raise ConfigurationError(f"alignment record needs a non-empty prompt at {path}:{line}")
+    prompt = value_as_text(prompt_value, path, line, "prompt")
+    response_value = _first_present(item, ("response", "completion", "answer", "output"))
+    response = (
+        value_as_text(response_value, path, line, "response", response=True)
+        if response_value is not None
+        else None
+    )
+    reward = _first_present(item, ("reward", "score", "value"))
+    if reward is None and "label" in item:
+        reward = _feedback_reward(item["label"], path, line)
     old_logprob = item.get("old_logprob")
     if (
         isinstance(response, str)
@@ -419,9 +452,142 @@ def _parse_example(item: Any, path: Path, line: int) -> tuple[AlignmentExample, 
             "reward",
         )
     raise ConfigurationError(
-        f"alignment record must contain prompt/chosen/rejected or "
-        f"prompt/response/reward at {path}:{line}"
+        "alignment record must contain a standard or conversational preference pair, "
+        "prompt/response/reward, or prompt/completion/label at "
+        f"{path}:{line}"
     )
+
+
+def _first_present(item: dict[str, Any], keys: tuple[str, ...]) -> Any:
+    for key in keys:
+        if key in item and item[key] is not None:
+            return item[key]
+    return None
+
+
+def _ranked_pair(item: dict[str, Any]) -> tuple[Any, Any] | None:
+    if "response_j" not in item or "response_k" not in item or "label" not in item:
+        return None
+    label = item["label"]
+    if isinstance(label, (str, int, bool)) and label in {
+        1,
+        "1",
+        "j",
+        "J",
+        "response_j",
+    }:
+        return item["response_j"], item["response_k"]
+    if isinstance(label, (str, int, bool)) and label in {
+        0,
+        "0",
+        "k",
+        "K",
+        "response_k",
+    }:
+        return item["response_k"], item["response_j"]
+    return None
+
+
+def _feedback_reward(value: Any, path: Path, line: int) -> float:
+    if isinstance(value, bool):
+        return 1.0 if value else -1.0
+    if (
+        isinstance(value, (int, float))
+        and math.isfinite(float(value))
+        and float(value) in {0.0, 1.0}
+    ):
+        return 1.0 if float(value) == 1.0 else -1.0
+    if isinstance(value, str):
+        normalized = value.strip().casefold().replace("-", "_").replace(" ", "_")
+        if normalized in {
+            "1",
+            "true",
+            "chosen",
+            "desirable",
+            "good",
+            "like",
+            "liked",
+            "positive",
+            "preferred",
+            "thumbs_up",
+        }:
+            return 1.0
+        if normalized in {
+            "0",
+            "false",
+            "bad",
+            "dislike",
+            "disliked",
+            "negative",
+            "rejected",
+            "undesirable",
+            "thumbs_down",
+        }:
+            return -1.0
+    raise ConfigurationError(
+        f"binary feedback label must identify desirable or undesirable at {path}:{line}"
+    )
+
+
+def _implicit_preference(
+    chosen_value: Any, rejected_value: Any, path: Path, line: int
+) -> tuple[str, str, str]:
+    if isinstance(chosen_value, list) and isinstance(rejected_value, list):
+        chosen_messages, chosen_modalities = normalize_conversation(
+            chosen_value, path, line, "chosen"
+        )
+        rejected_messages, rejected_modalities = normalize_conversation(
+            rejected_value, path, line, "rejected"
+        )
+        media = sorted((set(chosen_modalities) | set(rejected_modalities)) - {"text"})
+        if media:
+            raise ConfigurationError(
+                f"alignment preference contains {', '.join(media)} media at {path}:{line}; "
+                "the current alignment optimizers require language-model text"
+            )
+        common = 0
+        for left, right in zip(chosen_messages, rejected_messages, strict=False):
+            if left != right:
+                break
+            common += 1
+        if common < 1 or common == len(chosen_messages) or common == len(rejected_messages):
+            raise ConfigurationError(
+                f"implicit conversational preference needs a shared prompt at {path}:{line}"
+            )
+        prompt = conversation_text(chosen_messages[:common])
+        chosen = conversation_text(chosen_messages[common:], response=True)
+        rejected = conversation_text(rejected_messages[common:], response=True)
+        if prompt and chosen and rejected:
+            return prompt, chosen, rejected
+
+    if isinstance(chosen_value, str) and isinstance(rejected_value, str):
+        chosen = chosen_value.strip()
+        rejected = rejected_value.strip()
+        common = os.path.commonprefix((chosen, rejected))
+        markers = tuple(re.finditer(r"(?:\n\s*)?(?:Assistant|assistant|GPT|gpt)\s*:\s*", common))
+        if markers:
+            boundary = markers[-1].end()
+            prompt = chosen[:boundary].strip()
+            chosen_response = chosen[boundary:].strip()
+            rejected_response = rejected[boundary:].strip()
+            if prompt and chosen_response and rejected_response:
+                return prompt, chosen_response, rejected_response
+    raise ConfigurationError(
+        f"implicit preference needs a shared conversational prompt at {path}:{line}"
+    )
+
+
+def _reject_alignment_media(item: dict[str, Any], path: Path, line: int) -> None:
+    media_keys = sorted(
+        key
+        for key in ("image", "images", "audio", "audios", "video", "videos")
+        if item.get(key) is not None
+    )
+    if media_keys:
+        raise ConfigurationError(
+            f"alignment row contains media fields {', '.join(media_keys)} at {path}:{line}; "
+            "the current alignment optimizers require language-model text"
+        )
 
 
 def _log_sigmoid(value: float) -> float:

@@ -21,7 +21,9 @@ from .errors import DependencyError, VerificationError
 from .formats import ModelInspection
 from .paths import llama_cpp_root
 
-_ADAPTER_KEY = re.compile(r"^(?P<module>.+)\.lora_(?P<side>[ab])$")
+_ADAPTER_KEY = re.compile(
+    r"^(?P<module>.+?)(?:\.lora_(?P<mlx_side>[ab])|\.(?P<vlm_side>[AB]))$"
+)
 _SAFE_MODULE = re.compile(
     r"^(?:language_model\.)?model\.layers\.\d+\."
     r"(?:self_attn\.(?:q_proj|k_proj|v_proj|o_proj)|"
@@ -62,9 +64,11 @@ def convert_mlx_adapter(
         adapter_config = json.loads(config_path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise VerificationError(f"invalid MLX adapter config: {exc}") from exc
-    lora = adapter_config.get("lora_parameters") or {}
+    lora = adapter_config.get("lora_parameters") or adapter_config
     rank = int(lora.get("rank", 0))
-    mlx_scale = float(lora.get("scale", 0))
+    mlx_scale = float(
+        lora.get("scale", float(lora.get("alpha", 0)) / rank if rank else 0)
+    )
     if rank < 1 or mlx_scale <= 0:
         raise VerificationError("adapter config has invalid rank or scale")
     # PEFT/llama.cpp applies alpha/rank. MLX LM applies `scale` directly.
@@ -82,7 +86,8 @@ def convert_mlx_adapter(
         if not _SAFE_MODULE.match(module):
             unexpected.append(name)
             continue
-        pairs.setdefault(module, {})[match.group("side")] = tensor
+        side = match.group("mlx_side") or str(match.group("vlm_side")).lower()
+        pairs.setdefault(module, {})[side] = tensor
     if unexpected:
         raise VerificationError(
             "GGUF export refuses tensors requiring architecture-specific transforms: "

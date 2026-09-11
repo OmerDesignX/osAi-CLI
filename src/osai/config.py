@@ -53,6 +53,11 @@ class TrainingConfig:
     rank: int = 4
     scale: float = 8.0
     dropout: float = 0.0
+    image_width: int | None = None
+    image_height: int | None = None
+    video_fps: float = 2.0
+    video_max_frames: int = 32
+    assistant_token_id: int | None = None
     learning_rate: float = 1e-5
     optimizer: str = "auto"
     gguf_batch_size: int = 8
@@ -120,6 +125,18 @@ class TrainingConfig:
             raise ConfigurationError("dropout must be in [0, 1)")
         if self.learning_rate <= 0:
             raise ConfigurationError("learning_rate must be positive")
+        if (self.image_width is None) != (self.image_height is None):
+            raise ConfigurationError("image_width and image_height must be set together")
+        if self.image_width is not None and (
+            self.image_width < 16 or self.image_height is None or self.image_height < 16
+        ):
+            raise ConfigurationError("image dimensions must each be at least 16 pixels")
+        if self.video_fps <= 0:
+            raise ConfigurationError("video_fps must be positive")
+        if self.video_max_frames < 2:
+            raise ConfigurationError("video_max_frames must be at least 2")
+        if self.assistant_token_id is not None and self.assistant_token_id < 0:
+            raise ConfigurationError("assistant_token_id cannot be negative")
         if self.scale <= 0:
             raise ConfigurationError("scale must be positive")
         if self.optimizer not in {"auto", "adam", "adamw", "sgd", "adafactor"}:

@@ -13,7 +13,7 @@ from typing import Any
 from .config import ModelFormat
 from .dataset import DatasetSummary
 from .errors import ConfigurationError, VerificationError
-from .formats import ModelInspection
+from .formats import ModelInspection, discover_gguf_projectors
 from .io import atomic_json, sha256_file
 
 
@@ -138,6 +138,8 @@ def record_dataset(layout: SessionLayout, dataset: DatasetSummary) -> Path:
         "schema_version": 1,
         "source": str(dataset.path),
         "schema": dataset.schema,
+        "formats": list(dataset.formats),
+        "modalities": list(dataset.modalities),
         "examples": {
             "train": dataset.train_examples,
             "valid": dataset.valid_examples,
@@ -215,7 +217,7 @@ def _materialize_base(layout: SessionLayout, base: ModelInspection) -> BaseBundl
         published_path = model_root
     else:
         destination.mkdir(parents=True, exist_ok=True)
-        for source in base.shards:
+        for source in (*base.shards, *discover_gguf_projectors(base.path)):
             target = destination / source.name
             modes.append(clone_or_copy(source, target))
             files.append(target)

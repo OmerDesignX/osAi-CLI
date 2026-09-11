@@ -20,6 +20,7 @@ from .backends.llama_gradient import LlamaGradientOptions, train_gradient_gguf
 from .bundle import verify_model_bundle
 from .catalog import ModelTier, bundled_root, list_catalog, resolve_model
 from .config import ModelFormat, TrainingConfig
+from .dataset import validate_dataset
 from .errors import ConfigurationError, DependencyError, OsAiError, TrainingError
 from .formats import inspect_model
 from .gguf_adapter import convert_mlx_adapter
@@ -190,6 +191,27 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--max-seq-length", type=int)
     train_parser.add_argument("--learning-rate", type=float)
     train_parser.add_argument("--dropout", type=float)
+    train_parser.add_argument(
+        "--image-size",
+        nargs=2,
+        type=int,
+        metavar=("WIDTH", "HEIGHT"),
+        help=(
+            "resize images before local VLM training; model processor default is "
+            "used when omitted"
+        ),
+    )
+    train_parser.add_argument(
+        "--video-fps", type=float, help="video frame sampling rate (default: 2)"
+    )
+    train_parser.add_argument(
+        "--video-max-frames", type=int, help="maximum sampled frames per video (default: 32)"
+    )
+    train_parser.add_argument(
+        "--assistant-token-id",
+        type=int,
+        help="assistant boundary token for completion-only VLM loss",
+    )
     train_parser.add_argument("--seed", type=int)
     train_parser.add_argument(
         "--gradient-accumulation-steps",
@@ -510,6 +532,55 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
         config = replace(config, output=session)
     config = _resolve_training_settings(config, args, engine)
     selected_optimizer = _select_optimizer(args, config, engine)
+    dataset_summary = validate_dataset(config.data)
+    multimodal = bool(set(dataset_summary.modalities) - {"text"})
+    if multimodal:
+        # The text-only compact profile uses a deliberately tiny context.  Media
+        # processors commonly emit hundreds or thousands of visual/audio tokens,
+        # so use a safe baseline unless the user explicitly chose a limit.
+        if not args.config and args.max_seq_length is None and config.max_seq_length < 2048:
+            config = replace(config, max_seq_length=2048)
+        if config.effective_format is ModelFormat.GGUF and config.companion_mlx is None:
+            raise ConfigurationError(
+                "llama.cpp has no multimodal backward API; GGUF VLM training requires "
+                "a matching quantized MLX VLM in the custom model's mlx folder so osAi "
+                "can backpropagate through media locally and export the language adapter"
+            )
+        requested_optimizer = getattr(args, "gguf_optimizer", None) or args.optimizer
+        if requested_optimizer == "auto":
+            selected_optimizer = "adamw"
+        result = train(
+            replace(config, optimizer=selected_optimizer),
+            python=args.python,
+            mlx_accelerator=args.accelerator,
+            llama_accelerator=args.accelerator,
+        )
+        target_format = config.effective_format
+        adapter = (
+            result.gguf_adapter
+            if target_format is ModelFormat.GGUF
+            else result.mlx_adapter
+        )
+        return {
+            "status": "completed",
+            "engine": engine.value,
+            "training_backend": "mlx-vlm",
+            "modalities": list(dataset_summary.modalities),
+            "output": str(result.output),
+            "mlx_adapter": str(result.mlx_adapter),
+            "gguf_adapter": str(result.gguf_adapter) if result.gguf_adapter else None,
+            "manifest": str(result.manifest),
+            "base_plus_adapter": str(result.deployment_manifest.parent),
+            "deployment_manifest": str(result.deployment_manifest),
+            "merged_model": str(result.merged_model) if result.merged_model else None,
+            "reported_losses": result.losses,
+            "test_loss": result.test_loss,
+            "optimizer": selected_optimizer,
+            "auto_settings": _auto_payload(config),
+            "model": str(config.model),
+            "format": target_format.value,
+            "adapter": str(adapter),
+        }
     if engine is Engine.MLX and args.accelerator in {
         Accelerator.MPS.value,
         Accelerator.VULKAN.value,
@@ -925,6 +996,9 @@ def _resolve_training_settings(
         ("max_seq_length", "max_seq_length"),
         ("learning_rate", "learning_rate"),
         ("dropout", "dropout"),
+        ("video_fps", "video_fps"),
+        ("video_max_frames", "video_max_frames"),
+        ("assistant_token_id", "assistant_token_id"),
         ("seed", "seed"),
         ("grad_accumulation_steps", "grad_accumulation_steps"),
         ("save_every", "save_every"),
@@ -934,11 +1008,13 @@ def _resolve_training_settings(
         ("gguf_batch_size", "gguf_batch_size"),
         ("gguf_threads", "gguf_threads"),
     ):
-        value = getattr(args, argument)
+        value = getattr(args, argument, None)
         if value is not None:
             overrides[field_name] = value
     if args.target_modules:
         overrides["target_modules"] = tuple(args.target_modules)
+    if getattr(args, "image_size", None) is not None:
+        overrides["image_width"], overrides["image_height"] = args.image_size
     if args.mask_prompt is not None:
         overrides["mask_prompt"] = args.mask_prompt
     if args.grad_checkpoint is not None:

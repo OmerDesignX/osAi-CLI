@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .errors import ConfigurationError, VerificationError
+from .formats import discover_gguf_projectors
 from .io import atomic_json, sha256_file
 from .session import clone_or_copy
 
@@ -42,6 +43,7 @@ class GgufFusionBundle:
     manifest: Path
     model: Path
     shards: tuple[Path, ...]
+    projectors: tuple[Path, ...]
     adapter: Path
     copy_modes: tuple[str, ...]
 
@@ -50,6 +52,7 @@ class GgufFusionBundle:
         for key in ("path", "manifest", "model", "adapter"):
             result[key] = str(result[key])
         result["shards"] = [str(path) for path in self.shards]
+        result["projectors"] = [str(path) for path in self.projectors]
         return result
 
 
@@ -170,12 +173,18 @@ def create_gguf_fusion_bundle(
 
     modes: list[str] = []
     copied_shards: list[Path] = []
+    source_projectors = discover_gguf_projectors(model_path)
+    copied_projectors: list[Path] = []
     try:
         model_directory = target / "model"
         for source in source_shards:
             copied = model_directory / source.name
             modes.append(clone_or_copy(source, copied))
             copied_shards.append(copied)
+        for source in source_projectors:
+            copied = model_directory / source.name
+            modes.append(clone_or_copy(source, copied))
+            copied_projectors.append(copied)
         copied_adapter = target / GGUF_EMBEDDED_ADAPTER
         copied_adapter.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(adapter_path, copied_adapter)
@@ -189,6 +198,9 @@ def create_gguf_fusion_bundle(
                 "format": "gguf",
                 "model_path": str(copied_model.relative_to(target)),
                 "shards": [str(path.relative_to(target)) for path in copied_shards],
+                "projectors": [
+                    str(path.relative_to(target)) for path in copied_projectors
+                ],
                 "adapter_path": GGUF_EMBEDDED_ADAPTER,
                 "base_weights_unchanged": True,
                 "adapter_residual_embedded": True,
@@ -197,12 +209,14 @@ def create_gguf_fusion_bundle(
         )
         resolved = resolve_gguf_fusion_bundle(target)
         _verify_exact_files(source_shards, resolved.shards)
+        _verify_exact_files(source_projectors, resolved.projectors)
         _verify_exact_files((adapter_path,), (resolved.adapter,))
         return GgufFusionBundle(
             path=target,
             manifest=manifest,
             model=resolved.model,
             shards=resolved.shards,
+            projectors=resolved.projectors,
             adapter=resolved.adapter,
             copy_modes=tuple(modes),
         )
@@ -226,7 +240,13 @@ def resolve_gguf_fusion_bundle(model: str | Path) -> GgufFusionBundle:
     if not isinstance(raw_shards, list) or not raw_shards:
         raise VerificationError(f"GGUF fusion manifest has no shards: {manifest}")
     shard_paths = tuple(_safe_bundle_path(root, value, manifest) for value in raw_shards)
-    required = (*shard_paths, model_path, adapter_path)
+    raw_projectors = payload.get("projectors", [])
+    if not isinstance(raw_projectors, list):
+        raise VerificationError(f"GGUF fusion manifest has invalid projectors: {manifest}")
+    projector_paths = tuple(
+        _safe_bundle_path(root, value, manifest) for value in raw_projectors
+    )
+    required = (*shard_paths, *projector_paths, model_path, adapter_path)
     missing = [str(path) for path in required if not path.is_file() or path.stat().st_size == 0]
     if missing:
         raise VerificationError("missing GGUF fusion file(s): " + ", ".join(missing))
@@ -237,6 +257,7 @@ def resolve_gguf_fusion_bundle(model: str | Path) -> GgufFusionBundle:
         manifest=manifest,
         model=model_path,
         shards=shard_paths,
+        projectors=projector_paths,
         adapter=adapter_path,
         copy_modes=(),
     )

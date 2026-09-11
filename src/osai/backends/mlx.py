@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from ..config import TrainingConfig
+from ..dataset import prepare_mlx_dataset, validate_dataset
 from ..errors import ConfigurationError, DependencyError, TrainingError
 from ..hardware import Accelerator, macos_version_at_least
 from ..io import atomic_json
@@ -142,6 +143,10 @@ class MlxBackend:
         layout = SessionLayout.at(config.output)
         layout.create()
         internal = layout.work
+        data_path = prepare_mlx_dataset(
+            config.data, internal / "mlx-dataset"
+        )
+        dataset = validate_dataset(config.data)
         adapter_dir = layout.adapters / "mlx"
         log_path = layout.logs / "train.log"
         adapter_dir.mkdir(parents=True, exist_ok=True)
@@ -152,7 +157,7 @@ class MlxBackend:
             "train": True,
             "test": False,
             "fine_tune_type": "lora",
-            "data": str(config.data.resolve()),
+            "data": str(data_path),
             "optimizer": "adamw" if config.optimizer == "auto" else config.optimizer,
             "batch_size": config.batch_size,
             "iters": config.iterations,
@@ -162,7 +167,8 @@ class MlxBackend:
             "max_seq_length": config.max_seq_length,
             "grad_checkpoint": config.grad_checkpoint,
             "grad_accumulation_steps": config.grad_accumulation_steps,
-            "mask_prompt": config.mask_prompt,
+            # Raw language-modelling rows do not have a prompt boundary to mask.
+            "mask_prompt": config.mask_prompt and dataset.schema != "text",
             "adapter_path": str(adapter_dir.resolve()),
             "save_every": min(config.save_every, config.iterations),
             "steps_per_report": config.steps_per_report,
@@ -225,8 +231,8 @@ class MlxBackend:
         if not all(math.isfinite(loss) for loss in losses):
             raise TrainingError(f"training reported a non-finite loss; see {log_path}")
         test_loss = None
-        if (config.data / "test.jsonl").is_file():
-            test_loss = self.evaluate(config, adapter_dir)
+        if (data_path / "test.jsonl").is_file():
+            test_loss = self.evaluate(config, adapter_dir, data_path=data_path)
         return MlxTrainingResult(
             adapter_dir=adapter_dir,
             adapter_file=adapter_file,
@@ -236,14 +242,20 @@ class MlxBackend:
             test_loss=test_loss,
         )
 
-    def evaluate(self, config: TrainingConfig, adapter_dir: Path) -> float:
+    def evaluate(
+        self,
+        config: TrainingConfig,
+        adapter_dir: Path,
+        *,
+        data_path: Path | None = None,
+    ) -> float:
         layout = SessionLayout.at(config.output)
         internal = layout.work
         eval_config = {
             "model": str(config.training_model.resolve()),
             "train": False,
             "test": True,
-            "data": str(config.data.resolve()),
+            "data": str((data_path or config.data).resolve()),
             "batch_size": config.batch_size,
             "test_batches": config.val_batches,
             "max_seq_length": config.max_seq_length,

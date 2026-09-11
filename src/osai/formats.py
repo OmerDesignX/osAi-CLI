@@ -48,6 +48,22 @@ class ModelInspection:
         return result
 
 
+def discover_gguf_projectors(model: str | Path) -> tuple[Path, ...]:
+    """Return local multimodal projector sidecars belonging to a GGUF model."""
+
+    model_path = Path(model).expanduser().resolve()
+    directory = model_path.parent if model_path.is_file() else model_path
+    if not directory.is_dir():
+        return ()
+    return tuple(
+        path.resolve()
+        for path in sorted(directory.glob("*.gguf"))
+        if path.is_file()
+        and path.resolve() != model_path
+        and ("mmproj" in path.name.casefold() or "projector" in path.name.casefold())
+    )
+
+
 def inspect_model(path: str | Path, expected: ModelFormat | None = None) -> ModelInspection:
     model_path = Path(path).expanduser().resolve()
     fusion_manifest = model_path / "osai_fusion.json"

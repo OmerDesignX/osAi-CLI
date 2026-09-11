@@ -1,7 +1,7 @@
 # osAi CLI
 
-**osAi** trains LoRA adapters for quantized MLX and GGUF
-language models, and keeps the quantized base frozen.
+**osAi** trains LoRA adapters for quantized MLX and GGUF language and
+vision-language models, and keeps the quantized base frozen.
 Training and inference are local after any selected model download completes.
 
 osCode Models are supported by default and custom models can be added.
@@ -11,6 +11,8 @@ More about osCode Models: https://github.com/OmerDesignX/osCode-Models
 Supported modes:
 
 - MLX gradient LoRA on Apple silicon and Linux.
+- Quantized MLX-VLM gradient LoRA with local image, video, and compatible
+  audio inputs.
 - llama.cpp gradient LoRA on GGUF models.
 - Post-fine-tuning DPO, IPO, SimPO, ORPO, CPO, KTO, PPO, REINFORCE,
   RLOO, and GRPO alignment.
@@ -126,9 +128,49 @@ hardware-specific libraries, builds the bundled engines, and runs diagnostics.
 
 ## Train
 
-`--data` must point to a directory containing `train.jsonl`. Optional
-`valid.jsonl` and `test.jsonl` files use the same JSONL schema. Each row may
-contain `text`, `prompt` and `completion`, or a `messages` list.
+`--data` points to a directory containing `train.jsonl`, with optional
+`valid.jsonl` and `test.jsonl` splits. UTF-8 and UTF-8-with-BOM files are
+accepted. Equivalent supervised layouts can be mixed; osAi validates every row
+and writes one canonical chat dataset inside the session before training.
+
+| Dataset layout | Accepted fields |
+| --- | --- |
+| Language modelling | `text` |
+| Standard or conversational completion | `prompt` + `completion`, as strings or message lists |
+| OpenAI chat | `messages` with text/content parts, tools, and tool calls |
+| ShareGPT or dialogue | `conversations`, `conversation`, `dialog`, or `dialogue`; `role/content`, `from/value`, and `speaker/text` messages |
+| Alpaca / Dolly | `instruction` + optional `input` or `context` + `output` or `response` |
+| QA / translation | `question/answer`, `query/response`, `source/target`, or `src/tgt` |
+| Preference data used for SFT | `prompt` + `chosen/rejected`; the chosen response is the supervised target |
+
+Image, audio, and video fields and multimodal message parts are parsed and
+validated before training. Relative paths resolve beside the selected dataset;
+absolute paths, base64 values, and `data:` URIs are also accepted. Remote media
+URLs are never fetched.
+
+```json
+{"messages":[{"role":"user","content":"What is shown?"},{"role":"assistant","content":"A blue book."}],"images":["media/book.jpg"]}
+{"prompt":"Describe the motion.","completion":"The pen moves left.","videos":["media/pen.mp4"]}
+{"prompt":"Transcribe this clip.","completion":"Hello world.","audio":["media/hello.wav"]}
+```
+
+Media can also appear inside OpenAI-style content parts such as `image_url`,
+`input_image`, `video`, `input_video`, `audio`, and `input_audio`. osAi copies or
+materializes every input into the private session and records the detected
+modalities in its manifest.
+
+MLX VLM training requires a complete local quantized checkpoint containing the
+matching processor and media-tower weights. Video is enabled only for model
+families with a working local video processor; audio currently supports
+compatible Gemma 4, MiniCPM-o, Nemotron Nano Omni, and Phi-4 Multimodal MLX
+checkpoints. Capability checks inspect actual tensors rather than trusting
+reserved media token IDs.
+
+For a GGUF VLM, place a matching quantized MLX VLM under the custom model's
+`mlx/` folder and the GGUF plus its `mmproj*.gguf` under `gguf/`. MLX performs
+the media-conditioned backward pass because llama.cpp does not expose a media
+projector backward API; osAi exports the language LoRA to GGUF and preserves the
+GGUF and projector bytes. No full-precision model is created.
 
 List the official model tiers and any custom local models:
 
@@ -164,8 +206,12 @@ osai train \
   --alignment-data /path/to/preference-data
 ```
 
-Alignment source rows contain either `prompt`, `chosen`, and `rejected`, or
-`prompt`, `response`, and numeric `reward` with optional `old_logprob`. By
+Alignment accepts standard or conversational `prompt/chosen/rejected` rows,
+implicit chosen/rejected conversations with a shared prompt, common
+`preferred/non_preferred` and `winner/loser` aliases, ranked
+`response_j/response_k` rows, numeric `prompt/response/reward` rows, and KTO
+`prompt/completion/label` feedback. `question`, `query`, `answer`, `output`,
+`score`, and `value` aliases are normalized where unambiguous. By
 default, the fine-tuned adapter generates fresh answers for every source prompt.
 Pairwise objectives compare the generated answer with the local references;
 reward objectives use a local token/sequence-similarity score derived from those
@@ -257,8 +303,8 @@ Place local models in this structure:
 
 ```text
 models/custom/my-model/
-├── mlx/       # MLX model files
-└── gguf/      # one GGUF file or a complete split set
+├── mlx/       # complete quantized MLX LM or VLM checkpoint
+└── gguf/      # GGUF shard set and optional mmproj*.gguf
 ```
 
 Then run:
@@ -288,10 +334,11 @@ embeds the adapter in `osai_adapter/`. The bundled MLX loader applies it from
 next-token logit with the original base-plus-adapter path and requires an exact
 match.
 
-For GGUF, the bundle keeps the original file or split shards unchanged under
-`model/`, stores the exact adapter as `osai_adapter.gguf`, and records both in
-`osai_fusion.json`. SHA-256 checks require every copied base and adapter file to
-match its source. Raw llama.cpp commands load the manifest's model with
+For GGUF, the bundle keeps the original file or split shards and any multimodal
+projector unchanged under `model/`, stores the exact adapter as
+`osai_adapter.gguf`, and records them in `osai_fusion.json`. SHA-256 checks
+require every copied base, projector, and adapter file to match its source. Raw
+llama.cpp commands load the manifest's model with
 `--lora osai_adapter.gguf`; no unified, dequantized, or requantized model is
 created.
 
@@ -346,8 +393,8 @@ directly to alignment.
 | `--engine auto\|mlx\|llama.cpp` | Select the trainer. `auto` prefers MLX on Apple silicon and llama.cpp elsewhere. |
 | `--accelerator auto\|metal\|mps\|cuda\|vulkan\|cpu` | Select compute. `auto` is GPU-first with CPU fallback. MPS is diagnostic only; use Metal on macOS. |
 | `--stage fine-tuning\|alignment\|fine-tune-align` | Select one stage or run fine-tuning followed by alignment. Default: `fine-tuning`. |
-| `--data PATH` | Directory containing `train.jsonl` and optional validation/test splits. |
-| `--alignment-data PATH` | Directory containing alignment `train.jsonl`. |
+| `--data PATH` | Directory containing `train.jsonl` and optional validation/test splits in any supported supervised schema. |
+| `--alignment-data PATH` | Directory containing standard or conversational preference, binary-feedback, or scored-response `train.jsonl`. |
 | `--alignment-type auto\|dpo\|ipo\|simpo\|orpo\|cpo\|kto\|ppo\|reinforce\|rloo\|grpo` | Alignment objective. Omit it in `fine-tune-align` with preference data to receive a yes/no ORPO prompt. Explicit `auto` chooses DPO for preference pairs and PPO for reward rows. |
 | `--adapter PATH` | Input adapter file/directory for an alignment-only run. |
 | `--alignment-iterations N` | Alignment optimizer updates. Default: `10`. |
@@ -378,7 +425,11 @@ directly to alignment.
 | `--rank N` | LoRA rank. Default: `2`. |
 | `--scale NUMBER` | LoRA scaling value. Default: `4`. |
 | `--num-layers N` | Number of final model layers to adapt. Default: `1`. |
-| `--max-seq-length N` | Maximum token sequence length. Default: `64`. |
+| `--max-seq-length N` | Maximum token sequence length. Default: `64` for text and at least `2048` for automatically configured media training. |
+| `--image-size WIDTH HEIGHT` | Resize local images before VLM preprocessing. Omit it to use the model processor's native size. |
+| `--video-fps NUMBER` | Frames sampled per second from local videos. Default: `2`. |
+| `--video-max-frames N` | Maximum frames loaded from each local video. Default: `32`. |
+| `--assistant-token-id N` | Assistant boundary token used for completion-only VLM loss when a processor cannot expose it automatically. |
 | `--learning-rate NUMBER` | Override the backend learning rate. |
 | `--dropout NUMBER` | MLX LoRA dropout in the range `[0, 1)`. Default: `0`. |
 | `--seed N` | Fine-tuning random seed. Default: `0`. |
@@ -396,7 +447,7 @@ directly to alignment.
 | `--strict-base-hash`, `--no-strict-base-hash` | Enable or disable full pre/post base-file hashes. Enabled by default. |
 | `--merge`, `--no-merge` | Enable or disable the standalone lossless quantized-residual bundle. Enabled by default. |
 | `--materialize-base`, `--no-materialize-base` | Copy/clone the base into the deployment folder or reference its local path. Enabled by default. |
-| `--python PATH` | Python executable containing MLX and MLX LM. |
+| `--python PATH` | Python executable containing MLX, MLX LM, and MLX-VLM. |
 
 ### Other command options
 
@@ -444,6 +495,18 @@ directly to alignment.
 | `prove-learning` | `--accelerator auto\|metal\|mps\|cuda\|vulkan\|cpu` | Probe compute backend. Default: `auto`. |
 
 ### Advanced command examples
+
+Fine-tune a quantized VLM from local images:
+
+```sh
+osai train \
+  --custom my-vlm \
+  --engine mlx \
+  --stage fine-tuning \
+  --data /path/to/image-dataset \
+  --auto-settings \
+  --max-seq-length 2048
+```
 
 Fine-tune with explicit training controls:
 

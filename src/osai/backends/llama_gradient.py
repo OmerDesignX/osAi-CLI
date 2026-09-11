@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config import DEFAULT_TARGETS, ModelFormat
-from ..dataset import validate_dataset
+from ..dataset import require_text_training, validate_dataset
 from ..errors import ConfigurationError, DependencyError, TrainingError, VerificationError
 from ..formats import inspect_model
 from ..hardware import Accelerator, select_llama_accelerator
@@ -122,6 +122,7 @@ def train_gradient_gguf(
     _validate_memory_budget(settings, physical_memory_bytes())
     base = inspect_model(model, ModelFormat.GGUF)
     dataset = validate_dataset(data)
+    require_text_training(dataset)
     destination = Path(output).expanduser().resolve()
     _validate_output(destination, base.path, dataset.path)
     layout = SessionLayout.at(destination)
