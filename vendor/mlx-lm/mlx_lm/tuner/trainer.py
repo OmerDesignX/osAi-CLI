@@ -11,6 +11,7 @@ import mlx.nn as nn
 import numpy as np
 from mlx.nn.utils import average_gradients
 from mlx.utils import tree_flatten, tree_map
+from osai.mlx_safety import truncate_completion_aware
 
 from ..cli_ui import TrainUI, rprint
 from .callbacks import TrainingCallback
@@ -94,7 +95,10 @@ def default_loss(model, batch, lengths):
 
     ce = nn.losses.cross_entropy(logits, targets) * mask
     ntoks = mask.sum()
-    ce = ce.astype(mx.float32).sum() / ntoks
+    # A completion-masked row can contain no trainable tokens when an invalid or
+    # aggressively truncated sample reaches this final guard. Keep that row a
+    # finite, zero-gradient no-op instead of poisoning the optimizer with NaN.
+    ce = ce.astype(mx.float32).sum() / mx.maximum(ntoks, mx.array(1))
 
     return ce, ntoks
 
@@ -137,6 +141,7 @@ def iterate_batches(
     ]
     if seed is not None:
         np.random.seed(seed)
+    warned_about_truncation = False
     while True:
         indices = np.random.permutation(len(batch_idx))
         for i in indices:
@@ -145,13 +150,15 @@ def iterate_batches(
                 batch, offsets = zip(*batch)
             else:
                 offsets = [0] * len(batch)
+            offsets = list(offsets)
             lengths = [len(x) for x in batch]
-            if max(lengths) > max_seq_length:
+            if max(lengths) > max_seq_length and not warned_about_truncation:
                 rprint(
                     f"[WARNING] Some sequences are longer than {max_seq_length} tokens. "
-                    f"The longest sentence {max(lengths)} will be truncated to {max_seq_length}. "
-                    "Consider pre-splitting your data to save memory."
+                    "They will be truncated to fit; completion-masked samples retain "
+                    "both the end of the prompt and trainable answer tokens."
                 )
+                warned_about_truncation = True
 
             # Pad to one plus nearest multiple of pad_to or the maximum length
             pad_to = 32
@@ -162,7 +169,21 @@ def iterate_batches(
 
             for j in range(batch_size // step):
                 truncated_length = min(lengths[j], max_seq_length)
-                batch_arr[j, :truncated_length] = batch[j][:truncated_length]
+                sequence = batch[j]
+                prompt_offset = offsets[j]
+                if lengths[j] > max_seq_length and 0 < prompt_offset < lengths[j]:
+                    # Keeping only the start of a long completion-masked sample can
+                    # discard its entire answer. Keep a balanced window around the
+                    # prompt/answer boundary instead: all of a short answer, or at
+                    # least half of the context for a long answer.
+                    sequence, prompt_offset = truncate_completion_aware(
+                        sequence, prompt_offset, max_seq_length
+                    )
+                    truncated_length = len(sequence)
+                else:
+                    sequence = sequence[:truncated_length]
+                batch_arr[j, :truncated_length] = sequence
+                offsets[j] = min(prompt_offset, truncated_length)
                 lengths[j] = (
                     truncated_length  # Update lengths to match truncated lengths
                 )

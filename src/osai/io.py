@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
+import secrets
 import tempfile
+import time
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -82,27 +85,165 @@ def sha256_file(path: str | Path, chunk_size: int = 8 * 1024 * 1024) -> str:
 
 
 class OutputLock:
-    """Simple cross-platform single-writer lock based on O_EXCL."""
+    """Cross-platform single-writer lock with safe crash recovery."""
+
+    _MALFORMED_LOCK_GRACE_SECONDS = 30.0
+    _CREATE_ATTEMPTS = 8
 
     def __init__(self, output: str | Path):
         self.output = Path(output)
         self.path = self.output / ".osai.lock"
         self._descriptor: int | None = None
+        self._payload: bytes | None = None
 
     def __enter__(self) -> OutputLock:
         self.output.mkdir(parents=True, exist_ok=True)
-        try:
-            self._descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(self._descriptor, f"pid={os.getpid()}\n".encode())
-        except FileExistsError as exc:
-            raise TrainingError(
-                f"output is locked by another run (or a stale lock): {self.path}"
-            ) from exc
-        return self
+        self._payload = (
+            f"version=1\npid={os.getpid()}\ncreated_ns={time.time_ns()}\n"
+            f"token={secrets.token_hex(16)}\n"
+        ).encode("ascii")
+
+        for _ in range(self._CREATE_ATTEMPTS):
+            try:
+                descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError as exc:
+                if self._reclaim_stale_lock():
+                    continue
+                raise TrainingError(f"output is locked by another active run: {self.path}") from exc
+
+            try:
+                os.write(descriptor, self._payload)
+                os.fsync(descriptor)
+            except BaseException:
+                os.close(descriptor)
+                with suppress(FileNotFoundError):
+                    self.path.unlink()
+                raise
+            self._descriptor = descriptor
+            return self
+
+        raise TrainingError(f"could not acquire the output lock: {self.path}")
 
     def __exit__(self, exc_type, exc, traceback) -> None:
         if self._descriptor is not None:
             os.close(self._descriptor)
             self._descriptor = None
-        with suppress(FileNotFoundError):
+        try:
+            if self._payload is not None and self.path.read_bytes() == self._payload:
+                self.path.unlink()
+        except FileNotFoundError:
+            pass
+        finally:
+            self._payload = None
+
+    def _reclaim_stale_lock(self) -> bool:
+        """Remove a lock only when the observed owner can no longer be running."""
+
+        try:
+            descriptor = os.open(self.path, os.O_RDONLY)
+        except FileNotFoundError:
+            return True
+
+        try:
+            observed = os.fstat(descriptor)
+            payload = os.read(descriptor, 16 * 1024).decode("utf-8", errors="replace")
+        finally:
+            os.close(descriptor)
+
+        owner_pid = _lock_owner_pid(payload)
+        if owner_pid is not None:
+            stale = not _process_is_running(owner_pid)
+        else:
+            age_seconds = max(0.0, time.time() - observed.st_mtime)
+            stale = age_seconds >= self._MALFORMED_LOCK_GRACE_SECONDS
+
+        if not stale:
+            return False
+
+        try:
+            current = self.path.stat()
+        except FileNotFoundError:
+            return True
+
+        observed_identity = (
+            observed.st_dev,
+            observed.st_ino,
+            observed.st_size,
+            observed.st_mtime_ns,
+        )
+        current_identity = (
+            current.st_dev,
+            current.st_ino,
+            current.st_size,
+            current.st_mtime_ns,
+        )
+        if current_identity != observed_identity:
+            return True
+
+        try:
             self.path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError as exc:
+            raise TrainingError(f"cannot recover stale output lock: {self.path}") from exc
+        return True
+
+
+def _lock_owner_pid(payload: str) -> int | None:
+    for line in payload.splitlines():
+        key, separator, value = line.partition("=")
+        if separator and key.strip() == "pid":
+            try:
+                pid = int(value.strip())
+            except ValueError:
+                return None
+            return pid if pid > 0 else None
+    return None
+
+
+def _process_is_running(pid: int) -> bool:
+    """Check process liveness without sending a terminating signal."""
+
+    if os.name == "nt":
+        return _windows_process_is_running(pid)
+
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as exc:
+        return exc.errno != errno.ESRCH
+    return True
+
+
+def _windows_process_is_running(pid: int) -> bool:
+    """Use a read-only Windows process handle; ``os.kill(pid, 0)`` is unsafe there."""
+
+    import ctypes
+    from ctypes import wintypes
+
+    process_query_limited_information = 0x1000
+    still_active = 259
+    error_access_denied = 5
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        return ctypes.get_last_error() == error_access_denied
+
+    try:
+        exit_code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+            return True
+        return exit_code.value == still_active
+    finally:
+        kernel32.CloseHandle(handle)

@@ -72,6 +72,18 @@ def test_manual_training_defaults_are_resolved_after_parsing():
     assert args.rollouts_per_prompt == 2
 
 
+def test_fine_tune_epochs_and_legacy_iterations_share_one_value():
+    parser = build_parser()
+    epochs = parser.parse_args(
+        ["train", "--tier", "small", "--data", "data", "--epochs", "3"]
+    )
+    legacy = parser.parse_args(
+        ["train", "--tier", "small", "--data", "data", "--iterations", "2"]
+    )
+    assert epochs.iterations == 3
+    assert legacy.iterations == 2
+
+
 def test_official_model_download_can_be_disabled():
     args = build_parser().parse_args(
         ["select", "--tier", "small", "--no-download-model"]

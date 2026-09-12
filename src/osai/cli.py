@@ -183,7 +183,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="fit memory-sensitive settings to the model, RAM, and engine",
     )
-    train_parser.add_argument("--iterations", type=int)
+    train_parser.add_argument(
+        "--epochs",
+        "--iterations",
+        dest="iterations",
+        type=int,
+        help=(
+            "complete passes over the fine-tuning dataset (default: 1); "
+            "--iterations is retained as a compatibility alias"
+        ),
+    )
     train_parser.add_argument("--batch-size", type=int, help="MLX training batch size")
     train_parser.add_argument("--rank", type=int)
     train_parser.add_argument("--scale", type=float)

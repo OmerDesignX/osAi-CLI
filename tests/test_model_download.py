@@ -2,6 +2,8 @@ import hashlib
 import io
 import json
 from pathlib import Path
+from urllib.error import URLError
+from urllib.request import Request
 
 import pytest
 
@@ -147,6 +149,65 @@ def test_console_progress_renders_a_bar():
     rendered = output.getvalue()
     assert "[############------------]" in rendered
     assert "100%" in rendered
+
+
+def test_console_progress_keeps_reporting_bytes_within_one_percent():
+    output = io.StringIO()
+    progress = downloads.ConsoleProgress(output)
+
+    progress(downloads.DownloadProgress(0, "model.gguf", 100_000, 3_000_000_000))
+    progress(downloads.DownloadProgress(0, "model.gguf", 1_148_576, 3_000_000_000))
+
+    assert output.getvalue().count("model.gguf") == 2
+
+
+def test_download_file_resumes_a_partial_file(monkeypatch, tmp_path: Path):
+    destination = tmp_path / "model.gguf"
+    destination.write_bytes(b"hello, ")
+    requested = []
+
+    class ResumeResponse(_Response):
+        status = 206
+        headers = {"Content-Range": "bytes 7-11/12"}
+
+    def open_response(request):
+        requested.append(request)
+        return ResumeResponse(b"world", downloads._RAW_REPOSITORY + "/model.gguf")
+
+    monkeypatch.setattr(downloads, "_open_response", open_response)
+    chunks = []
+    size, digest = downloads._download_file("model.gguf", destination, chunks.append)
+
+    assert isinstance(requested[0], Request)
+    assert requested[0].get_header("Range") == "bytes=7-"
+    assert destination.read_bytes() == b"hello, world"
+    assert chunks == [7, 5]
+    assert size == 12
+    assert digest == hashlib.sha256(b"hello, world").hexdigest()
+
+
+def test_interrupted_download_preserves_partial_staging(monkeypatch, tmp_path: Path):
+    variant = downloads.variant_for("llama.cpp", "small")
+    repository_path = downloads.files_for_variant(variant)[0]
+    checksum = hashlib.sha256(b"partial").hexdigest()
+
+    monkeypatch.setattr(downloads, "_release_catalog", lambda: {"release": "1.0"})
+    monkeypatch.setattr(downloads, "_checksum_catalog", lambda: {repository_path: checksum})
+    monkeypatch.setattr(downloads, "_published_variant", lambda *_: {})
+    monkeypatch.setattr(downloads, "_published_files", lambda *_: (repository_path,))
+    monkeypatch.setattr(downloads, "_check_disk_budget", lambda *_: None)
+
+    def interrupt(_repository_path, destination, _on_chunk):
+        destination.write_bytes(b"partial")
+        raise URLError("connection lost")
+
+    monkeypatch.setattr(downloads, "_download_file", interrupt)
+
+    with pytest.raises(ModelDownloadError, match="can be resumed"):
+        downloads.download_model_variant(tmp_path, variant)
+
+    partial = tmp_path / ".downloads" / "llama.cpp-small.partial"
+    assert (partial / Path(repository_path).name).read_bytes() == b"partial"
 
 
 def test_offline_environment_prevents_missing_model_download(monkeypatch, tmp_path: Path):

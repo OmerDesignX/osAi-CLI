@@ -36,6 +36,22 @@ class MlxTrainingResult:
     elapsed_seconds: float
     losses: tuple[float, ...]
     test_loss: float | None = None
+    epochs: int = 1
+    training_steps: int = 1
+    optimizer_updates: int = 1
+    examples_per_epoch: int = 1
+
+
+def resolve_mlx_training_steps(config: TrainingConfig, train_examples: int) -> int:
+    """Translate dataset epochs into complete MLX minibatch steps."""
+
+    if train_examples < 1:
+        raise ConfigurationError("training dataset must contain at least one example")
+    batches_per_epoch = math.ceil(train_examples / config.batch_size)
+    requested_steps = batches_per_epoch * config.iterations
+    accumulation = config.grad_accumulation_steps
+    # MLX only applies accumulated gradients at the end of a full window.
+    return math.ceil(requested_steps / accumulation) * accumulation
 
 
 def _resolve_distributed_workers(
@@ -147,6 +163,16 @@ class MlxBackend:
             config.data, internal / "mlx-dataset"
         )
         dataset = validate_dataset(config.data)
+        training_steps = resolve_mlx_training_steps(config, dataset.train_examples)
+        optimizer_updates = training_steps // config.grad_accumulation_steps
+        print(
+            "osai: training plan "
+            f"examples={dataset.train_examples} epochs={config.iterations} "
+            f"batch={config.batch_size} steps={training_steps} "
+            f"optimizer_updates={optimizer_updates}",
+            file=sys.stderr,
+            flush=True,
+        )
         adapter_dir = layout.adapters / "mlx"
         log_path = layout.logs / "train.log"
         adapter_dir.mkdir(parents=True, exist_ok=True)
@@ -160,7 +186,7 @@ class MlxBackend:
             "data": str(data_path),
             "optimizer": "adamw" if config.optimizer == "auto" else config.optimizer,
             "batch_size": config.batch_size,
-            "iters": config.iterations,
+            "iters": training_steps,
             "val_batches": config.val_batches,
             "learning_rate": config.learning_rate,
             "num_layers": config.num_layers,
@@ -170,7 +196,7 @@ class MlxBackend:
             # Raw language-modelling rows do not have a prompt boundary to mask.
             "mask_prompt": config.mask_prompt and dataset.schema != "text",
             "adapter_path": str(adapter_dir.resolve()),
-            "save_every": min(config.save_every, config.iterations),
+            "save_every": min(config.save_every, training_steps),
             "steps_per_report": config.steps_per_report,
             "steps_per_eval": config.steps_per_eval,
             "seed": config.seed,
@@ -240,6 +266,10 @@ class MlxBackend:
             elapsed_seconds=result.elapsed_seconds,
             losses=losses,
             test_loss=test_loss,
+            epochs=config.iterations,
+            training_steps=training_steps,
+            optimizer_updates=optimizer_updates,
+            examples_per_epoch=dataset.train_examples,
         )
 
     def evaluate(

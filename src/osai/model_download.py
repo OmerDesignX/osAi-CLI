@@ -9,7 +9,6 @@ import re
 import shutil
 import ssl
 import sys
-import uuid
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -147,10 +146,13 @@ class ConsoleProgress:
     def __init__(self, stream=None) -> None:
         self.stream = stream or sys.stderr
         self._started = False
-        self._last: tuple[int, str] | None = None
+        self._last: tuple[int, str, int] | None = None
 
     def __call__(self, progress: DownloadProgress) -> None:
-        current = (progress.percent, progress.file)
+        # File downloads are much larger than one percentage point. Include the
+        # received byte count so redirected output stays visibly alive between
+        # percentage changes (the downloader reports in 1 MiB chunks).
+        current = (progress.percent, progress.file, progress.bytes_received)
         if current == self._last:
             return
         self._last = current
@@ -259,22 +261,51 @@ def download_model_variant(
                 f"an incomplete or unverified model directory already exists: {destination}; "
                 "move or remove that directory before retrying"
             )
-        staging = downloads / f"{variant.runtime}-{variant.tier}-{uuid.uuid4().hex}"
+        # A stable staging directory lets a later invocation resume after the
+        # app, process, or computer is stopped. It is never activated until all
+        # published SHA-256 checksums have passed.
+        staging = downloads / f"{variant.runtime}-{variant.tier}.partial"
         activated = False
+        preserve_partial = False
         try:
-            staging.mkdir(parents=True)
+            staging.mkdir(parents=True, exist_ok=True)
             callback(DownloadProgress(0, "Checking model catalogue", 0, variant.bytes))
             release = _release_catalog()
             checksum_map = _checksum_catalog()
             published = _published_variant(release, variant)
             remote_files = _published_files(published, variant)
-            _check_disk_budget(model_root, variant.bytes)
+            staged_bytes = sum(
+                item.stat().st_size for item in staging.rglob("*") if item.is_file()
+            )
+            _check_disk_budget(model_root, max(0, variant.bytes - staged_bytes))
             received = 0
             manifest_files: list[dict[str, Any]] = []
             for repository_path in remote_files:
                 relative = _local_relative_path(repository_path, variant)
                 target = _safe_destination(staging, relative)
                 target.parent.mkdir(parents=True, exist_ok=True)
+                expected = checksum_map.get(repository_path)
+                if expected is None:
+                    raise VerificationError(
+                        f"the published checksum is missing for {Path(repository_path).name}"
+                    )
+
+                if target.is_file():
+                    size = target.stat().st_size
+                    digest = _file_sha256(target)
+                    if digest == expected:
+                        received += size
+                        callback(
+                            _progress(received, variant.bytes, Path(repository_path).name)
+                        )
+                        manifest_files.append(
+                            {
+                                "path": relative.as_posix(),
+                                "bytes": size,
+                                "sha256": digest,
+                            }
+                        )
+                        continue
                 callback(
                     _progress(received, variant.bytes, Path(repository_path).name)
                 )
@@ -285,8 +316,7 @@ def download_model_variant(
                     callback(_progress(received, variant.bytes, name))
 
                 size, digest = _download_file(repository_path, target, on_chunk)
-                expected = checksum_map.get(repository_path)
-                if expected is None or digest != expected:
+                if digest != expected:
                     raise VerificationError(
                         f"SHA-256 verification failed for {Path(repository_path).name}"
                     )
@@ -326,11 +356,17 @@ def download_model_variant(
                 downloaded=True,
             )
         except (HTTPError, URLError, TimeoutError) as exc:
-            raise ModelDownloadError(f"model download failed: {exc}") from exc
+            preserve_partial = True
+            raise ModelDownloadError(
+                f"model download was interrupted and can be resumed: {exc}"
+            ) from exc
         except OSError as exc:
-            raise ModelDownloadError(f"cannot store the downloaded model: {exc}") from exc
+            preserve_partial = True
+            raise ModelDownloadError(
+                f"cannot store the downloaded model; a retry will verify and resume it: {exc}"
+            ) from exc
         finally:
-            if not activated:
+            if not activated and not preserve_partial:
                 shutil.rmtree(staging, ignore_errors=True)
 
 
@@ -536,11 +572,37 @@ def _download_file(
     on_chunk: Callable[[int], None],
 ) -> tuple[int, str]:
     encoded = "/".join(quote(part, safe="") for part in repository_path.split("/"))
+    url = f"{_RAW_REPOSITORY}/{encoded}"
+    existing = destination.stat().st_size if destination.is_file() else 0
+    request: str | Request = url
+    if existing:
+        request = Request(url, headers={"Range": f"bytes={existing}-"})
+
+    try:
+        response_context = _open_response(request)
+    except HTTPError as exc:
+        if existing and exc.code == 416:
+            destination.unlink(missing_ok=True)
+            return _download_file(repository_path, destination, on_chunk)
+        raise
+
     digest = hashlib.sha256()
-    size = 0
-    with _open_response(f"{_RAW_REPOSITORY}/{encoded}") as response:
+    size = existing
+    with response_context as response:
         _validate_response_url(response)
-        with destination.open("xb") as output:
+        append = existing > 0 and _response_status(response) == 206
+        if append:
+            if _content_range_start(response) != existing:
+                raise VerificationError(
+                    f"invalid resume response for {Path(repository_path).name}"
+                )
+            with destination.open("rb") as partial:
+                while chunk := partial.read(_CHUNK_BYTES):
+                    digest.update(chunk)
+            on_chunk(existing)
+        else:
+            size = 0
+        with destination.open("ab" if append else "wb") as output:
             while True:
                 chunk = response.read(_CHUNK_BYTES)
                 if not chunk:
@@ -554,11 +616,33 @@ def _download_file(
     return size, digest.hexdigest()
 
 
-def _open_response(url: str) -> BinaryIO:
-    request = Request(url, headers={"User-Agent": "osAi-model-downloader/0.1.0"})
+def _open_response(url: str | Request) -> BinaryIO:
+    request = url if isinstance(url, Request) else Request(url)
+    request.add_header("User-Agent", "osAi-model-downloader/0.1.0")
     return urlopen(  # noqa: S310 - fixed HTTPS hosts are verified below
         request, timeout=60, context=_TLS_CONTEXT
     )
+
+
+def _response_status(response: BinaryIO) -> int:
+    status = getattr(response, "status", None)
+    if isinstance(status, int):
+        return status
+    getcode = getattr(response, "getcode", None)
+    code = getcode() if callable(getcode) else None
+    return code if isinstance(code, int) else 200
+
+
+def _content_range_start(response: BinaryIO) -> int | None:
+    headers = getattr(response, "headers", None)
+    value = headers.get("Content-Range", "") if headers is not None else ""
+    match = re.fullmatch(r"bytes\s+(\d+)-\d+/\d+", str(value).strip(), re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def _file_sha256(path: Path) -> str:
+    with path.open("rb") as handle:
+        return hashlib.file_digest(handle, "sha256").hexdigest()
 
 
 def _validate_response_url(response: BinaryIO) -> None:

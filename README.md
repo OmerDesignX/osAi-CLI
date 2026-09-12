@@ -293,9 +293,10 @@ Automatic settings reserve 25% of physical RAM for the operating system and
 runtime, reject a base model larger than 55% of RAM, and select the largest
 conservative `compact`, `balanced`, `performance`, or `maximum` profile that
 fits the remaining budget. The selected values are printed before training and
-stored in the run manifest. Training iterations and learning rate remain user
+stored in the run manifest. Training epochs and learning rate remain user
 controlled because they affect training duration and quality rather than peak
-memory. A manual flag such as `--rank 8` overrides that one automatic value.
+memory. One epoch means one full pass over the training split on both MLX and
+llama.cpp. A manual flag such as `--rank 8` overrides that one automatic value.
 
 ## Custom models
 
@@ -420,7 +421,8 @@ directly to alignment.
 | `--main-gpu N` | llama.cpp main GPU index. Default: `0`. |
 | `--distributed-workers N` | MLX Linux CUDA/NCCL worker count. `0` chooses a safe count. |
 | `--auto-settings`, `--no-auto-settings` | Select a RAM-aware profile for batch size, context, LoRA rank/layers/targets, and threads. Disabled by default; explicit tuning flags override its choices. |
-| `--iterations N` | Number of MLX updates or GGUF backpropagation epochs. Default: `1`. |
+| `--epochs N` | Complete passes over the fine-tuning dataset on MLX or llama.cpp. Default: `1`. |
+| `--iterations N` | Compatibility alias for `--epochs`. |
 | `--batch-size N` | MLX training batch size. Default: `1`. |
 | `--rank N` | LoRA rank. Default: `2`. |
 | `--scale NUMBER` | LoRA scaling value. Default: `4`. |
@@ -519,7 +521,7 @@ osai train \
   --data /path/to/fine-tuning-data \
   --no-auto-settings \
   --optimizer sgd \
-  --iterations 100 \
+  --epochs 1 \
   --batch-size 1 \
   --gradient-accumulation-steps 8 \
   --gradient-checkpointing \
@@ -550,7 +552,7 @@ osai train \
   --alignment-type grpo \
   --auto-settings \
   --optimizer auto \
-  --iterations 100 \
+  --epochs 1 \
   --alignment-iterations 40 \
   --alignment-learning-rate 0.00001 \
   --alignment-beta 0.1 \

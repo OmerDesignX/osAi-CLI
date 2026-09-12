@@ -46,7 +46,9 @@ class TrainingConfig:
     output: Path
     format: ModelFormat | None = None
     companion_mlx: Path | None = None
-    iterations: int = 10
+    # Fine-tuning dataset epochs. The historical field name is retained so
+    # existing JSON/TOML configurations continue to load.
+    iterations: int = 1
     batch_size: int = 1
     max_seq_length: int = 128
     num_layers: int = 1

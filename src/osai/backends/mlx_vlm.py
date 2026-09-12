@@ -7,16 +7,22 @@ import math
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 from ..config import TrainingConfig
-from ..dataset import prepare_mlx_vlm_dataset
+from ..dataset import prepare_mlx_vlm_dataset, validate_dataset
 from ..errors import DependencyError, TrainingError
 from ..io import atomic_json
 from ..paths import mlx_vlm_root
 from ..process import run_logged
 from ..session import SessionLayout
-from .mlx import MlxBackend, MlxTrainingResult, _resolve_distributed_workers
+from .mlx import (
+    MlxBackend,
+    MlxTrainingResult,
+    _resolve_distributed_workers,
+    resolve_mlx_training_steps,
+)
 
 _LOSS_RE = re.compile(r"(?:Train|Val) loss\s+([0-9]+(?:\.[0-9]+)?)", re.I)
 _TEST_RE = re.compile(r"Test loss\s+([0-9]+(?:\.[0-9]+)?)", re.I)
@@ -64,6 +70,17 @@ class MlxVlmBackend(MlxBackend):
             video_fps=config.video_fps,
             video_max_frames=config.video_max_frames,
         )
+        dataset = validate_dataset(config.data)
+        training_steps = resolve_mlx_training_steps(config, dataset.train_examples)
+        optimizer_updates = training_steps // config.grad_accumulation_steps
+        print(
+            "osai: training plan "
+            f"examples={dataset.train_examples} epochs={config.iterations} "
+            f"batch={config.batch_size} steps={training_steps} "
+            f"optimizer_updates={optimizer_updates}",
+            file=sys.stderr,
+            flush=True,
+        )
         adapter_dir = layout.adapters / "mlx"
         adapter_dir.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -72,7 +89,7 @@ class MlxVlmBackend(MlxBackend):
             "adapter_path": str(adapter_dir.resolve()),
             "optimizer": "adamw" if config.optimizer == "auto" else config.optimizer,
             "batch_size": config.batch_size,
-            "iters": config.iterations,
+            "iters": training_steps,
             "val_batches": config.val_batches,
             "learning_rate": config.learning_rate,
             "num_layers": config.num_layers,
@@ -81,7 +98,7 @@ class MlxVlmBackend(MlxBackend):
             "grad_accumulation_steps": config.grad_accumulation_steps,
             "mask_prompt": config.mask_prompt,
             "assistant_token_id": config.assistant_token_id,
-            "save_every": min(config.save_every, config.iterations),
+            "save_every": min(config.save_every, training_steps),
             "steps_per_report": config.steps_per_report,
             "steps_per_eval": config.steps_per_eval,
             "seed": config.seed,
@@ -143,6 +160,10 @@ class MlxVlmBackend(MlxBackend):
             elapsed_seconds=result.elapsed_seconds,
             losses=losses,
             test_loss=test_loss,
+            epochs=config.iterations,
+            training_steps=training_steps,
+            optimizer_updates=optimizer_updates,
+            examples_per_epoch=dataset.train_examples,
         )
 
     def verify_fusion(

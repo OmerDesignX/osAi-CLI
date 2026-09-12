@@ -177,6 +177,10 @@ def train(
                     "merged_model": merged.as_dict() if merged else None,
                     "training": {
                         "elapsed_seconds": mlx_result.elapsed_seconds,
+                        "epochs": mlx_result.epochs,
+                        "examples_per_epoch": mlx_result.examples_per_epoch,
+                        "minibatch_steps": mlx_result.training_steps,
+                        "optimizer_updates": mlx_result.optimizer_updates,
                         "reported_losses": list(mlx_result.losses),
                         "test_loss": mlx_result.test_loss,
                     },
