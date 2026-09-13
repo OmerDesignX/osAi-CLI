@@ -197,7 +197,14 @@ def build_parser() -> argparse.ArgumentParser:
     train_parser.add_argument("--rank", type=int)
     train_parser.add_argument("--scale", type=float)
     train_parser.add_argument("--num-layers", type=int)
-    train_parser.add_argument("--max-seq-length", type=int)
+    train_parser.add_argument(
+        "--max-seq-length",
+        type=int,
+        help=(
+            "maximum prompt and answer tokens per training example; longer supervised "
+            "records trim old prompt context while preserving assistant labels"
+        ),
+    )
     train_parser.add_argument("--learning-rate", type=float)
     train_parser.add_argument("--dropout", type=float)
     train_parser.add_argument(

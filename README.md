@@ -29,6 +29,12 @@ dataset.
 
 AdamW optimizer is used for MLX while SGD is used for LLama.cpp models.
 
+Hybrid GGUF models may alternate attention and recurrent blocks. osAi resolves
+LoRA targets from the projections present in the model instead of assuming the
+last blocks share one topology. When a supervised row exceeds the selected
+context, llama.cpp trims prompt context while preserving answer labels. Rows
+containing only raw text use full-token language-model loss.
+
 ## Hardware support
 
 | System | Engines |
@@ -138,9 +144,11 @@ and writes one canonical chat dataset inside the session before training.
 | Language modelling | `text` |
 | Standard or conversational completion | `prompt` + `completion`, as strings or message lists |
 | OpenAI chat | `messages` with text/content parts, tools, and tool calls |
-| ShareGPT or dialogue | `conversations`, `conversation`, `dialog`, or `dialogue`; `role/content`, `from/value`, and `speaker/text` messages |
+| ShareGPT or dialogue | `conversations`, `conversation`, `dialog`, `dialogue`, `chat`, or `turns`; `role/content`, `from/value`, `speaker/text`, and `author/content` messages |
 | Alpaca / Dolly | `instruction` + optional `input` or `context` + `output` or `response` |
-| QA / translation | `question/answer`, `query/response`, `source/target`, or `src/tgt` |
+| QA / translation | `question/answer`, SQuAD `context/question/answers`, `query/response`, translation dictionaries, `source/target`, or `src/tgt` |
+| Common task pairs | `problem/solution`, `task/solution`, `request/response`, `document/summary`, `article/highlights`, `description/code`, or `input/output` |
+| Role columns | Optional `system` plus `user` and `assistant` text columns |
 | Preference data used for SFT | `prompt` + `chosen/rejected`; the chosen response is the supervised target |
 
 Image, audio, and video fields and multimodal message parts are parsed and
@@ -427,7 +435,7 @@ directly to alignment.
 | `--rank N` | LoRA rank. Default: `2`. |
 | `--scale NUMBER` | LoRA scaling value. Default: `4`. |
 | `--num-layers N` | Number of final model layers to adapt. Default: `1`. |
-| `--max-seq-length N` | Maximum token sequence length. Default: `64` for text and at least `2048` for automatically configured media training. |
+| `--max-seq-length N` | Maximum prompt + answer tokens per example. Longer supervised rows trim old prompt context while preserving answer labels. Auto selects a hardware-safe value. |
 | `--image-size WIDTH HEIGHT` | Resize local images before VLM preprocessing. Omit it to use the model processor's native size. |
 | `--video-fps NUMBER` | Frames sampled per second from local videos. Default: `2`. |
 | `--video-max-frames N` | Maximum frames loaded from each local video. Default: `32`. |

@@ -270,7 +270,7 @@ def test_manual_values_override_the_auto_profile(monkeypatch, tmp_path: Path):
     assert resolved.auto_profile == "compact"
     assert resolved.batch_size == 2
     assert resolved.rank == 6
-    assert resolved.max_seq_length == 64
+    assert resolved.max_seq_length == 256
     assert resolved.dropout == 0.15
     assert resolved.grad_accumulation_steps == 3
     assert resolved.grad_checkpoint is False

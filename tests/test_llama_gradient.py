@@ -28,11 +28,16 @@ def test_gradient_options_reject_unknown_projection():
 
 
 def test_low_memory_guard_rejects_wide_backward_graph():
-    options = LlamaGradientOptions(
-        target_modules=("self_attn.q_proj", "mlp.down_proj")
-    )
+    options = LlamaGradientOptions(target_modules=("self_attn.q_proj", "mlp.down_proj"))
     with pytest.raises(ConfigurationError, match="low-memory"):
         _validate_memory_budget(options, 8 * 1024**3)
+
+
+def test_low_memory_guard_accepts_the_native_256_token_floor():
+    _validate_memory_budget(
+        LlamaGradientOptions(context=256, batch_size=8),
+        8 * 1024**3,
+    )
 
 
 def test_cpu_gradient_command_disables_repack_and_devices():
@@ -51,9 +56,7 @@ def test_cpu_gradient_command_disables_repack_and_devices():
 
 
 def test_metal_gradient_command_preserves_multi_gpu_devices():
-    options = LlamaGradientOptions(
-        multi_gpu="on", devices=("MTL0", "MTL1"), split_mode="layer"
-    )
+    options = LlamaGradientOptions(multi_gpu="on", devices=("MTL0", "MTL1"), split_mode="layer")
     command = _gradient_command(
         Path("llama-finetune"),
         Path("base.gguf"),
@@ -74,10 +77,7 @@ def test_gradient_log_parsers():
     )
     assert _parse_epoch_losses(output, Path("train.log")) == (0.795442714,)
     assert _parse_optimizer_steps(output, 1) == 64
-    supervised = (
-        "supervised optimizer step labels=4\n"
-        "I checkpoint epoch=2 best_train_loss=0.25\n"
-    )
+    supervised = "supervised optimizer step labels=4\nI checkpoint epoch=2 best_train_loss=0.25\n"
     assert _parse_optimizer_steps(supervised, 10, mask_prompt=True) == 1
     assert _parse_best_checkpoint(supervised, (0.5, 0.25)) == (2, 0.25)
     assert _parse_supervised_loss("I eval_loss=0.03125", Path("eval.log")) == 0.03125
@@ -93,16 +93,12 @@ def test_cli_exposes_gradient_optimizer():
 
 
 def test_cli_allows_explicit_adamw_gradient_optimizer():
-    args = build_parser().parse_args(
-        ["train", "--tier", "small", "--optimizer", "adamw"]
-    )
+    args = build_parser().parse_args(["train", "--tier", "small", "--optimizer", "adamw"])
     assert args.optimizer == "adamw"
 
 
 def test_cli_retains_legacy_gguf_optimizer_alias():
-    args = build_parser().parse_args(
-        ["train", "--tier", "small", "--gguf-optimizer", "adamw"]
-    )
+    args = build_parser().parse_args(["train", "--tier", "small", "--gguf-optimizer", "adamw"])
     assert args.gguf_optimizer == "adamw"
 
 
@@ -112,6 +108,21 @@ def test_cli_exposes_default_on_merge_controls():
     disabled = parser.parse_args(["train", "--tier", "small", "--no-merge"])
     assert enabled.merge_model is True
     assert disabled.merge_model is False
+
+
+def test_native_trainer_honors_the_selected_sequence_limit():
+    source = (
+        Path(__file__).parents[1]
+        / "vendor"
+        / "llama.cpp"
+        / "examples"
+        / "training"
+        / "finetune.cpp"
+    ).read_text(encoding="utf-8")
+    assert 'std::getenv("OSAI_MAX_SEQ_LENGTH")' in source
+    assert "trimmed prompt context while preserving assistant labels" in source
+    assert "osai_tokenize_training_record" in source
+    assert "Plain-text corpora have no prompt/answer boundary" in source
 
 
 def test_cli_defaults_training_runs_to_sessions():

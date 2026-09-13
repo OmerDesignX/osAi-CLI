@@ -508,6 +508,7 @@ def _native_alignment_step(
     log_path.unlink(missing_ok=True)
     environment = offline_environment()
     environment["OSAI_MASK_PROMPT"] = "1"
+    environment["OSAI_MAX_SEQ_LENGTH"] = str(settings.context)
     environment["OSAI_EXAMPLE_WEIGHTS"] = ",".join(
         format(value, ".17g") for value in weights
     )

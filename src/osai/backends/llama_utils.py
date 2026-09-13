@@ -23,9 +23,7 @@ from ..paths import llama_cpp_root
 from ..process import run_logged
 
 _PPL_RE = re.compile(r"Final estimate:\s*PPL\s*=\s*([0-9.eE+-]+)")
-_LOSS_ROW_RE = re.compile(
-    r"^\s*\d+\s+[0-9.eE+-]+\s+([0-9.eE+-]+)\s+[0-9.eE+-]+\s*$", re.MULTILINE
-)
+_LOSS_ROW_RE = re.compile(r"^\s*\d+\s+[0-9.eE+-]+\s+([0-9.eE+-]+)\s+[0-9.eE+-]+\s*$", re.MULTILINE)
 _MODULE_NAMES = {
     "self_attn.q_proj": "attn_q",
     "self_attn.k_proj": "attn_k",
@@ -35,6 +33,8 @@ _MODULE_NAMES = {
     "mlp.up_proj": "ffn_up",
     "mlp.down_proj": "ffn_down",
 }
+_MODULE_BY_GGUF_NAME = {value: key for key, value in _MODULE_NAMES.items()}
+_BLOCK_TENSOR_RE = re.compile(r"^blk\.(\d+)\.([^.]+)\.weight$")
 
 
 class AdapterSettings(DeviceSettings, Protocol):
@@ -49,34 +49,95 @@ def _initialize_parameters(base: ModelInspection, settings: AdapterSettings, np)
         raise VerificationError("GGUF block count is required to select LoRA layers")
     if settings.num_layers > base.block_count:
         raise ConfigurationError("num_layers exceeds the GGUF block count")
-    wanted = {
-        f"blk.{block}.{_MODULE_NAMES[module]}.weight"
-        for block in range(base.block_count - settings.num_layers, base.block_count)
-        for module in settings.target_modules
-    }
-    shapes: dict[str, tuple[int, int]] = {}
+    discovered: dict[str, tuple[int, int]] = {}
     gguf = _import_gguf()
     for shard in base.shards:
         reader = gguf.GGUFReader(shard)
         for tensor in reader.tensors:
-            if tensor.name in wanted:
-                dimensions = tuple(int(value) for value in tensor.shape)
-                if len(dimensions) != 2:
-                    raise VerificationError(f"LoRA target is not a matrix: {tensor.name}")
-                shapes[tensor.name] = (dimensions[0], dimensions[1])
-    missing = sorted(wanted - set(shapes))
-    if missing:
-        raise VerificationError("GGUF is missing requested LoRA tensors: " + ", ".join(missing))
+            match = _BLOCK_TENSOR_RE.fullmatch(str(tensor.name))
+            if match is None or match.group(2) not in _MODULE_BY_GGUF_NAME:
+                continue
+            dimensions = tuple(int(value) for value in tensor.shape)
+            if len(dimensions) != 2:
+                continue
+            discovered[str(tensor.name)] = (dimensions[0], dimensions[1])
+    shapes = _select_lora_tensor_shapes(discovered, base.block_count, settings)
     rng = np.random.default_rng(settings.seed)
     parameters = {}
     for name, (input_size, output_size) in sorted(shapes.items()):
         parameters[f"{name}.lora_a"] = rng.normal(
             0.0, 1.0 / math.sqrt(input_size), size=(settings.rank, input_size)
         ).astype(np.float32)
-        parameters[f"{name}.lora_b"] = np.zeros(
-            (output_size, settings.rank), dtype=np.float32
-        )
+        parameters[f"{name}.lora_b"] = np.zeros((output_size, settings.rank), dtype=np.float32)
     return parameters
+
+
+def _select_lora_tensor_shapes(
+    discovered: dict[str, tuple[int, int]],
+    block_count: int,
+    settings: AdapterSettings,
+) -> dict[str, tuple[int, int]]:
+    """Select the last available instances of each requested projection.
+
+    Hybrid models do not contain every projection in every transformer block.
+    In particular, attention and recurrent blocks can alternate. Selecting the
+    final numeric block range therefore asks for tensors that legitimately do
+    not exist. Resolve each projection against the tensors actually present in
+    the GGUF so the same model works on Windows, Linux, and macOS.
+    """
+
+    candidates: dict[str, list[tuple[int, str, tuple[int, int]]]] = {
+        module: [] for module in settings.target_modules
+    }
+    available_modules: set[str] = set()
+    for name, shape in discovered.items():
+        match = _BLOCK_TENSOR_RE.fullmatch(name)
+        if match is None:
+            continue
+        block = int(match.group(1))
+        if not 0 <= block < block_count:
+            continue
+        module = _MODULE_BY_GGUF_NAME.get(match.group(2))
+        if module is None:
+            continue
+        available_modules.add(module)
+        if module in candidates:
+            candidates[module].append((block, name, shape))
+
+    selected: dict[str, tuple[int, int]] = {}
+    unavailable: list[str] = []
+    limited: list[str] = []
+    for module in settings.target_modules:
+        options = sorted(candidates[module], key=lambda item: item[0])
+        if not options:
+            unavailable.append(module)
+            continue
+        chosen = options[-settings.num_layers :]
+        if len(chosen) < settings.num_layers:
+            limited.append(f"{module} ({len(chosen)}/{settings.num_layers})")
+        selected.update({name: shape for _, name, shape in chosen})
+
+    if not selected:
+        available = ", ".join(sorted(available_modules)) or "none"
+        requested = ", ".join(settings.target_modules)
+        raise VerificationError(
+            "GGUF has none of the requested LoRA projections "
+            f"({requested}); available projections: {available}"
+        )
+    if unavailable:
+        print(
+            "osai: GGUF architecture omits requested projection(s) "
+            + ", ".join(unavailable)
+            + "; continuing with compatible projections",
+            file=sys.stderr,
+        )
+    if limited:
+        print(
+            "osai: GGUF has fewer compatible projection layers than requested: "
+            + ", ".join(limited),
+            file=sys.stderr,
+        )
+    return selected
 
 
 def _write_adapter(path: Path, architecture: str, parameters, alpha: float, np) -> None:

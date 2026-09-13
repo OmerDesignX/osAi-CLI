@@ -37,6 +37,9 @@ def _line(path: Path, value, *, encoding: str = "utf-8"):
         ({"question": "p", "answer": "c"}, "question-answer", "p", "c"),
         ({"query": "p", "response": "c"}, "query-response", "p", "c"),
         ({"src": "p", "tgt": "c"}, "source-target", "p", "c"),
+        ({"problem": "p", "solution": "c"}, "problem-solution", "p", "c"),
+        ({"document": "p", "summary": "c"}, "document-summary", "p", "c"),
+        ({"description": "p", "code": "c"}, "text-to-code", "p", "c"),
         (
             {"prompt": "p", "chosen": "c", "rejected": "r"},
             "preference-chosen",
@@ -87,6 +90,14 @@ def test_common_supervised_pairs_are_normalized(
             ],
             "dialogue",
         ),
+        (
+            "chat",
+            [
+                {"author": "human", "content": "hi"},
+                {"author": "agent", "content": "hello"},
+            ],
+            "dialogue",
+        ),
     ],
 )
 def test_openai_sharegpt_and_dialogue_formats(
@@ -124,6 +135,36 @@ def test_conversational_prompt_completion_and_text_parts(tmp_path: Path):
     record = next(iter_normalized_examples(tmp_path, "train"))
     assert record["messages"][1]["content"] == "first\nsecond"
     assert record["messages"][-1]["content"] == "done"
+
+
+def test_squad_translation_and_role_columns_are_normalized(tmp_path: Path):
+    rows = (
+        {
+            "context": "The sky is blue.",
+            "question": "What colour is the sky?",
+            "answers": {"text": ["blue"], "answer_start": [11]},
+        },
+        {"translation": {"en": "hello", "fr": "bonjour"}},
+        {"system": "Be concise", "user": "Hi", "assistant": "Hello"},
+    )
+    (tmp_path / "train.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    summary = validate_dataset(tmp_path)
+    records = list(iter_normalized_examples(tmp_path, "train"))
+    assert summary.schema == "mixed-supervised"
+    assert records[0]["messages"] == [
+        {
+            "role": "user",
+            "content": "What colour is the sky?\n\nContext:\nThe sky is blue.",
+        },
+        {"role": "assistant", "content": "blue"},
+    ]
+    assert records[1]["messages"][0]["content"] == ("Translate from en to fr:\nhello")
+    assert records[2]["messages"][0] == {
+        "role": "system",
+        "content": "Be concise",
+    }
 
 
 def test_conversational_preference_uses_chosen_response_for_sft(tmp_path: Path):
@@ -196,10 +237,7 @@ def test_compatible_supervised_schemas_can_be_mixed_and_are_homogeneous_for_mlx(
 
 def test_raw_text_is_supported_but_cannot_mix_with_supervised_loss(tmp_path: Path):
     (tmp_path / "train.jsonl").write_text(
-        json.dumps({"text": "one"})
-        + "\n"
-        + json.dumps({"prompt": "p", "completion": "c"})
-        + "\n",
+        json.dumps({"text": "one"}) + "\n" + json.dumps({"prompt": "p", "completion": "c"}) + "\n",
         encoding="utf-8",
     )
     with pytest.raises(ConfigurationError, match="cannot be mixed"):
@@ -212,9 +250,7 @@ def test_bom_jsonl_and_text_corpus(tmp_path: Path):
         {"instruction": "Question", "response": "Answer"},
         encoding="utf-8-sig",
     )
-    assert list(text_corpus(tmp_path, "train")) == [
-        "user: Question\nassistant: Answer"
-    ]
+    assert list(text_corpus(tmp_path, "train")) == ["user: Question\nassistant: Answer"]
 
 
 def test_bad_role_and_prompt_only_chat_are_rejected(tmp_path: Path):

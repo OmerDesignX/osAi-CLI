@@ -37,9 +37,7 @@ from .llama_utils import (
 _EPOCH_LOSS_RE = re.compile(r"epoch=(\d+)\s+train_loss=([0-9.eE+-]+)")
 _PROGRESS_RE = re.compile(r"data=\d+/(\d+)")
 _SUPERVISED_STEP_RE = re.compile(r"supervised optimizer step labels=\d+")
-_CHECKPOINT_RE = re.compile(
-    r"checkpoint epoch=(\d+)\s+best_train_loss=([0-9.eE+-]+)"
-)
+_CHECKPOINT_RE = re.compile(r"checkpoint epoch=(\d+)\s+best_train_loss=([0-9.eE+-]+)")
 _SUPERVISED_EVAL_RE = re.compile(r"eval_loss=([0-9.eE+-]+)")
 _SUPPORTED_TARGETS = frozenset(DEFAULT_TARGETS)
 
@@ -171,6 +169,10 @@ def train_gradient_gguf(
 
             np = _import_numpy()
             parameters = _initialize_parameters(base, settings, np)
+            manifest["options"]["selected_base_tensors"] = sorted(
+                {name.removesuffix(".lora_a").removesuffix(".lora_b") for name in parameters}
+            )
+            atomic_json(manifest_path, manifest)
             internal = layout.work
             initial_adapter = internal / "adapter-initial.gguf"
             trained_adapter = internal / "adapter-trained.gguf"
@@ -205,9 +207,7 @@ def train_gradient_gguf(
                     internal / "test.txt",
                     corpus_context,
                     repeat_to_minimum=not settings.mask_prompt,
-                    record_separator=(
-                        structured_separator if settings.mask_prompt else "\n\n"
-                    ),
+                    record_separator=(structured_separator if settings.mask_prompt else "\n\n"),
                 )
                 if test_source.is_file()
                 else None
@@ -219,9 +219,7 @@ def train_gradient_gguf(
             if not settings.mask_prompt:
                 perplexity_binary = llama_binary("llama-perplexity")
                 if perplexity_binary is None:
-                    raise DependencyError(
-                        "llama-perplexity is not built; run `osai build-llama`"
-                    )
+                    raise DependencyError("llama-perplexity is not built; run `osai build-llama`")
                 initial_loss, evaluation_accelerator = _evaluate_loss(
                     perplexity_binary,
                     base.path,
@@ -237,11 +235,17 @@ def train_gradient_gguf(
             log_path.unlink(missing_ok=True)
             successful_offset = 0
             command = _gradient_command(
-                binary, base.path, initial_adapter, train_corpus, trained_adapter,
-                settings, training_accelerator,
+                binary,
+                base.path,
+                initial_adapter,
+                train_corpus,
+                trained_adapter,
+                settings,
+                training_accelerator,
             )
             training_env = offline_environment()
             training_env["OSAI_MASK_PROMPT"] = "1" if settings.mask_prompt else "0"
+            training_env["OSAI_MAX_SEQ_LENGTH"] = str(settings.context)
             try:
                 run_logged(command, log_path=log_path, env=training_env)
             except TrainingError:
@@ -253,8 +257,13 @@ def train_gradient_gguf(
                 successful_offset = log_path.stat().st_size if log_path.exists() else 0
                 print(f"osai: {fallback_from} backprop failed; retrying with CPU")
                 command = _gradient_command(
-                    binary, base.path, initial_adapter, train_corpus, trained_adapter,
-                    settings, training_accelerator,
+                    binary,
+                    base.path,
+                    initial_adapter,
+                    train_corpus,
+                    trained_adapter,
+                    settings,
+                    training_accelerator,
                 )
                 run_logged(command, log_path=log_path, env=training_env)
 
@@ -267,9 +276,7 @@ def train_gradient_gguf(
             optimizer_steps = _parse_optimizer_steps(
                 successful_log, settings.epochs, settings.mask_prompt
             )
-            best_epoch, best_supervised_loss = _parse_best_checkpoint(
-                successful_log, epoch_losses
-            )
+            best_epoch, best_supervised_loss = _parse_best_checkpoint(successful_log, epoch_losses)
             if settings.mask_prompt:
                 initial_loss = epoch_losses[0]
 
@@ -341,9 +348,7 @@ def train_gradient_gguf(
             if settings.mask_prompt:
                 loss_reducing_steps = sum(
                     current < previous
-                    for previous, current in zip(
-                        epoch_losses, epoch_losses[1:], strict=False
-                    )
+                    for previous, current in zip(epoch_losses, epoch_losses[1:], strict=False)
                 )
             else:
                 loss_reducing_steps = int(final_loss < initial_loss)
@@ -415,21 +420,35 @@ def _gradient_command(
 ) -> list[str]:
     command = [
         str(binary),
-        "-m", str(model),
-        "--lora", str(adapter),
-        "-f", str(corpus),
-        "-o", str(output),
-        "-c", str(settings.context),
-        "-b", str(settings.batch_size),
-        "-ub", str(settings.batch_size),
-        "-epochs", str(settings.epochs),
-        "-val-split", "0",
-        "-lr", format(settings.learning_rate, ".17g"),
-        "-opt", settings.optimizer,
-        "-t", str(settings.threads),
-        "-tb", str(settings.threads),
+        "-m",
+        str(model),
+        "--lora",
+        str(adapter),
+        "-f",
+        str(corpus),
+        "-o",
+        str(output),
+        "-c",
+        str(settings.context),
+        "-b",
+        str(settings.batch_size),
+        "-ub",
+        str(settings.batch_size),
+        "-epochs",
+        str(settings.epochs),
+        "-val-split",
+        "0",
+        "-lr",
+        format(settings.learning_rate, ".17g"),
+        "-opt",
+        settings.optimizer,
+        "-t",
+        str(settings.threads),
+        "-tb",
+        str(settings.threads),
         "--no-repack",
-        "--log-colors", "off",
+        "--log-colors",
+        "off",
     ]
     command.extend(llama_device_arguments(accelerator, settings))
     return command
@@ -460,6 +479,7 @@ def _evaluate_supervised_loss(
     )
     environment = offline_environment()
     environment["OSAI_MASK_PROMPT"] = "1"
+    environment["OSAI_MAX_SEQ_LENGTH"] = str(settings.context)
     environment["OSAI_EVAL_ONLY"] = "1"
     if example_weights is not None:
         environment["OSAI_EXAMPLE_WEIGHTS"] = ",".join(
@@ -471,8 +491,13 @@ def _evaluate_supervised_loss(
         if accelerator is Accelerator.CPU:
             raise
         command = _gradient_command(
-            binary, model, adapter, corpus, log_path.with_suffix(".unused.gguf"),
-            settings, Accelerator.CPU,
+            binary,
+            model,
+            adapter,
+            corpus,
+            log_path.with_suffix(".unused.gguf"),
+            settings,
+            Accelerator.CPU,
         )
         run_logged(command, log_path=log_path, env=environment)
     output = log_path.read_text(encoding="utf-8", errors="replace")
@@ -520,9 +545,7 @@ def _parse_optimizer_steps(output: str, epochs: int, mask_prompt: bool = False) 
     return max(totals, default=1) * epochs
 
 
-def _parse_best_checkpoint(
-    output: str, epoch_losses: tuple[float, ...]
-) -> tuple[int, float]:
+def _parse_best_checkpoint(output: str, epoch_losses: tuple[float, ...]) -> tuple[int, float]:
     matches = _CHECKPOINT_RE.findall(output)
     if matches:
         epoch, loss = matches[-1]
@@ -531,9 +554,7 @@ def _parse_best_checkpoint(
     return best_index + 1, epoch_losses[best_index]
 
 
-def _validate_memory_budget(
-    settings: LlamaGradientOptions, physical_memory: int | None
-) -> None:
+def _validate_memory_budget(settings: LlamaGradientOptions, physical_memory: int | None) -> None:
     if physical_memory is None or physical_memory > 10 * 1024**3:
         return
     unsafe: list[str] = []
@@ -541,13 +562,13 @@ def _validate_memory_budget(
         unsafe.append("more than one target module")
     if settings.num_layers > 1:
         unsafe.append("more than one model layer")
-    if settings.context > 64:
-        unsafe.append("context above 64")
+    if settings.context > 256:
+        unsafe.append("context above 256")
     if settings.batch_size > 8:
         unsafe.append("microbatch above 8")
     if unsafe:
         raise ConfigurationError(
             "the low-memory GGUF backprop safety limit rejects "
             + ", ".join(unsafe)
-            + "; use one target, one layer, context <= 64, and microbatch <= 8"
+            + "; use one target, one layer, context <= 256, and microbatch <= 8"
         )

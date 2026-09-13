@@ -33,12 +33,109 @@ static bool lora_param_filter(const ggml_tensor * tensor, void * userdata) {
     return ends_with(suffix_a) || ends_with(suffix_b);
 }
 
-static bool token_sequence_at(
-        const std::vector<llama_token> & tokens,
-        size_t                           offset,
-        const std::vector<llama_token> & sequence) {
-    return !sequence.empty() && offset + sequence.size() <= tokens.size() &&
-            std::equal(sequence.begin(), sequence.end(), tokens.begin() + offset);
+static bool osai_role_marker_at(
+        const std::string & record,
+        size_t              offset,
+        size_t            & marker_size,
+        bool              & is_assistant) {
+    if (offset > 0 && record[offset - 1] != '\n') {
+        return false;
+    }
+    static const char * roles[] = {"system:", "user:", "assistant:", "tool:"};
+    for (const char * role : roles) {
+        const size_t size = std::strlen(role);
+        if (record.compare(offset, size, role) == 0) {
+            marker_size = size;
+            is_assistant = std::strcmp(role, "assistant:") == 0;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void osai_append_tokens(
+        llama_context            * ctx,
+        const std::string        & text,
+        bool                       train,
+        std::vector<llama_token> & tokens,
+        std::vector<bool>        & train_mask) {
+    if (text.empty()) {
+        return;
+    }
+    const auto chunk = common_tokenize(ctx, text, tokens.empty());
+    tokens.insert(tokens.end(), chunk.begin(), chunk.end());
+    train_mask.insert(train_mask.end(), chunk.size(), train);
+}
+
+// Tokenize role-delimited text one span at a time. Locating roles in the source
+// text avoids BPE boundary differences such as "\nassistant:" being tokenized
+// differently from an isolated "assistant:" marker.
+static bool osai_tokenize_training_record(
+        llama_context            * ctx,
+        const std::string        & record,
+        std::vector<llama_token> & tokens,
+        std::vector<bool>        & train_mask,
+        bool                     & train_eos) {
+    struct role_span {
+        size_t offset;
+        size_t marker_size;
+        bool   assistant;
+    };
+    std::vector<role_span> spans;
+    for (size_t offset = 0; offset < record.size(); ++offset) {
+        size_t marker_size = 0;
+        bool assistant = false;
+        if (osai_role_marker_at(record, offset, marker_size, assistant)) {
+            spans.push_back({offset, marker_size, assistant});
+        }
+    }
+
+    if (spans.empty()) {
+        // Plain-text corpora have no prompt/answer boundary. Train all tokens
+        // instead of rejecting an otherwise valid language-model dataset.
+        osai_append_tokens(ctx, record, true, tokens, train_mask);
+        train_eos = true;
+        return !tokens.empty();
+    }
+    if (spans.front().offset > 0) {
+        osai_append_tokens(ctx, record.substr(0, spans.front().offset), false, tokens, train_mask);
+    }
+
+    bool found_assistant = false;
+    bool assistant_has_labels = false;
+    for (size_t index = 0; index < spans.size(); ++index) {
+        const auto & span = spans[index];
+        const size_t stop = index + 1 < spans.size() ? spans[index + 1].offset : record.size();
+        osai_append_tokens(
+                ctx, record.substr(span.offset, span.marker_size), false, tokens, train_mask);
+        const size_t content_begin = span.offset + span.marker_size;
+        const auto labels_before = std::count(train_mask.begin(), train_mask.end(), true);
+        osai_append_tokens(
+                ctx, record.substr(content_begin, stop - content_begin),
+                span.assistant, tokens, train_mask);
+        if (span.assistant) {
+            found_assistant = true;
+            assistant_has_labels = assistant_has_labels ||
+                    std::count(train_mask.begin(), train_mask.end(), true) > labels_before;
+        }
+    }
+    train_eos = spans.back().assistant;
+    return found_assistant && (assistant_has_labels || train_eos);
+}
+
+static size_t osai_record_token_limit(llama_context * ctx) {
+    const size_t context = llama_n_ctx(ctx);
+    const char * value = std::getenv("OSAI_MAX_SEQ_LENGTH");
+    if (value == nullptr || *value == '\0') {
+        return context;
+    }
+    char * end = nullptr;
+    const unsigned long long parsed = std::strtoull(value, &end, 10);
+    if (end == value || *end != '\0' || parsed == 0) {
+        LOG_WRN("ignoring invalid OSAI_MAX_SEQ_LENGTH=%s\n", value);
+        return context;
+    }
+    return std::min(context, static_cast<size_t>(parsed));
 }
 
 // Build one padded datapoint per structured record and mark every label outside
@@ -52,17 +149,13 @@ static ggml_opt_dataset_t assistant_dataset_init(
         int64_t            & n_examples,
         std::vector<int64_t> & label_counts,
         std::vector<int64_t> & backward_batches) {
-    const auto assistant = common_tokenize(ctx, "assistant:", false);
-    const auto user      = common_tokenize(ctx, "user:",      false);
-    if (assistant.empty() || user.empty()) {
-        return nullptr;
-    }
-
     const std::string separator = "\n<|osai_record_end|>\n";
     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
     const llama_token eos = llama_vocab_eos(vocab);
+    const size_t record_token_limit = osai_record_token_limit(ctx);
     std::vector<std::vector<llama_token>> examples;
     std::vector<std::vector<bool>> train_masks;
+    size_t truncated_records = 0;
     for (size_t begin = 0; begin <= corpus.size();) {
         const size_t end = corpus.find(separator, begin);
         std::string record = corpus.substr(begin, end == std::string::npos ? end : end - begin);
@@ -70,36 +163,40 @@ static ggml_opt_dataset_t assistant_dataset_init(
             record.pop_back();
         }
         if (!record.empty()) {
-            auto tokens = common_tokenize(ctx, record, true);
+            std::vector<llama_token> tokens;
+            std::vector<bool> train_token;
+            bool train_eos = false;
+            if (!osai_tokenize_training_record(
+                        ctx, record, tokens, train_token, train_eos)) {
+                LOG_ERR("structured training record has no usable assistant response\n");
+                return nullptr;
+            }
             if (eos != LLAMA_TOKEN_NULL && (tokens.empty() || tokens.back() != eos)) {
                 tokens.push_back(eos);
+                train_token.push_back(train_eos);
             }
-            if (tokens.size() > llama_n_ctx(ctx)) {
-                LOG_ERR("structured training record has %zu tokens but context size is %u\n",
-                        tokens.size(), llama_n_ctx(ctx));
-                return nullptr;
-            }
-            std::vector<bool> train_token(tokens.size(), false);
-            bool in_assistant = false;
-            bool found_assistant = false;
-            for (size_t i = 0; i < tokens.size();) {
-                if (token_sequence_at(tokens, i, assistant)) {
-                    found_assistant = true;
-                    in_assistant = true;
-                    i += assistant.size();
-                    continue;
+            if (tokens.size() > record_token_limit) {
+                const auto first_label = std::find(train_token.begin(), train_token.end(), true);
+                if (first_label == train_token.end()) {
+                    LOG_ERR("structured training record has no assistant labels\n");
+                    return nullptr;
                 }
-                if (token_sequence_at(tokens, i, user)) {
-                    in_assistant = false;
-                    i += user.size();
-                    continue;
+                const size_t label_offset = static_cast<size_t>(first_label - train_token.begin());
+                const size_t completion = tokens.size() - label_offset;
+                const size_t completion_budget = std::min(
+                        completion, std::max<size_t>(1, record_token_limit / 2));
+                const size_t prompt_budget = record_token_limit - completion_budget;
+                const size_t start = label_offset > prompt_budget ? label_offset - prompt_budget : 0;
+                const size_t stop = std::min(tokens.size(), start + record_token_limit);
+                tokens = std::vector<llama_token>(tokens.begin() + start, tokens.begin() + stop);
+                train_token = std::vector<bool>(
+                        train_token.begin() + start, train_token.begin() + stop);
+                ++truncated_records;
+                if (truncated_records <= 3) {
+                    LOG_WRN("structured training record exceeded the %zu-token training limit; "
+                            "trimmed prompt context while preserving assistant labels\n",
+                            record_token_limit);
                 }
-                train_token[i] = in_assistant;
-                ++i;
-            }
-            if (!found_assistant) {
-                LOG_ERR("structured training record has no assistant: span\n");
-                return nullptr;
             }
             examples.push_back(std::move(tokens));
             train_masks.push_back(std::move(train_token));
@@ -111,6 +208,10 @@ static ggml_opt_dataset_t assistant_dataset_init(
     }
     if (examples.empty()) {
         return nullptr;
+    }
+    if (truncated_records > 0) {
+        LOG_WRN("trimmed %zu structured training record(s) to %zu tokens\n",
+                truncated_records, record_token_limit);
     }
 
     const int64_t n_ctx = llama_n_ctx(ctx);

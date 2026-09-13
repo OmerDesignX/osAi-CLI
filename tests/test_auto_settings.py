@@ -46,7 +46,7 @@ def test_low_memory_backprop_uses_the_proven_safe_shape():
         memory_bytes=8 * GIB,
         cpu_count=8,
     )
-    assert settings.max_seq_length == 64
+    assert settings.max_seq_length == 256
     assert settings.gguf_batch_size == 8
     assert settings.num_layers == 1
     assert settings.rank == 1

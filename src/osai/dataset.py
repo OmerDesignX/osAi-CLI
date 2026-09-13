@@ -20,6 +20,7 @@ _ROLE_ALIASES = {
     "bot": "assistant",
     "gpt": "assistant",
     "model": "assistant",
+    "agent": "assistant",
     "system": "system",
     "developer": "system",
     "tool": "tool",
@@ -33,10 +34,13 @@ _ROLE_ALIASES = {
 _MEDIA_KEYS = {
     "image": "image",
     "images": "image",
+    "image_url": "image",
     "audio": "audio",
     "audios": "audio",
+    "audio_url": "audio",
     "video": "video",
     "videos": "video",
+    "video_url": "video",
 }
 _MEDIA_TYPES = {"image", "image_url", "audio", "audio_url", "video", "video_url"}
 _REMOTE_SCHEMES = {"http", "https", "ftp", "ftps", "s3", "gs"}
@@ -177,9 +181,7 @@ def read_jsonl(path: Path) -> Iterator[tuple[int, dict[str, Any]]]:
         raise ConfigurationError(f"cannot read dataset file {path}: {exc}") from exc
 
 
-def normalize_sft_example(
-    item: dict[str, Any], path: Path, line: int
-) -> NormalizedExample:
+def normalize_sft_example(item: dict[str, Any], path: Path, line: int) -> NormalizedExample:
     """Map common LLM/VLM JSON schemas to MLX-compatible canonical records."""
 
     if not isinstance(item, dict):
@@ -198,11 +200,9 @@ def normalize_sft_example(
             tools=item.get("tools"),
         )
 
-    for key in ("conversations", "conversation", "dialog", "dialogue"):
+    for key in ("conversations", "conversation", "dialog", "dialogue", "chat", "turns"):
         if isinstance(item.get(key), list):
-            messages, message_modalities = normalize_conversation(
-                item[key], path, line, key
-            )
+            messages, message_modalities = normalize_conversation(item[key], path, line, key)
             _require_supervised_messages(messages, path, line)
             return _supervised_record(
                 messages,
@@ -220,27 +220,78 @@ def normalize_sft_example(
         )
 
     instruction = _nonempty_string(item.get("instruction"))
-    output = _first_text(item, ("output", "response", "answer"))
+    output = _first_text(item, ("output", "response", "answer", "solution", "code"))
     if instruction and output:
         context = item.get("input", item.get("context", ""))
         if context is not None and not isinstance(context, str):
-            raise ConfigurationError(
-                f"instruction context/input must be a string at {path}:{line}"
-            )
+            raise ConfigurationError(f"instruction context/input must be a string at {path}:{line}")
         prompt = _instruction_prompt(instruction, context or "")
         schema = "alpaca" if "output" in item or "input" in item else "dolly"
         return _pair_record(prompt, output, schema, top_modalities)
 
     question = _first_text(item, ("question", "query"))
     answer = _first_text(item, ("answer", "response", "output", "target"))
+    if question and not answer:
+        answer = _answer_text(item.get("answers"))
     if question and answer:
-        schema = "question-answer" if "question" in item else "query-response"
-        return _pair_record(question, answer, schema, top_modalities)
+        context = _first_text(item, ("context", "passage", "background"))
+        schema = (
+            "squad"
+            if "answers" in item
+            else ("question-answer" if "question" in item else "query-response")
+        )
+        return _pair_record(_instruction_prompt(question, context), answer, schema, top_modalities)
 
     source = _first_text(item, ("source", "src"))
     target = _first_text(item, ("target", "tgt"))
     if source and target:
         return _pair_record(source, target, "source-target", top_modalities)
+
+    translation = item.get("translation")
+    if isinstance(translation, dict):
+        translations = [
+            (str(language), text.strip())
+            for language, text in translation.items()
+            if isinstance(text, str) and text.strip()
+        ]
+        if len(translations) >= 2:
+            source_language, source_text = translations[0]
+            target_language, target_text = translations[1]
+            return _pair_record(
+                f"Translate from {source_language} to {target_language}:\n{source_text}",
+                target_text,
+                "translation",
+                top_modalities,
+            )
+
+    user_text = _first_text(item, ("user", "human"))
+    assistant_text = _first_text(item, ("assistant", "agent", "bot"))
+    if user_text and assistant_text:
+        messages: list[dict[str, Any]] = []
+        system_text = _first_text(item, ("system", "developer"))
+        if system_text:
+            messages.append({"role": "system", "content": system_text})
+        messages.extend(
+            [
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": assistant_text},
+            ]
+        )
+        return _supervised_record(messages, "role-columns", top_modalities)
+
+    for prompt_key, response_key, schema in (
+        ("problem", "solution", "problem-solution"),
+        ("task", "solution", "task-solution"),
+        ("request", "response", "request-response"),
+        ("document", "summary", "document-summary"),
+        ("article", "highlights", "article-summary"),
+        ("description", "code", "text-to-code"),
+        ("input", "output", "input-output"),
+    ):
+        pair_prompt = _nonempty_string(item.get(prompt_key))
+        pair_response = _nonempty_string(item.get(response_key))
+        if pair_prompt and pair_response:
+            return _pair_record(pair_prompt, pair_response, schema, top_modalities)
 
     prompt_value = _first_value(item, ("prompt", "question", "query", "instruction"))
     chosen = _first_value(item, ("chosen", "preferred", "accepted", "winner"))
@@ -249,29 +300,17 @@ def normalize_sft_example(
     )
     if chosen is not None and rejected is not None:
         if prompt_value is not None:
-            messages, modalities = _prompt_completion_messages(
-                prompt_value, chosen, path, line
-            )
-            return _supervised_record(
-                messages, "preference-chosen", top_modalities | modalities
-            )
+            messages, modalities = _prompt_completion_messages(prompt_value, chosen, path, line)
+            return _supervised_record(messages, "preference-chosen", top_modalities | modalities)
         if isinstance(chosen, list):
-            messages, modalities = normalize_conversation(
-                chosen, path, line, "chosen"
-            )
+            messages, modalities = normalize_conversation(chosen, path, line, "chosen")
             _require_supervised_messages(messages, path, line)
-            return _supervised_record(
-                messages, "preference-chosen", top_modalities | modalities
-            )
+            return _supervised_record(messages, "preference-chosen", top_modalities | modalities)
 
     ranked_choice = _ranked_choice(item)
     if prompt_value is not None and ranked_choice is not None:
-        messages, modalities = _prompt_completion_messages(
-            prompt_value, ranked_choice, path, line
-        )
-        return _supervised_record(
-            messages, "preference-chosen", top_modalities | modalities
-        )
+        messages, modalities = _prompt_completion_messages(prompt_value, ranked_choice, path, line)
+        return _supervised_record(messages, "preference-chosen", top_modalities | modalities)
 
     prompt = _nonempty_string(item.get("prompt"))
 
@@ -288,21 +327,18 @@ def normalize_sft_example(
                 "image": "Describe the image.",
                 "video": "Describe the video.",
             }.get(media, "Describe the media.")
-            return _pair_record(
-                prompt_for_media, caption, f"{media}-caption", top_modalities
-            )
+            return _pair_record(prompt_for_media, caption, f"{media}-caption", top_modalities)
 
-    text = _nonempty_string(item.get("text"))
+    text = _first_text(item, ("text", "content", "corpus"))
     if text:
-        return NormalizedExample(
-            {"text": text}, "text", "text", frozenset({"text"})
-        )
+        return NormalizedExample({"text": text}, "text", "text", frozenset({"text"}))
 
     raise ConfigurationError(
         f"unsupported example at {path}:{line}; expected text, prompt/completion, "
-        "messages, ShareGPT conversations, instruction/input/output, "
+        "messages, ShareGPT/dialogue/chat conversations, instruction/input/output, "
         "instruction/context/response, question/answer, query/response, "
-        "source/target, a preference row, or a caption paired with local media"
+        "SQuAD answers, source/target, translation, common task/response pairs, "
+        "a preference row, or a caption paired with local media"
     )
 
 
@@ -315,15 +351,11 @@ def normalize_conversation(
     modalities = {"text"}
     for index, raw in enumerate(value):
         if not isinstance(raw, dict):
-            raise ConfigurationError(
-                f"{label} message {index} is not an object at {path}:{line}"
-            )
-        raw_role = raw.get("role", raw.get("from", raw.get("speaker")))
+            raise ConfigurationError(f"{label} message {index} is not an object at {path}:{line}")
+        raw_role = raw.get("role", raw.get("from", raw.get("speaker", raw.get("author"))))
         role = _ROLE_ALIASES.get(str(raw_role).strip().casefold())
         if role is None:
-            raise ConfigurationError(
-                f"invalid message role {raw_role!r} at {path}:{line}"
-            )
+            raise ConfigurationError(f"invalid message role {raw_role!r} at {path}:{line}")
         content_value = raw.get("content", raw.get("value", raw.get("text")))
         content, content_modalities = _normalize_content(
             content_value, path, line, f"{label} message {index}"
@@ -338,8 +370,7 @@ def normalize_conversation(
         if tool_calls is not None:
             if not isinstance(tool_calls, (dict, list)):
                 raise ConfigurationError(
-                    f"{label} message {index} tool_calls must be an object or list "
-                    f"at {path}:{line}"
+                    f"{label} message {index} tool_calls must be an object or list at {path}:{line}"
                 )
             message["tool_calls"] = tool_calls
         if isinstance(raw.get("name"), str) and raw["name"].strip():
@@ -441,9 +472,7 @@ def prepare_mlx_vlm_dataset(
                 for line_number, item in read_jsonl(source):
                     normalized = normalize_sft_example(item, source, line_number)
                     record = _without_media_markers(normalized.record)
-                    references = _collect_media_references(
-                        item, source, line_number, media_root
-                    )
+                    references = _collect_media_references(item, source, line_number, media_root)
                     expected = set(normalized.modalities) - {"text"}
                     missing = sorted(name for name in expected if not references[name])
                     if missing:
@@ -548,9 +577,12 @@ def _materialize_media_reference(
     mime_type: str | None = None
     embedded: Any = None
     if isinstance(reference, dict):
-        mime_type = _nonempty_string(
-            reference.get("mime_type", reference.get("mime", reference.get("content_type")))
-        ) or None
+        mime_type = (
+            _nonempty_string(
+                reference.get("mime_type", reference.get("mime", reference.get("content_type")))
+            )
+            or None
+        )
         embedded = reference.get("bytes")
         if embedded is None:
             reference = reference.get("url") or reference.get("path")
@@ -595,11 +627,14 @@ def _write_embedded_media(
 ) -> Path:
     if not payload:
         raise ConfigurationError("embedded media cannot be empty")
-    extension = mimetypes.guess_extension(mime_type or "") or {
-        "image": ".png",
-        "audio": ".wav",
-        "video": ".mp4",
-    }[modality]
+    extension = (
+        mimetypes.guess_extension(mime_type or "")
+        or {
+            "image": ".png",
+            "audio": ".wav",
+            "video": ".mp4",
+        }[modality]
+    )
     destination = media_root / f"{hashlib.sha256(payload).hexdigest()}{extension}"
     if not destination.exists():
         destination.write_bytes(payload)
@@ -639,14 +674,10 @@ def _prompt_completion_messages(
 ) -> tuple[list[dict[str, Any]], frozenset[str]]:
     modalities = {"text"}
     if isinstance(prompt, list):
-        prompt_messages, prompt_modalities = normalize_conversation(
-            prompt, path, line, "prompt"
-        )
+        prompt_messages, prompt_modalities = normalize_conversation(prompt, path, line, "prompt")
         modalities.update(prompt_modalities)
     else:
-        prompt_messages = [
-            {"role": "user", "content": value_as_text(prompt, path, line, "prompt")}
-        ]
+        prompt_messages = [{"role": "user", "content": value_as_text(prompt, path, line, "prompt")}]
     if isinstance(completion, list):
         completion_messages, completion_modalities = normalize_conversation(
             completion, path, line, "completion"
@@ -664,18 +695,14 @@ def _prompt_completion_messages(
     return messages, frozenset(modalities)
 
 
-def _require_supervised_messages(
-    messages: Sequence[dict[str, Any]], path: Path, line: int
-) -> None:
+def _require_supervised_messages(messages: Sequence[dict[str, Any]], path: Path, line: int) -> None:
     if not any(message.get("role") == "assistant" for message in messages):
         raise ConfigurationError(
             f"supervised conversation needs at least one assistant response at {path}:{line}"
         )
 
 
-def _normalize_content(
-    value: Any, path: Path, line: int, label: str
-) -> tuple[str, frozenset[str]]:
+def _normalize_content(value: Any, path: Path, line: int, label: str) -> tuple[str, frozenset[str]]:
     if isinstance(value, str):
         return value.strip(), frozenset({"text"})
     if value is None:
@@ -781,6 +808,26 @@ def _first_value(item: dict[str, Any], keys: Sequence[str]) -> Any:
         if key in item and item[key] is not None:
             return item[key]
     return None
+
+
+def _answer_text(value: Any) -> str:
+    """Extract the first answer from SQuAD and similar QA containers."""
+
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        for answer in value:
+            text = _answer_text(answer)
+            if text:
+                return text
+        return ""
+    if isinstance(value, dict):
+        for key in ("text", "answer", "value"):
+            if key in value:
+                text = _answer_text(value[key])
+                if text:
+                    return text
+    return ""
 
 
 def _nonempty_string(value: Any) -> str:
