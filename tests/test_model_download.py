@@ -8,7 +8,7 @@ from urllib.request import Request
 import pytest
 
 import osai.model_download as downloads
-from osai.errors import ModelDownloadError, VerificationError
+from osai.errors import ConfigurationError, ModelDownloadError, VerificationError
 
 
 class _Response(io.BytesIO):
@@ -21,8 +21,8 @@ class _Response(io.BytesIO):
 
 
 def test_variant_file_lists_match_published_shard_counts():
-    gguf = downloads.variant_for("llama.cpp", "small")
-    mlx = downloads.variant_for("mlx", "small")
+    gguf = downloads.variant_for("llama.cpp", "small", "v1")
+    mlx = downloads.variant_for("mlx", "small", "v1")
 
     assert len(downloads.files_for_variant(gguf)) == 2
     assert downloads.files_for_variant(gguf)[-1].endswith("00002-of-00002.gguf")
@@ -30,14 +30,37 @@ def test_variant_file_lists_match_published_shard_counts():
     assert downloads.files_for_variant(mlx)[-1].endswith("00021-of-00021.safetensors")
 
 
-def test_downloads_verifies_and_atomically_activates_selected_variant(
-    monkeypatch, tmp_path: Path
-):
-    variant = downloads.variant_for("llama.cpp", "small")
+def test_v2_catalog_has_all_tiers_and_gguf_projectors():
+    variants = [item for item in downloads.MODEL_VARIANTS if item.version == "v2"]
+    assert len(variants) == 8
+    for tier in ("xsmall", "small", "medium", "large"):
+        gguf = downloads.variant_for("llama.cpp", tier)
+        mlx = downloads.variant_for("mlx", tier)
+        assert gguf.projector in downloads.files_for_variant(gguf)
+        assert gguf.primary_path(Path("models")).name.startswith("osCode-GGUF-")
+        assert mlx.destination(Path("models")).name.startswith("osCode-MLX-")
+    with pytest.raises(ConfigurationError, match="supported by that version"):
+        downloads.variant_for("mlx", "xsmall", "v1")
+
+
+def test_v2_mlx_checksum_catalog_includes_every_model_file():
+    variant = downloads.variant_for("mlx", "xsmall")
+    required = downloads.files_for_variant(variant)
+    extras = (
+        f"{variant.repository_path}/model.safetensors",
+        f"{variant.repository_path}/model-vision-00001-of-00001.safetensors",
+        f"{variant.repository_path}/preprocessor_config.json",
+    )
+    checksum_map = {path: "0" * 64 for path in (*required, *extras)}
+    files = downloads._published_files({}, variant, checksum_map)
+    assert set(files) == set(checksum_map)
+
+
+def test_downloads_verifies_and_atomically_activates_selected_variant(monkeypatch, tmp_path: Path):
+    variant = downloads.variant_for("llama.cpp", "small", "v1")
     remote_files = downloads.files_for_variant(variant)
     payloads = {
-        path: f"GGUF fixture {index}".encode()
-        for index, path in enumerate(remote_files, 1)
+        path: f"GGUF fixture {index}".encode() for index, path in enumerate(remote_files, 1)
     }
     release = {
         "release": "1.0",
@@ -52,8 +75,7 @@ def test_downloads_verifies_and_atomically_activates_selected_variant(
         ],
     }
     sums = "\n".join(
-        f"{hashlib.sha256(payload).hexdigest()}  ./{path}"
-        for path, payload in payloads.items()
+        f"{hashlib.sha256(payload).hexdigest()}  ./{path}" for path, payload in payloads.items()
     )
 
     def open_response(url: str):
@@ -70,9 +92,7 @@ def test_downloads_verifies_and_atomically_activates_selected_variant(
     monkeypatch.setattr(downloads, "_check_disk_budget", lambda *_: None)
     progress = []
 
-    result = downloads.download_model_variant(
-        tmp_path, variant, progress=progress.append
-    )
+    result = downloads.download_model_variant(tmp_path, variant, progress=progress.append)
 
     assert result.downloaded is True
     assert result.model == tmp_path / "GGUF" / "small" / Path(variant.repository_path).name
@@ -88,13 +108,13 @@ def test_downloads_verifies_and_atomically_activates_selected_variant(
         lambda _url: (_ for _ in ()).throw(AssertionError("network used")),
     )
     existing = downloads.ensure_official_model(
-        tmp_path, runtime="llama.cpp", tier="small"
+        tmp_path, runtime="llama.cpp", tier="small", version="v1"
     )
     assert existing.downloaded is False
 
 
 def test_checksum_failure_does_not_activate_partial_model(monkeypatch, tmp_path: Path):
-    variant = downloads.variant_for("llama.cpp", "small")
+    variant = downloads.variant_for("llama.cpp", "small", "v1")
     remote_files = downloads.files_for_variant(variant)
     release = {
         "release": "1.0",
@@ -127,14 +147,19 @@ def test_checksum_failure_does_not_activate_partial_model(monkeypatch, tmp_path:
 
 
 def test_published_file_list_cannot_escape_model_folder():
-    variant = downloads.variant_for("mlx", "small")
+    variant = downloads.variant_for("mlx", "small", "v2")
     with pytest.raises(VerificationError, match="leaves"):
         downloads._published_files(
-            {"files": [f"{variant.repository_path}/../secret"]}, variant
+            {},
+            variant,
+            {
+                f"{variant.repository_path}/../secret": "0" * 64,
+                **{path: "0" * 64 for path in downloads.files_for_variant(variant)},
+            },
         )
 
 
-def test_download_redirect_must_remain_on_github():
+def test_download_redirect_must_remain_on_model_host():
     response = _Response(b"data", "https://example.com/model.gguf")
     with pytest.raises(VerificationError, match="untrusted host"):
         downloads._validate_response_url(response)
@@ -172,7 +197,7 @@ def test_download_file_resumes_a_partial_file(monkeypatch, tmp_path: Path):
 
     def open_response(request):
         requested.append(request)
-        return ResumeResponse(b"world", downloads._RAW_REPOSITORY + "/model.gguf")
+        return ResumeResponse(b"world", downloads._source_root("v2") + "/model.gguf")
 
     monkeypatch.setattr(downloads, "_open_response", open_response)
     chunks = []
@@ -187,17 +212,19 @@ def test_download_file_resumes_a_partial_file(monkeypatch, tmp_path: Path):
 
 
 def test_interrupted_download_preserves_partial_staging(monkeypatch, tmp_path: Path):
-    variant = downloads.variant_for("llama.cpp", "small")
+    variant = downloads.variant_for("llama.cpp", "small", "v1")
     repository_path = downloads.files_for_variant(variant)[0]
     checksum = hashlib.sha256(b"partial").hexdigest()
 
-    monkeypatch.setattr(downloads, "_release_catalog", lambda: {"release": "1.0"})
-    monkeypatch.setattr(downloads, "_checksum_catalog", lambda: {repository_path: checksum})
+    monkeypatch.setattr(downloads, "_release_catalog", lambda _version: {"release": "1.0"})
+    monkeypatch.setattr(
+        downloads, "_checksum_catalog", lambda _version: {repository_path: checksum}
+    )
     monkeypatch.setattr(downloads, "_published_variant", lambda *_: {})
     monkeypatch.setattr(downloads, "_published_files", lambda *_: (repository_path,))
     monkeypatch.setattr(downloads, "_check_disk_budget", lambda *_: None)
 
-    def interrupt(_repository_path, destination, _on_chunk):
+    def interrupt(_repository_path, destination, _on_chunk, _version):
         destination.write_bytes(b"partial")
         raise URLError("connection lost")
 
@@ -206,7 +233,7 @@ def test_interrupted_download_preserves_partial_staging(monkeypatch, tmp_path: P
     with pytest.raises(ModelDownloadError, match="can be resumed"):
         downloads.download_model_variant(tmp_path, variant)
 
-    partial = tmp_path / ".downloads" / "llama.cpp-small.partial"
+    partial = tmp_path / ".downloads" / "v1-llama.cpp-small.partial"
     assert (partial / Path(repository_path).name).read_bytes() == b"partial"
 
 
@@ -219,6 +246,4 @@ def test_offline_environment_prevents_missing_model_download(monkeypatch, tmp_pa
     )
 
     with pytest.raises(ModelDownloadError, match="OSAI_OFFLINE"):
-        downloads.ensure_official_model(
-            tmp_path, runtime="llama.cpp", tier="small"
-        )
+        downloads.ensure_official_model(tmp_path, runtime="llama.cpp", tier="small", version="v1")

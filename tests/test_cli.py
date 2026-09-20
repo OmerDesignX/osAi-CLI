@@ -58,9 +58,7 @@ def test_train_auto_settings_and_manual_overrides_parse():
 
 
 def test_manual_training_defaults_are_resolved_after_parsing():
-    args = build_parser().parse_args(
-        ["train", "--tier", "small", "--data", "data"]
-    )
+    args = build_parser().parse_args(["train", "--tier", "small", "--data", "data"])
     assert args.auto_settings is False
     assert args.batch_size is None
     assert args.rank is None
@@ -74,21 +72,23 @@ def test_manual_training_defaults_are_resolved_after_parsing():
 
 def test_fine_tune_epochs_and_legacy_iterations_share_one_value():
     parser = build_parser()
-    epochs = parser.parse_args(
-        ["train", "--tier", "small", "--data", "data", "--epochs", "3"]
-    )
-    legacy = parser.parse_args(
-        ["train", "--tier", "small", "--data", "data", "--iterations", "2"]
-    )
+    epochs = parser.parse_args(["train", "--tier", "small", "--data", "data", "--epochs", "3"])
+    legacy = parser.parse_args(["train", "--tier", "small", "--data", "data", "--iterations", "2"])
     assert epochs.iterations == 3
     assert legacy.iterations == 2
 
 
 def test_official_model_download_can_be_disabled():
-    args = build_parser().parse_args(
-        ["select", "--tier", "small", "--no-download-model"]
-    )
+    args = build_parser().parse_args(["select", "--tier", "small", "--no-download-model"])
     assert args.download_model is False
+
+
+def test_official_model_version_is_explicit_and_v2_is_default():
+    parser = build_parser()
+    current = parser.parse_args(["train", "--tier", "xsmall", "--data", "data"])
+    legacy = parser.parse_args(["select", "--tier", "small", "--model-version", "v1"])
+    assert current.model_version == "v2"
+    assert legacy.model_version == "v1"
 
 
 def test_auto_optimizer_is_backend_aware(tmp_path: Path):
@@ -151,31 +151,21 @@ def test_alignment_pipeline_options_parse():
 def test_cli_accepts_reinforce_rloo_and_grpo():
     parser = build_parser()
     for method in ("reinforce", "rloo", "grpo"):
-        args = parser.parse_args(
-            ["train", "--tier", "small", "--alignment-type", method]
-        )
+        args = parser.parse_args(["train", "--tier", "small", "--alignment-type", method])
         assert args.alignment_type == method
 
 
-def test_combined_preference_run_offers_orpo_before_training(
-    monkeypatch, tmp_path: Path
-):
+def test_combined_preference_run_offers_orpo_before_training(monkeypatch, tmp_path: Path):
     args = _combined_args(tmp_path)
-    monkeypatch.setattr(
-        "osai.cli.sys.stdin", SimpleNamespace(isatty=lambda: True)
-    )
+    monkeypatch.setattr("osai.cli.sys.stdin", SimpleNamespace(isatty=lambda: True))
     monkeypatch.setattr("builtins.input", lambda _: "yes")
     _choose_combined_alignment(args)
     assert args.alignment_type == "orpo"
 
 
-def test_combined_preference_run_uses_dpo_when_orpo_is_declined(
-    monkeypatch, tmp_path: Path
-):
+def test_combined_preference_run_uses_dpo_when_orpo_is_declined(monkeypatch, tmp_path: Path):
     args = _combined_args(tmp_path)
-    monkeypatch.setattr(
-        "osai.cli.sys.stdin", SimpleNamespace(isatty=lambda: True)
-    )
+    monkeypatch.setattr("osai.cli.sys.stdin", SimpleNamespace(isatty=lambda: True))
     answers = iter(["maybe", "no"])
     monkeypatch.setattr("builtins.input", lambda _: next(answers))
     _choose_combined_alignment(args)
@@ -195,9 +185,7 @@ def test_noninteractive_combined_preference_run_defaults_to_dpo(
     monkeypatch, tmp_path: Path, capsys
 ):
     args = _combined_args(tmp_path)
-    monkeypatch.setattr(
-        "osai.cli.sys.stdin", SimpleNamespace(isatty=lambda: False)
-    )
+    monkeypatch.setattr("osai.cli.sys.stdin", SimpleNamespace(isatty=lambda: False))
     _choose_combined_alignment(args)
     assert args.alignment_type == "dpo"
     assert "non-interactive" in capsys.readouterr().err
@@ -257,9 +245,7 @@ def test_manual_values_override_the_auto_profile(monkeypatch, tmp_path: Path):
         context_length=4096,
     )
     monkeypatch.setattr("osai.cli.inspect_model", lambda *_: inspection)
-    monkeypatch.setattr(
-        "osai.auto_settings.physical_memory_bytes", lambda: 8 * 1024**3
-    )
+    monkeypatch.setattr("osai.auto_settings.physical_memory_bytes", lambda: 8 * 1024**3)
     config = TrainingConfig(
         model=inspection.path,
         format=ModelFormat.GGUF,

@@ -29,7 +29,13 @@ from .health import check_sessions
 from .io import OutputLock, atomic_json
 from .learning_proof import prove_learning
 from .merge import MergedModelResult, merge_gguf_model, merge_mlx_model
-from .model_download import ConsoleProgress, ModelDownload, ensure_official_model
+from .model_download import (
+    DEFAULT_MODEL_VERSION,
+    MODEL_VERSIONS,
+    ConsoleProgress,
+    ModelDownload,
+    ensure_official_model,
+)
 from .paths import project_root
 from .rollouts import RolloutSettings
 from .session import (
@@ -64,6 +70,12 @@ def build_parser() -> argparse.ArgumentParser:
     source.add_argument("--config", type=Path)
     source.add_argument("--tier", choices=[tier.value for tier in ModelTier])
     source.add_argument("--custom", dest="custom_model")
+    train_parser.add_argument(
+        "--model-version",
+        choices=MODEL_VERSIONS,
+        default=DEFAULT_MODEL_VERSION,
+        help="official osCode model generation (default: v2)",
+    )
     train_parser.add_argument(
         "--engine", choices=[engine.value for engine in Engine], default="auto"
     )
@@ -136,9 +148,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="first reproducible local rollout seed (default: 0)",
     )
-    train_parser.add_argument(
-        "--sessions-root", type=Path, default=project_root() / "sessions"
-    )
+    train_parser.add_argument("--sessions-root", type=Path, default=project_root() / "sessions")
     train_parser.add_argument("--session-name")
     train_parser.add_argument("--bundled-root", type=Path)
     train_parser.add_argument("--custom-root", type=Path)
@@ -213,8 +223,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         metavar=("WIDTH", "HEIGHT"),
         help=(
-            "resize images before local VLM training; model processor default is "
-            "used when omitted"
+            "resize images before local VLM training; model processor default is used when omitted"
         ),
     )
     train_parser.add_argument(
@@ -305,6 +314,9 @@ def build_parser() -> argparse.ArgumentParser:
         "models", help="list official downloadable tiers and custom local models"
     )
     models_parser.add_argument("--bundled-root", type=Path)
+    models_parser.add_argument(
+        "--model-version", choices=MODEL_VERSIONS, default=DEFAULT_MODEL_VERSION
+    )
     models_parser.add_argument("--custom-root", type=Path)
     models_parser.add_argument("--json", action="store_true", dest="as_json")
     models_parser.set_defaults(handler=_models)
@@ -312,17 +324,13 @@ def build_parser() -> argparse.ArgumentParser:
     verify_models_parser = subparsers.add_parser(
         "verify-models", help="verify downloaded official models without network access"
     )
-    verify_models_parser.add_argument(
-        "--root", type=Path, default=project_root() / "osCode-Models"
-    )
+    verify_models_parser.add_argument("--root", type=Path, default=project_root() / "osCode-Models")
     verify_models_parser.set_defaults(handler=_verify_models)
 
     sessions_parser = subparsers.add_parser(
         "check-sessions", help="validate completed local session publications"
     )
-    sessions_parser.add_argument(
-        "--root", type=Path, default=project_root() / "sessions"
-    )
+    sessions_parser.add_argument("--root", type=Path, default=project_root() / "sessions")
     sessions_parser.add_argument("--require-completed", action="store_true")
     sessions_parser.set_defaults(handler=_check_sessions)
 
@@ -332,6 +340,12 @@ def build_parser() -> argparse.ArgumentParser:
     selection_source = select_parser.add_mutually_exclusive_group(required=True)
     selection_source.add_argument("--tier", choices=[tier.value for tier in ModelTier])
     selection_source.add_argument("--custom", dest="custom_model")
+    select_parser.add_argument(
+        "--model-version",
+        choices=MODEL_VERSIONS,
+        default=DEFAULT_MODEL_VERSION,
+        help="official osCode model generation (default: v2)",
+    )
     select_parser.add_argument(
         "--engine", choices=[engine.value for engine in Engine], default="auto"
     )
@@ -446,12 +460,13 @@ def _train(args: argparse.Namespace) -> int:
         if args.data is None:
             raise ConfigurationError("--data is required with --stage fine-tune-align")
         if args.alignment_data is None:
-            raise ConfigurationError(
-                "--alignment-data is required with --stage fine-tune-align"
-            )
+            raise ConfigurationError("--alignment-data is required with --stage fine-tune-align")
         _choose_combined_alignment(args)
-        label = args.session_name or args.tier or args.custom_model or (
-            args.config.stem if args.config else "run"
+        label = (
+            args.session_name
+            or args.tier
+            or args.custom_model
+            or (args.config.stem if args.config else "run")
         )
         parent = timestamped_session_path(args.sessions_root, f"{label}-fine-tune-align")
         fine_args = argparse.Namespace(**vars(args))
@@ -497,7 +512,8 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
             elif config.companion_mlx is None:
                 engine = Engine.LLAMA_CPP
         session = getattr(args, "_session_override", None) or timestamped_session_path(
-            args.sessions_root, args.session_name or args.config.stem,
+            args.sessions_root,
+            args.session_name or args.config.stem,
         )
         config = replace(config, output=session)
     else:
@@ -506,9 +522,7 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
         selection = _resolve_cli_model(args)
         engine = selection.engine
         fallback_gguf = selection.entry.gguf
-        target_modules = (
-            tuple(args.target_modules) if args.target_modules else ("mlp.down_proj",)
-        )
+        target_modules = tuple(args.target_modules) if args.target_modules else ("mlp.down_proj",)
         source_name = args.tier or args.custom_model or "run"
         config = TrainingConfig(
             model=selection.model,
@@ -523,13 +537,9 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
             num_layers=1 if args.num_layers is None else args.num_layers,
             max_seq_length=64 if args.max_seq_length is None else args.max_seq_length,
             learning_rate=1e-5 if args.learning_rate is None else args.learning_rate,
-            strict_base_hash=(
-                True if args.strict_base_hash is None else args.strict_base_hash
-            ),
+            strict_base_hash=(True if args.strict_base_hash is None else args.strict_base_hash),
             merge_model=True if args.merge_model is None else args.merge_model,
-            materialize_base=(
-                True if args.materialize_base is None else args.materialize_base
-            ),
+            materialize_base=(True if args.materialize_base is None else args.materialize_base),
             gguf_batch_size=(8 if args.gguf_batch_size is None else args.gguf_batch_size),
             gguf_threads=2 if args.gguf_threads is None else args.gguf_threads,
             multi_gpu=args.multi_gpu or "auto",
@@ -543,7 +553,8 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
             target_modules=target_modules,
         )
         session = getattr(args, "_session_override", None) or timestamped_session_path(
-            args.sessions_root, args.session_name or f"{source_name}-{args.engine}",
+            args.sessions_root,
+            args.session_name or f"{source_name}-{args.engine}",
         )
         config = replace(config, output=session)
     config = _resolve_training_settings(config, args, engine)
@@ -572,11 +583,7 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
             llama_accelerator=args.accelerator,
         )
         target_format = config.effective_format
-        adapter = (
-            result.gguf_adapter
-            if target_format is ModelFormat.GGUF
-            else result.mlx_adapter
-        )
+        adapter = result.gguf_adapter if target_format is ModelFormat.GGUF else result.mlx_adapter
         return {
             "status": "completed",
             "engine": engine.value,
@@ -620,9 +627,7 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
             if fallback_gguf is None:
                 raise
             if args.tier is not None:
-                fallback_gguf = _ensure_official_tier(
-                    args, Engine.LLAMA_CPP
-                ).model
+                fallback_gguf = _ensure_official_tier(args, Engine.LLAMA_CPP).model
             print("osai: MLX execution failed; retrying the local GGUF with llama.cpp")
             engine = Engine.LLAMA_CPP
             config = replace(config, model=fallback_gguf, format=ModelFormat.GGUF)
@@ -696,9 +701,7 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
             "gguf_adapter": str(native.adapter),
             "manifest": str(native.manifest),
             "base_plus_adapter": str(SessionLayout.at(config.output).base_adapter),
-            "deployment_manifest": str(
-                SessionLayout.at(config.output).deployment_manifest
-            ),
+            "deployment_manifest": str(SessionLayout.at(config.output).deployment_manifest),
             "materialized_base": str(base_bundle.path) if base_bundle.path else None,
             "merged_model": str(merged.path) if merged else None,
             "reported_losses": native.losses,
@@ -732,9 +735,7 @@ def _alignment_stage(
     session = getattr(args, "_session_override", None)
     if args.config:
         pending = session or args.sessions_root.expanduser().resolve() / ".pending"
-        config = TrainingConfig.from_file(
-            args.config, data=args.alignment_data, output=pending
-        )
+        config = TrainingConfig.from_file(args.config, data=args.alignment_data, output=pending)
         if model is not None:
             config = replace(
                 config,
@@ -764,12 +765,8 @@ def _alignment_stage(
             gguf_batch_size=8 if args.gguf_batch_size is None else args.gguf_batch_size,
             gguf_threads=2 if args.gguf_threads is None else args.gguf_threads,
             merge_model=True if args.merge_model is None else args.merge_model,
-            materialize_base=(
-                True if args.materialize_base is None else args.materialize_base
-            ),
-            strict_base_hash=(
-                True if args.strict_base_hash is None else args.strict_base_hash
-            ),
+            materialize_base=(True if args.materialize_base is None else args.materialize_base),
+            strict_base_hash=(True if args.strict_base_hash is None else args.strict_base_hash),
             multi_gpu=args.multi_gpu or "auto",
             devices=tuple(args.devices or ()),
             split_mode=args.split_mode or "layer",
@@ -781,8 +778,11 @@ def _alignment_stage(
         )
     assert engine is not None
     if session is None:
-        label = args.session_name or args.tier or args.custom_model or (
-            args.config.stem if args.config else "alignment"
+        label = (
+            args.session_name
+            or args.tier
+            or args.custom_model
+            or (args.config.stem if args.config else "alignment")
         )
         session = timestamped_session_path(args.sessions_root, f"{label}-alignment")
     config = replace(config, output=session)
@@ -1069,9 +1069,7 @@ def _select_optimizer(
         return requested
     if args.config and config.optimizer != "auto":
         if engine is Engine.LLAMA_CPP and config.optimizer not in {"sgd", "adamw"}:
-            raise ConfigurationError(
-                "llama.cpp optimizer from config must be sgd or adamw"
-            )
+            raise ConfigurationError("llama.cpp optimizer from config must be sgd or adamw")
         return config.optimizer
     return "adamw" if engine is Engine.MLX else "sgd"
 
@@ -1142,14 +1140,19 @@ def _parse_tensor_split(value: str | None) -> tuple[float, ...]:
 def _models(args: argparse.Namespace) -> int:
     entries = [
         entry.as_dict()
-        for entry in list_catalog(bundled=args.bundled_root, custom=args.custom_root)
+        for entry in list_catalog(
+            bundled=args.bundled_root,
+            custom=args.custom_root,
+            version=args.model_version,
+        )
     ]
     if args.as_json:
         print(json.dumps(entries, indent=2, sort_keys=True))
     else:
         for entry in entries:
             print(
-                f"{entry['name']}: source={entry['source']} tier={entry['tier'] or '-'} "
+                f"{entry['name']}: source={entry['source']} "
+                f"version={entry['version'] or '-'} tier={entry['tier'] or '-'} "
                 f"mlx={'ready' if entry['mlx_materialized'] else '-'} "
                 f"llama.cpp={'ready' if entry['gguf_materialized'] else '-'}"
             )
@@ -1162,9 +1165,7 @@ def _verify_models(args: argparse.Namespace) -> int:
 
 
 def _check_sessions(args: argparse.Namespace) -> int:
-    _print_json(
-        check_sessions(args.root, require_completed=args.require_completed).as_dict()
-    )
+    _print_json(check_sessions(args.root, require_completed=args.require_completed).as_dict())
     return 0
 
 
@@ -1185,18 +1186,18 @@ def _resolve_cli_model(args: argparse.Namespace):
         bundled=args.bundled_root,
         custom_models=args.custom_root,
         hardware=hardware,
+        model_version=args.model_version,
     )
 
 
-def _ensure_official_tier(
-    args: argparse.Namespace, engine: Engine
-) -> ModelDownload:
+def _ensure_official_tier(args: argparse.Namespace, engine: Engine) -> ModelDownload:
     progress = ConsoleProgress()
     try:
         return ensure_official_model(
             args.bundled_root or bundled_root(),
             runtime=engine.value,
             tier=args.tier,
+            version=args.model_version,
             allow_download=getattr(args, "download_model", True),
             progress=progress,
         )

@@ -21,15 +21,19 @@ def test_custom_models_live_in_named_format_folders(tmp_path: Path):
 
 
 def test_official_gguf_models_use_atomic_tier_directories(tmp_path: Path):
-    entry = bundled_entry("small", tmp_path)
+    entry = bundled_entry("small", tmp_path, "v1")
 
     assert entry.source == "official"
     assert entry.gguf == (
-        tmp_path
-        / "GGUF"
-        / "small"
-        / "osCode-GGUF-Small-Q4_K_M-00001-of-00002.gguf"
+        tmp_path / "GGUF" / "small" / "osCode-GGUF-Small-Q4_K_M-00001-of-00002.gguf"
     )
+
+
+def test_v2_keeps_names_but_separates_model_generations(tmp_path: Path):
+    entry = bundled_entry("xsmall", tmp_path, "v2")
+    assert entry.name == "oscode-xsmall"
+    assert entry.mlx == tmp_path / "V2" / "MLX" / "osCode-MLX-xSmall-Q4"
+    assert entry.gguf == (tmp_path / "V2" / "GGUF" / "xsmall" / "osCode-GGUF-xSmall-Q4_K_M.gguf")
 
 
 def test_custom_model_name_cannot_escape_root(tmp_path: Path):

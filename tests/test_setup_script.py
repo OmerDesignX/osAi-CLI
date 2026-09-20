@@ -93,3 +93,15 @@ def test_current_environment_preserves_the_active_python_path():
     assert setup_osai._target_python(args, dry_run=True) == Path(
         sys.executable
     ).absolute()
+
+
+def test_setup_selects_wheel_for_current_revision(monkeypatch, tmp_path: Path):
+    (tmp_path / "VERSION.txt").write_text("9.9.9\n", encoding="utf-8")
+    dist = tmp_path / "dist"
+    dist.mkdir()
+    old_wheel = dist / "osai-9.9.8-py3-none-any.whl"
+    new_wheel = dist / "osai-9.9.9-py3-none-any.whl"
+    old_wheel.touch()
+    new_wheel.touch()
+    monkeypatch.setattr(setup_osai, "PROJECT_ROOT", tmp_path)
+    assert setup_osai._install_target(None) == new_wheel

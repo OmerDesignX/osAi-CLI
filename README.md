@@ -6,7 +6,7 @@ Training and inference are local after any selected model download completes.
 
 osCode Models are supported by default and custom models can be added.
 
-More about osCode Models: https://github.com/OmerDesignX/osCode-Models
+More about osCode Models: https://models.omerdesign.com/oscode-models/
 
 Supported modes:
 
@@ -77,7 +77,7 @@ The script:
 1. Detects the OS, architecture, macOS version, CUDA toolkit, and Vulkan tools.
 2. Creates or reuses `.venv`.
 3. Selects the correct file from `requirements/` and installs it.
-4. Installs `dist/osai-0.1.0-py3-none-any.whl`, or builds from the local
+4. Installs `dist/osai-0.1.1-py3-none-any.whl`, or builds from the local
    project if the wheel is absent.
 5. Builds the bundled MLX and MLX-LM sources when the platform supports MLX.
 6. Builds bundled llama.cpp for Metal, CUDA, Vulkan, or CPU.
@@ -124,7 +124,7 @@ To install the wheel yourself first:
 ```sh
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install dist/osai-0.1.0-py3-none-any.whl
+python -m pip install dist/osai-0.1.1-py3-none-any.whl
 python scripts/setup_osai.py --current-environment
 ```
 
@@ -187,9 +187,12 @@ osai models
 ```
 
 Selecting an official tier with `osai select` or `osai train` downloads only the
-chosen MLX or GGUF variant when it is not already present. osAi reads the public
-[`OmerDesignX/osCode-Models`](https://github.com/OmerDesignX/osCode-Models)
-catalogue.
+chosen MLX or GGUF variant when it is not already present. V2 is the default;
+use `--model-version v1` for the original osCode release. V2 also offers
+`xsmall`. The downloader reads the [osModels V1/V2 catalogs](https://models.omerdesign.com/oscode-models/),
+fetches individual files and split shards, and verifies each file against that
+version's published SHA-256 list. V2 GGUF vision projectors are included. An
+interrupted download can resume. The model filenames remain unchanged.
 
 Use `--no-download-model` or set
 `OSAI_OFFLINE=1` to require an already-downloaded model.
@@ -397,7 +400,7 @@ directly to alignment.
 | Option | Purpose |
 | --- | --- |
 | `--config PATH` | Load training settings from a local TOML or JSON file. |
-| `--tier small\|medium\|large` | Use an official osCode model tier, downloading the selected format if needed. |
+| `--tier xsmall\|small\|medium\|large` | Use an official osCode model tier, downloading the selected format if needed. xSmall requires V2. |
 | `--custom NAME` | Use `models/custom/NAME/mlx` or `gguf`. |
 | `--engine auto\|mlx\|llama.cpp` | Select the trainer. `auto` prefers MLX on Apple silicon and llama.cpp elsewhere. |
 | `--accelerator auto\|metal\|mps\|cuda\|vulkan\|cpu` | Select compute. `auto` is GPU-first with CPU fallback. MPS is diagnostic only; use Metal on macOS. |
@@ -420,6 +423,7 @@ directly to alignment.
 | `--sessions-root PATH` | Store sessions below this directory. Default: `sessions/`. |
 | `--session-name NAME` | Replace the generated folder suffix while retaining its timestamp. |
 | `--bundled-root PATH` | Override the `osCode-Models` directory. |
+| `--model-version v1\|v2` | Choose the official osCode release. Default: V2; V1 remains available. |
 | `--custom-root PATH` | Override the `models/custom` directory. |
 | `--download-model`, `--no-download-model` | Download and verify a missing official tier, or require it to exist locally. Enabled by default. |
 | `--multi-gpu auto\|on\|off` | Automatically use available devices, require multiple GPUs, or force one GPU. |
@@ -467,12 +471,14 @@ directly to alignment.
 | `inspect` | `MODEL` | Local model file or directory to inspect. |
 | `inspect` | `--format mlx\|gguf` | Require a specific format instead of detecting it. |
 | `models` | `--bundled-root PATH` | Override the official-model download directory. |
+| `models` | `--model-version v1\|v2` | List the selected official release; default V2. |
 | `models` | `--custom-root PATH` | Override the custom-model directory. |
 | `models` | `--json` | Print the catalog as JSON. |
 | `verify-models` | `--root PATH` | Downloaded-model directory to verify. Default: `osCode-Models/`. |
 | `check-sessions` | `--root PATH` | Sessions directory to inspect. Default: `sessions/`. |
 | `check-sessions` | `--require-completed` | Fail when the directory has no completed session. |
-| `select` | `--tier small\|medium\|large` | Select an official tier. Use this or `--custom`. |
+| `select` | `--tier xsmall\|small\|medium\|large` | Select an official tier. xSmall requires V2. Use this or `--custom`. |
+| `select` | `--model-version v1\|v2` | Choose the official release; default V2. |
 | `select` | `--custom NAME` | Select a custom model. Use this or `--tier`. |
 | `select` | `--engine auto\|mlx\|llama.cpp` | Resolve for a specific engine. Default: `auto`. |
 | `select` | `--bundled-root PATH` | Override the official-model download directory. |

@@ -11,7 +11,7 @@ import ssl
 import sys
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
@@ -22,13 +22,12 @@ import certifi
 from .errors import ConfigurationError, ModelDownloadError, VerificationError
 from .io import OutputLock, atomic_json
 
-MODEL_REPOSITORY = "https://github.com/OmerDesignX/osCode-Models"
-_RAW_REPOSITORY = f"{MODEL_REPOSITORY}/raw/refs/heads/main"
-_RAW_TEXT_REPOSITORY = (
-    "https://raw.githubusercontent.com/OmerDesignX/osCode-Models/main"
-)
+MODEL_REPOSITORY = "https://models.omerdesign.com/oscode-models"
+_LEGACY_REPOSITORY = "https://github.com/OmerDesignX/osCode-Models"
+MODEL_VERSIONS = ("v1", "v2")
+DEFAULT_MODEL_VERSION = "v2"
 MODEL_MANIFEST = "OSCODE_MODEL.json"
-_ALLOWED_DOWNLOAD_HOSTS = {"github.com", "raw.githubusercontent.com"}
+_ALLOWED_DOWNLOAD_HOSTS = {"models.omerdesign.com"}
 _MAX_CATALOG_BYTES = 16 * 1024 * 1024
 _CHUNK_BYTES = 1024 * 1024
 _LFS_PREFIX = b"version https://git-lfs.github.com/spec/v1"
@@ -37,24 +36,27 @@ _TLS_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 
 @dataclass(frozen=True, slots=True)
 class ModelVariant:
+    version: str
     runtime: str
     tier: str
     repository_path: str
     folder: str
     bytes: int
     shards: int
+    projector: str | None = None
 
     @property
     def format_directory(self) -> str:
         return "GGUF" if self.runtime == "llama.cpp" else "MLX"
 
     def destination(self, root: Path) -> Path:
-        return root / self.format_directory / self.folder
+        version_root = root if self.version == "v1" else root / "V2"
+        return version_root / self.format_directory / self.folder
 
     def primary_path(self, root: Path) -> Path:
         destination = self.destination(root)
         if self.runtime == "llama.cpp":
-            return destination / Path(self.repository_path).name
+            return destination / PurePosixPath(self.repository_path).name
         return destination
 
 
@@ -90,6 +92,7 @@ class ManifestVerification:
 
 MODEL_VARIANTS = (
     ModelVariant(
+        "v1",
         "llama.cpp",
         "small",
         "GGUF/osCode-GGUF-Small-Q4_K_M-00001-of-00002.gguf",
@@ -98,6 +101,7 @@ MODEL_VARIANTS = (
         2,
     ),
     ModelVariant(
+        "v1",
         "llama.cpp",
         "medium",
         "GGUF/osCode-GGUF-Medium-Q6_K-00001-of-00002.gguf",
@@ -106,6 +110,7 @@ MODEL_VARIANTS = (
         2,
     ),
     ModelVariant(
+        "v1",
         "llama.cpp",
         "large",
         "GGUF/osCode-GGUF-Large-Q8_0-00001-of-00003.gguf",
@@ -114,6 +119,7 @@ MODEL_VARIANTS = (
         3,
     ),
     ModelVariant(
+        "v1",
         "mlx",
         "small",
         "MLX/osCode-MLX-Small-Q5",
@@ -122,6 +128,7 @@ MODEL_VARIANTS = (
         21,
     ),
     ModelVariant(
+        "v1",
         "mlx",
         "medium",
         "MLX/osCode-MLX-Medium-Q6",
@@ -130,12 +137,65 @@ MODEL_VARIANTS = (
         27,
     ),
     ModelVariant(
+        "v1",
         "mlx",
         "large",
         "MLX/osCode-MLX-Large-Q8",
         "osCode-MLX-Large-Q8",
         4_489_728_089,
         34,
+    ),
+    ModelVariant(
+        "v2",
+        "llama.cpp",
+        "xsmall",
+        "GGUF/osCode-GGUF-xSmall-Q4_K_M.gguf",
+        "xsmall",
+        1_453_069_472,
+        1,
+        "GGUF/osCode-GGUF-xSmall-mmproj-Q3_K_M.gguf",
+    ),
+    ModelVariant(
+        "v2",
+        "llama.cpp",
+        "small",
+        "GGUF/osCode-GGUF-Small-Q4_K_M-00001-of-00002.gguf",
+        "small",
+        2_967_466_240,
+        2,
+        "GGUF/osCode-GGUF-Small-mmproj-Q5_K_M.gguf",
+    ),
+    ModelVariant(
+        "v2",
+        "llama.cpp",
+        "medium",
+        "GGUF/osCode-GGUF-Medium-Q6_K-00001-of-00002.gguf",
+        "medium",
+        3_748_063_456,
+        2,
+        "GGUF/osCode-GGUF-Medium-mmproj-Q6_K.gguf",
+    ),
+    ModelVariant(
+        "v2",
+        "llama.cpp",
+        "large",
+        "GGUF/osCode-GGUF-Large-Q8_0-00001-of-00003.gguf",
+        "large",
+        4_846_152_064,
+        3,
+        "GGUF/osCode-GGUF-Large-mmproj-Q8_0.gguf",
+    ),
+    ModelVariant(
+        "v2", "mlx", "xsmall", "MLX/osCode-MLX-xSmall-Q4", "osCode-MLX-xSmall-Q4", 1_248_475_840, 1
+    ),
+    ModelVariant(
+        "v2", "mlx", "small", "MLX/osCode-MLX-Small-Q5", "osCode-MLX-Small-Q5", 3_144_821_433, 21
+    ),
+    ModelVariant(
+        "v2", "mlx", "medium", "MLX/osCode-MLX-Medium-Q6", "osCode-MLX-Medium-Q6", 3_995_397_150, 27
+    ),
+    ModelVariant(
+        "v2", "mlx", "large", "MLX/osCode-MLX-Large-Q8", "osCode-MLX-Large-Q8", 4_845_972_858, 34
     ),
 )
 
@@ -162,9 +222,7 @@ class ConsoleProgress:
         received = _human_bytes(progress.bytes_received)
         total = _human_bytes(progress.total_bytes)
         name = progress.file[:48]
-        self.stream.write(
-            f"\r[{bar}] {progress.percent:3d}% {received}/{total} {name:<48}"
-        )
+        self.stream.write(f"\r[{bar}] {progress.percent:3d}% {received}/{total} {name:<48}")
         self.stream.flush()
         self._started = True
         if progress.percent >= 100:
@@ -179,28 +237,43 @@ class ConsoleProgress:
             self._started = False
 
 
-def variant_for(runtime: str, tier: str) -> ModelVariant:
+def variant_for(runtime: str, tier: str, version: str = DEFAULT_MODEL_VERSION) -> ModelVariant:
     normalized_runtime = "llama.cpp" if runtime == "llamacpp" else runtime.lower()
     normalized_tier = tier.lower()
+    normalized_version = version.lower()
     for variant in MODEL_VARIANTS:
-        if variant.runtime == normalized_runtime and variant.tier == normalized_tier:
+        if (
+            variant.runtime == normalized_runtime
+            and variant.tier == normalized_tier
+            and variant.version == normalized_version
+        ):
             return variant
     raise ConfigurationError(
-        "official model selection requires runtime mlx or llama.cpp and tier "
-        "small, medium, or large"
+        "official model selection requires version v1 or v2, runtime mlx or "
+        "llama.cpp, and a tier supported by that version"
     )
 
 
 def files_for_variant(variant: ModelVariant) -> tuple[str, ...]:
     if variant.runtime == "llama.cpp":
+        if variant.shards == 1:
+            return (variant.repository_path, *((variant.projector,) if variant.projector else ()))
         match = re.fullmatch(r"(.*)-00001-of-(\d{5})\.gguf", variant.repository_path)
         if match is None or int(match.group(2)) != variant.shards:
             raise VerificationError("the built-in GGUF model catalogue is invalid")
-        return tuple(
+        shards = tuple(
             f"{match.group(1)}-{index:05d}-of-{match.group(2)}.gguf"
             for index in range(1, variant.shards + 1)
         )
+        return shards + ((variant.projector,) if variant.projector else ())
     prefix = variant.repository_path
+    if variant.version == "v2":
+        return (
+            f"{prefix}/config.json",
+            f"{prefix}/model.safetensors.index.json",
+            f"{prefix}/tokenizer.json",
+            f"{prefix}/tokenizer_config.json",
+        )
     return (
         f"{prefix}/config.json",
         f"{prefix}/chat_template.jinja",
@@ -220,21 +293,22 @@ def ensure_official_model(
     *,
     runtime: str,
     tier: str,
+    version: str = DEFAULT_MODEL_VERSION,
     allow_download: bool = True,
     progress: Callable[[DownloadProgress], None] | None = None,
 ) -> ModelDownload:
     model_root = Path(root).expanduser().resolve()
-    variant = variant_for(runtime, tier)
+    variant = variant_for(runtime, tier, version)
     installed = _installed_download(model_root, variant)
     if installed is not None:
         return installed
     if _offline_requested():
         raise ModelDownloadError(
-            f"the {tier} {runtime} model is not downloaded and OSAI_OFFLINE is enabled"
+            f"the {version} {tier} {runtime} model is not downloaded and OSAI_OFFLINE is enabled"
         )
     if not allow_download:
         raise ModelDownloadError(
-            f"the {tier} {runtime} model is not downloaded; rerun without "
+            f"the {version} {tier} {runtime} model is not downloaded; rerun without "
             "--no-download-model"
         )
     return download_model_variant(model_root, variant, progress=progress)
@@ -264,19 +338,17 @@ def download_model_variant(
         # A stable staging directory lets a later invocation resume after the
         # app, process, or computer is stopped. It is never activated until all
         # published SHA-256 checksums have passed.
-        staging = downloads / f"{variant.runtime}-{variant.tier}.partial"
+        staging = downloads / f"{variant.version}-{variant.runtime}-{variant.tier}.partial"
         activated = False
         preserve_partial = False
         try:
             staging.mkdir(parents=True, exist_ok=True)
             callback(DownloadProgress(0, "Checking model catalogue", 0, variant.bytes))
-            release = _release_catalog()
-            checksum_map = _checksum_catalog()
+            release = _release_catalog(variant.version)
+            checksum_map = _checksum_catalog(variant.version)
             published = _published_variant(release, variant)
-            remote_files = _published_files(published, variant)
-            staged_bytes = sum(
-                item.stat().st_size for item in staging.rglob("*") if item.is_file()
-            )
+            remote_files = _published_files(published, variant, checksum_map)
+            staged_bytes = sum(item.stat().st_size for item in staging.rglob("*") if item.is_file())
             _check_disk_budget(model_root, max(0, variant.bytes - staged_bytes))
             received = 0
             manifest_files: list[dict[str, Any]] = []
@@ -285,19 +357,16 @@ def download_model_variant(
                 target = _safe_destination(staging, relative)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 expected = checksum_map.get(repository_path)
+                filename = PurePosixPath(repository_path).name
                 if expected is None:
-                    raise VerificationError(
-                        f"the published checksum is missing for {Path(repository_path).name}"
-                    )
+                    raise VerificationError(f"the published checksum is missing for {filename}")
 
                 if target.is_file():
                     size = target.stat().st_size
                     digest = _file_sha256(target)
                     if digest == expected:
                         received += size
-                        callback(
-                            _progress(received, variant.bytes, Path(repository_path).name)
-                        )
+                        callback(_progress(received, variant.bytes, filename))
                         manifest_files.append(
                             {
                                 "path": relative.as_posix(),
@@ -306,20 +375,16 @@ def download_model_variant(
                             }
                         )
                         continue
-                callback(
-                    _progress(received, variant.bytes, Path(repository_path).name)
-                )
+                callback(_progress(received, variant.bytes, filename))
 
-                def on_chunk(count: int, *, name=Path(repository_path).name) -> None:
+                def on_chunk(count: int, *, name=filename) -> None:
                     nonlocal received
                     received += count
                     callback(_progress(received, variant.bytes, name))
 
-                size, digest = _download_file(repository_path, target, on_chunk)
+                size, digest = _download_file(repository_path, target, on_chunk, variant.version)
                 if digest != expected:
-                    raise VerificationError(
-                        f"SHA-256 verification failed for {Path(repository_path).name}"
-                    )
+                    raise VerificationError(f"SHA-256 verification failed for {filename}")
                 manifest_files.append(
                     {"path": relative.as_posix(), "bytes": size, "sha256": digest}
                 )
@@ -327,9 +392,10 @@ def download_model_variant(
             atomic_json(
                 manifest,
                 {
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "release": str(release["release"]),
                     "repository": MODEL_REPOSITORY,
+                    "model_version": variant.version,
                     "runtime": variant.runtime,
                     "tier": variant.tier,
                     "repository_path": variant.repository_path,
@@ -337,11 +403,7 @@ def download_model_variant(
                     "files": manifest_files,
                 },
             )
-            callback(
-                DownloadProgress(
-                    99, "Verifying downloaded files", received, variant.bytes
-                )
-            )
+            callback(DownloadProgress(99, "Verifying downloaded files", received, variant.bytes))
             verify_download_manifest(manifest)
             destination.parent.mkdir(parents=True, exist_ok=True)
             os.replace(staging, destination)
@@ -379,10 +441,14 @@ def verify_download_manifest(manifest: str | Path) -> ManifestVerification:
         raise VerificationError(
             f"invalid downloaded-model manifest {manifest_path}: {exc}"
         ) from exc
-    if payload.get("schema_version") != 1 or payload.get("repository") != MODEL_REPOSITORY:
+    if not _manifest_source_valid(payload):
         raise VerificationError(f"unsupported downloaded-model manifest: {manifest_path}")
     try:
-        variant = variant_for(str(payload.get("runtime")), str(payload.get("tier")))
+        variant = variant_for(
+            str(payload.get("runtime")),
+            str(payload.get("tier")),
+            str(payload.get("model_version", "v1")),
+        )
     except ConfigurationError as exc:
         raise VerificationError(
             f"downloaded-model manifest has an unknown model variant: {manifest_path}"
@@ -400,8 +466,7 @@ def verify_download_manifest(manifest: str | Path) -> ManifestVerification:
             f"downloaded-model manifest has an invalid file list: {manifest_path}"
         )
     required = {
-        _local_relative_path(path, variant).as_posix()
-        for path in files_for_variant(variant)
+        _local_relative_path(path, variant).as_posix() for path in files_for_variant(variant)
     }
     seen: set[str] = set()
     total = 0
@@ -447,8 +512,8 @@ def _installed_download(root: Path, variant: ModelVariant) -> ModelDownload | No
         payload = json.loads(manifest.read_text(encoding="utf-8"))
         records = payload["files"]
         if (
-            payload.get("schema_version") != 1
-            or payload.get("repository") != MODEL_REPOSITORY
+            not _manifest_source_valid(payload)
+            or payload.get("model_version", "v1") != variant.version
             or payload.get("runtime") != variant.runtime
             or payload.get("tier") != variant.tier
             or payload.get("repository_path") != variant.repository_path
@@ -458,8 +523,7 @@ def _installed_download(root: Path, variant: ModelVariant) -> ModelDownload | No
         ):
             return None
         required = {
-            _local_relative_path(path, variant).as_posix()
-            for path in files_for_variant(variant)
+            _local_relative_path(path, variant).as_posix() for path in files_for_variant(variant)
         }
         seen: set[str] = set()
         for record in records:
@@ -481,9 +545,28 @@ def _installed_download(root: Path, variant: ModelVariant) -> ModelDownload | No
     )
 
 
-def _release_catalog() -> dict[str, Any]:
+def _manifest_source_valid(payload: dict[str, Any]) -> bool:
+    if payload.get("schema_version") == 2:
+        return (
+            payload.get("repository") == MODEL_REPOSITORY
+            and payload.get("model_version") in MODEL_VERSIONS
+        )
+    return (
+        payload.get("schema_version") == 1
+        and payload.get("repository") == _LEGACY_REPOSITORY
+        and payload.get("model_version", "v1") == "v1"
+    )
+
+
+def _source_root(version: str) -> str:
+    if version not in MODEL_VERSIONS:
+        raise ConfigurationError("model version must be v1 or v2")
+    return f"{MODEL_REPOSITORY}/osModels-{version.upper()}"
+
+
+def _release_catalog(version: str) -> dict[str, Any]:
     try:
-        payload = json.loads(_read_text(f"{_RAW_TEXT_REPOSITORY}/release.json"))
+        payload = json.loads(_read_text(f"{_source_root(version)}/release.json"))
     except json.JSONDecodeError as exc:
         raise VerificationError("the remote osCode release catalogue is invalid JSON") from exc
     if not isinstance(payload, dict):
@@ -491,9 +574,9 @@ def _release_catalog() -> dict[str, Any]:
     return payload
 
 
-def _checksum_catalog() -> dict[str, str]:
+def _checksum_catalog(version: str) -> dict[str, str]:
     result: dict[str, str] = {}
-    for line in _read_text(f"{_RAW_TEXT_REPOSITORY}/SHA256SUMS").splitlines():
+    for line in _read_text(f"{_source_root(version)}/SHA256SUMS").splitlines():
         match = re.fullmatch(r"([a-fA-F0-9]{64})\s+\./(.+)", line.strip())
         if match:
             relative = match.group(2).replace("\\", "/")
@@ -517,9 +600,11 @@ def _published_variant(release: dict[str, Any], variant: ModelVariant) -> dict[s
         runtime = str(published.get("runtime", "")).lower()
         normalized_runtime = "llama.cpp" if runtime == "llama.cpp" else runtime
         if normalized_runtime == variant.runtime and published.get("tier") == variant.tier:
+            published_path = published.get("language_path", published.get("path"))
             if (
-                published.get("path") != variant.repository_path
+                published_path != variant.repository_path
                 or published.get("bytes") != variant.bytes
+                or published.get("projector_path") != variant.projector
             ):
                 raise VerificationError(
                     "the published model catalogue does not match this osAi release"
@@ -528,30 +613,25 @@ def _published_variant(release: dict[str, Any], variant: ModelVariant) -> dict[s
     raise VerificationError("the selected model is absent from the published catalogue")
 
 
-def _published_files(published: dict[str, Any], variant: ModelVariant) -> tuple[str, ...]:
-    raw_files = published.get("files")
-    if raw_files is None:
-        return files_for_variant(variant)
-    if not isinstance(raw_files, list) or not raw_files or len(raw_files) > 1_000:
-        raise VerificationError("the published model file list is invalid")
-    files = tuple(
-        str(value).replace("\\", "/").removeprefix("./") for value in raw_files
-    )
-    allowed_prefix = (
-        f"{variant.repository_path}/"
-        if variant.runtime == "mlx"
-        else f"{Path(variant.repository_path).parent.as_posix()}/"
-    )
-    if len(set(files)) != len(files) or any(
-        not path.startswith(allowed_prefix)
-        or "../" in path
-        or path.endswith("/")
+def _published_files(
+    published: dict[str, Any], variant: ModelVariant, checksum_map: dict[str, str]
+) -> tuple[str, ...]:
+    required = set(files_for_variant(variant))
+    if variant.runtime == "mlx":
+        prefix = f"{variant.repository_path}/"
+        files = {path for path in checksum_map if path.startswith(prefix)}
+    else:
+        files = required
+    if not required.issubset(files) or not files:
+        raise VerificationError("the published model file list is incomplete")
+    if len(files) > 1_000 or any(
+        PurePosixPath(path).is_absolute()
+        or ".." in PurePosixPath(path).parts
+        or (variant.runtime == "mlx" and not path.startswith(prefix))
         for path in files
     ):
         raise VerificationError("the published model file list leaves its model folder")
-    if not set(files_for_variant(variant)).issubset(files):
-        raise VerificationError("the published model file list is incomplete")
-    return files
+    return tuple(sorted(files))
 
 
 def _read_text(url: str) -> str:
@@ -570,9 +650,10 @@ def _download_file(
     repository_path: str,
     destination: Path,
     on_chunk: Callable[[int], None],
+    version: str = DEFAULT_MODEL_VERSION,
 ) -> tuple[int, str]:
     encoded = "/".join(quote(part, safe="") for part in repository_path.split("/"))
-    url = f"{_RAW_REPOSITORY}/{encoded}"
+    url = f"{_source_root(version)}/{encoded}"
     existing = destination.stat().st_size if destination.is_file() else 0
     request: str | Request = url
     if existing:
@@ -583,7 +664,7 @@ def _download_file(
     except HTTPError as exc:
         if existing and exc.code == 416:
             destination.unlink(missing_ok=True)
-            return _download_file(repository_path, destination, on_chunk)
+            return _download_file(repository_path, destination, on_chunk, version)
         raise
 
     digest = hashlib.sha256()
@@ -593,9 +674,7 @@ def _download_file(
         append = existing > 0 and _response_status(response) == 206
         if append:
             if _content_range_start(response) != existing:
-                raise VerificationError(
-                    f"invalid resume response for {Path(repository_path).name}"
-                )
+                raise VerificationError(f"invalid resume response for {Path(repository_path).name}")
             with destination.open("rb") as partial:
                 while chunk := partial.read(_CHUNK_BYTES):
                     digest.update(chunk)
@@ -618,7 +697,7 @@ def _download_file(
 
 def _open_response(url: str | Request) -> BinaryIO:
     request = url if isinstance(url, Request) else Request(url)
-    request.add_header("User-Agent", "osAi-model-downloader/0.1.0")
+    request.add_header("User-Agent", "osAi-model-downloader/0.1.1")
     return urlopen(  # noqa: S310 - fixed HTTPS hosts are verified below
         request, timeout=60, context=_TLS_CONTEXT
     )

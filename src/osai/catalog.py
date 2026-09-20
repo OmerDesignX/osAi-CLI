@@ -12,25 +12,17 @@ from typing import Any
 from .errors import ConfigurationError, ModelFormatError
 from .formats import inspect_gguf, inspect_mlx
 from .hardware import Engine, HardwareReport, detect_hardware, select_engine
+from .model_download import DEFAULT_MODEL_VERSION, MODEL_VERSIONS, variant_for
 from .paths import project_root
 
 
 class ModelTier(str, Enum):
+    XSMALL = "xsmall"
     SMALL = "small"
     MEDIUM = "medium"
     LARGE = "large"
 
 
-_BUNDLED_MLX = {
-    ModelTier.SMALL: "osCode-MLX-Small-Q5",
-    ModelTier.MEDIUM: "osCode-MLX-Medium-Q6",
-    ModelTier.LARGE: "osCode-MLX-Large-Q8",
-}
-_BUNDLED_GGUF = {
-    ModelTier.SMALL: "osCode-GGUF-Small-Q4_K_M-00001-of-00002.gguf",
-    ModelTier.MEDIUM: "osCode-GGUF-Medium-Q6_K-00001-of-00002.gguf",
-    ModelTier.LARGE: "osCode-GGUF-Large-Q8_0-00001-of-00003.gguf",
-}
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 
@@ -39,6 +31,7 @@ class CatalogEntry:
     name: str
     source: str
     tier: str | None
+    version: str | None
     mlx: Path | None
     gguf: Path | None
 
@@ -77,18 +70,27 @@ def custom_root() -> Path:
     return project_root() / "models" / "custom"
 
 
-def bundled_entry(tier: str | ModelTier, root: Path | None = None) -> CatalogEntry:
+def bundled_entry(
+    tier: str | ModelTier,
+    root: Path | None = None,
+    version: str = DEFAULT_MODEL_VERSION,
+) -> CatalogEntry:
     try:
         value = tier if isinstance(tier, ModelTier) else ModelTier(tier)
     except ValueError as exc:
-        raise ConfigurationError("tier must be small, medium, or large") from exc
+        raise ConfigurationError("tier must be xsmall, small, medium, or large") from exc
+    if version not in MODEL_VERSIONS or (version == "v1" and value is ModelTier.XSMALL):
+        raise ConfigurationError("xsmall is available only for v2; version must be v1 or v2")
     model_root = (root or bundled_root()).expanduser().resolve()
+    mlx = variant_for("mlx", value.value, version)
+    gguf = variant_for("llama.cpp", value.value, version)
     return CatalogEntry(
         name=f"oscode-{value.value}",
         source="official",
         tier=value.value,
-        mlx=model_root / "MLX" / _BUNDLED_MLX[value],
-        gguf=model_root / "GGUF" / value.value / _BUNDLED_GGUF[value],
+        version=version,
+        mlx=mlx.destination(model_root),
+        gguf=gguf.primary_path(model_root),
     )
 
 
@@ -112,15 +114,23 @@ def custom_entry(name: str, root: Path | None = None) -> CatalogEntry:
         name=name,
         source="custom",
         tier=None,
+        version=None,
         mlx=mlx if (mlx / "config.json").is_file() else None,
         gguf=gguf,
     )
 
 
 def list_catalog(
-    *, bundled: Path | None = None, custom: Path | None = None
+    *,
+    bundled: Path | None = None,
+    custom: Path | None = None,
+    version: str = DEFAULT_MODEL_VERSION,
 ) -> tuple[CatalogEntry, ...]:
-    entries = [bundled_entry(tier, bundled) for tier in ModelTier]
+    entries = [
+        bundled_entry(tier, bundled, version)
+        for tier in ModelTier
+        if version == "v2" or tier is not ModelTier.XSMALL
+    ]
     location = (custom or custom_root()).expanduser().resolve()
     if location.is_dir():
         for folder in sorted(location.iterdir(), key=lambda item: item.name.lower()):
@@ -137,11 +147,12 @@ def resolve_model(
     bundled: Path | None = None,
     custom_models: Path | None = None,
     hardware: HardwareReport | None = None,
+    model_version: str = DEFAULT_MODEL_VERSION,
 ) -> ModelSelection:
     if (tier is None) == (custom is None):
         raise ConfigurationError("select exactly one bundled tier or custom model")
     entry = (
-        bundled_entry(tier, bundled)
+        bundled_entry(tier, bundled, model_version)
         if tier is not None
         else custom_entry(str(custom), custom_models)
     )
@@ -183,8 +194,7 @@ def resolve_model(
 
 def _choose_gguf(folder: Path) -> Path | None:
     candidates = [
-        _contained_path(path, folder, "custom GGUF file")
-        for path in sorted(folder.glob("*.gguf"))
+        _contained_path(path, folder, "custom GGUF file") for path in sorted(folder.glob("*.gguf"))
     ]
     first_shards = [path for path in candidates if "-00001-of-" in path.name]
     choices = first_shards or candidates

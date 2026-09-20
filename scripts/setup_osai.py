@@ -367,9 +367,10 @@ def _install_target(explicit: Path | None) -> Path:
         if not selected.is_file() or selected.suffix != ".whl":
             raise SetupError(f"wheel does not exist: {selected}")
         return selected
-    wheels = sorted((PROJECT_ROOT / "dist").glob("osai-0.1.0-*.whl"))
+    version = (PROJECT_ROOT / "VERSION.txt").read_text(encoding="utf-8").strip()
+    wheels = sorted((PROJECT_ROOT / "dist").glob(f"osai-{version}-*.whl"))
     if len(wheels) > 1:
-        raise SetupError("multiple 0.1.0 wheels found; select one with --wheel")
+        raise SetupError(f"multiple {version} wheels found; select one with --wheel")
     return wheels[0].resolve() if wheels else PROJECT_ROOT
 
 
