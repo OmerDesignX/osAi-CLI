@@ -77,7 +77,7 @@ The script:
 1. Detects the OS, architecture, macOS version, CUDA toolkit, and Vulkan tools.
 2. Creates or reuses `.venv`.
 3. Selects the correct file from `requirements/` and installs it.
-4. Installs `dist/osai-0.1.1-py3-none-any.whl`, or builds from the local
+4. Installs `dist/osai-0.1.2-py3-none-any.whl`, or builds from the local
    project if the wheel is absent.
 5. Builds the bundled MLX and MLX-LM sources when the platform supports MLX.
 6. Builds bundled llama.cpp for Metal, CUDA, Vulkan, or CPU.
@@ -124,7 +124,7 @@ To install the wheel yourself first:
 ```sh
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install dist/osai-0.1.1-py3-none-any.whl
+python -m pip install dist/osai-0.1.2-py3-none-any.whl
 python scripts/setup_osai.py --current-environment
 ```
 
@@ -193,6 +193,10 @@ use `--model-version v1` for the original osCode release. V2 also offers
 fetches individual files and split shards, and verifies each file against that
 version's published SHA-256 list. V2 GGUF vision projectors are included. An
 interrupted download can resume. The model filenames remain unchanged.
+V1 models now live under `osCode-Models/V1/`, alongside V2 under `V2/`.
+Previously downloaded V1 models in the original `MLX/` or `GGUF/` folders
+remain usable; the desktop app promotes them into `V1/` during an upgrade
+while preserving the original paths for older sessions.
 
 Use `--no-download-model` or set
 `OSAI_OFFLINE=1` to require an already-downloaded model.

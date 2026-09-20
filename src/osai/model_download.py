@@ -50,8 +50,12 @@ class ModelVariant:
         return "GGUF" if self.runtime == "llama.cpp" else "MLX"
 
     def destination(self, root: Path) -> Path:
-        version_root = root if self.version == "v1" else root / "V2"
-        return version_root / self.format_directory / self.folder
+        return root / self.version.upper() / self.format_directory / self.folder
+
+    def legacy_destination(self, root: Path) -> Path | None:
+        if self.version != "v1":
+            return None
+        return root / self.format_directory / self.folder
 
     def primary_path(self, root: Path) -> Path:
         destination = self.destination(root)
@@ -504,7 +508,21 @@ def verify_download_manifest(manifest: str | Path) -> ManifestVerification:
 
 
 def _installed_download(root: Path, variant: ModelVariant) -> ModelDownload | None:
-    destination = variant.destination(root)
+    for destination in (variant.destination(root), variant.legacy_destination(root)):
+        if destination is not None:
+            installed = _installed_at(destination, variant)
+            if installed is not None:
+                return installed
+    return None
+
+
+def installed_model_path(root: Path, variant: ModelVariant) -> Path:
+    """Use a verified legacy V1 installation until the app can migrate it."""
+    installed = _installed_download(root, variant)
+    return installed.model if installed is not None else variant.primary_path(root)
+
+
+def _installed_at(destination: Path, variant: ModelVariant) -> ModelDownload | None:
     manifest = destination / MODEL_MANIFEST
     if not manifest.is_file():
         return None
@@ -536,7 +554,11 @@ def _installed_download(root: Path, variant: ModelVariant) -> ModelDownload | No
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError, VerificationError):
         return None
     return ModelDownload(
-        model=variant.primary_path(root),
+        model=(
+            destination / PurePosixPath(variant.repository_path).name
+            if variant.runtime == "llama.cpp"
+            else destination
+        ),
         destination=destination,
         manifest=manifest,
         runtime=variant.runtime,
@@ -697,7 +719,7 @@ def _download_file(
 
 def _open_response(url: str | Request) -> BinaryIO:
     request = url if isinstance(url, Request) else Request(url)
-    request.add_header("User-Agent", "osAi-model-downloader/0.1.1")
+    request.add_header("User-Agent", "osAi-model-downloader/0.1.2")
     return urlopen(  # noqa: S310 - fixed HTTPS hosts are verified below
         request, timeout=60, context=_TLS_CONTEXT
     )

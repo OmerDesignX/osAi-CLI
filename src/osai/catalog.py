@@ -12,7 +12,12 @@ from typing import Any
 from .errors import ConfigurationError, ModelFormatError
 from .formats import inspect_gguf, inspect_mlx
 from .hardware import Engine, HardwareReport, detect_hardware, select_engine
-from .model_download import DEFAULT_MODEL_VERSION, MODEL_VERSIONS, variant_for
+from .model_download import (
+    DEFAULT_MODEL_VERSION,
+    MODEL_VERSIONS,
+    installed_model_path,
+    variant_for,
+)
 from .paths import project_root
 
 
@@ -89,8 +94,8 @@ def bundled_entry(
         source="official",
         tier=value.value,
         version=version,
-        mlx=mlx.destination(model_root),
-        gguf=gguf.primary_path(model_root),
+        mlx=installed_model_path(model_root, mlx),
+        gguf=installed_model_path(model_root, gguf),
     )
 
 

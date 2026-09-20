@@ -25,7 +25,7 @@ def test_official_gguf_models_use_atomic_tier_directories(tmp_path: Path):
 
     assert entry.source == "official"
     assert entry.gguf == (
-        tmp_path / "GGUF" / "small" / "osCode-GGUF-Small-Q4_K_M-00001-of-00002.gguf"
+        tmp_path / "V1" / "GGUF" / "small" / "osCode-GGUF-Small-Q4_K_M-00001-of-00002.gguf"
     )
 
 

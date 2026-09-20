@@ -95,7 +95,7 @@ def test_downloads_verifies_and_atomically_activates_selected_variant(monkeypatc
     result = downloads.download_model_variant(tmp_path, variant, progress=progress.append)
 
     assert result.downloaded is True
-    assert result.model == tmp_path / "GGUF" / "small" / Path(variant.repository_path).name
+    assert result.model == tmp_path / "V1" / "GGUF" / "small" / Path(variant.repository_path).name
     assert result.model.read_bytes() == payloads[remote_files[0]]
     assert progress[-1].percent == 100
     verified = downloads.verify_download_manifest(result.manifest)
@@ -111,6 +111,18 @@ def test_downloads_verifies_and_atomically_activates_selected_variant(monkeypatc
         tmp_path, runtime="llama.cpp", tier="small", version="v1"
     )
     assert existing.downloaded is False
+
+    legacy = tmp_path / "GGUF" / "small"
+    legacy.parent.mkdir(parents=True)
+    result.destination.rename(legacy)
+    migrated_later = downloads.ensure_official_model(
+        tmp_path, runtime="llama.cpp", tier="small", version="v1"
+    )
+    assert migrated_later.downloaded is False
+    assert migrated_later.model == legacy / Path(variant.repository_path).name
+    from osai.catalog import bundled_entry
+
+    assert bundled_entry("small", tmp_path, "v1").gguf == migrated_later.model
 
 
 def test_checksum_failure_does_not_activate_partial_model(monkeypatch, tmp_path: Path):
