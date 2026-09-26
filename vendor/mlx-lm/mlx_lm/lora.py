@@ -12,6 +12,7 @@ import mlx.optimizers as optim
 import numpy as np
 import yaml
 from tqdm import tqdm
+from osai.mlx_safety import WindowedDataset
 
 from .cli_ui import make_console, print_lora_run_header, rprint
 from .tuner.callbacks import get_reporting_callbacks
@@ -229,6 +230,20 @@ def train_model(
     training_callback: TrainingCallback = None,
 ):
     mx.random.seed(args.seed)
+    train_windows = WindowedDataset(CacheDataset(train_set), args.max_seq_length)
+    valid_windows = WindowedDataset(CacheDataset(valid_set), args.max_seq_length)
+    if not train_windows:
+        raise ValueError("Training data has no supervised tokens after tokenization")
+    if getattr(args, "osai_epochs", None) is not None:
+        batches = math.ceil(len(train_windows) / args.batch_size)
+        requested = batches * args.osai_epochs
+        accumulation = args.grad_accumulation_steps
+        args.iters = math.ceil(requested / accumulation) * accumulation
+        rprint(
+            f"osai: training plan examples={len(train_set)} windows={len(train_windows)} "
+            f"epochs={args.osai_epochs} batch={args.batch_size} steps={args.iters} "
+            f"optimizer_updates={args.iters // accumulation}"
+        )
     model.freeze()
     if args.num_layers > len(model.layers):
         raise ValueError(
@@ -306,21 +321,22 @@ def train_model(
         model=model,
         args=training_args,
         optimizer=opt,
-        train_dataset=CacheDataset(train_set),
-        val_dataset=CacheDataset(valid_set),
+        train_dataset=train_windows,
+        val_dataset=valid_windows,
         training_callback=training_callback,
     )
 
 
 def evaluate_model(args, model: nn.Module, test_set):
+    test_windows = WindowedDataset(CacheDataset(test_set), args.max_seq_length)
     rank = mx.distributed.init().rank()
-    n_batches = len(test_set) // args.batch_size
+    n_batches = len(test_windows) // args.batch_size
     if args.test_batches != -1:
         n_batches = min(n_batches, args.test_batches)
     pbar = tqdm(total=n_batches, desc="Calculating loss...") if rank == 0 else None
     test_loss = evaluate(
         model=model,
-        dataset=CacheDataset(test_set),
+        dataset=test_windows,
         batch_size=args.batch_size,
         num_batches=args.test_batches,
         max_seq_length=args.max_seq_length,

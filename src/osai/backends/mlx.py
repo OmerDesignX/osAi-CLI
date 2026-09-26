@@ -7,9 +7,10 @@ import math
 import os
 import platform
 import re
+import shutil
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from ..config import TrainingConfig
@@ -27,6 +28,31 @@ _LOSS_RE = re.compile(r"(?:Train|Val) loss\s+([0-9]+(?:\.[0-9]+)?)", re.IGNORECA
 _TABLE_LOSS_RE = re.compile(r"^\s*\d+\s+([0-9]+(?:\.[0-9]+)?)\s", re.MULTILINE)
 _TEST_LOSS_RE = re.compile(r"Test loss\s+([0-9]+(?:\.[0-9]+)?)", re.IGNORECASE)
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_WINDOW_PLAN_RE = re.compile(r"osai: training plan .*?windows=(\d+).*?steps=(\d+)")
+_MEMORY_ERRORS = (
+    "out of memory",
+    "out of device memory",
+    "failed to allocate",
+    "resource exhausted",
+    "memory allocation failed",
+    "std::bad_alloc",
+    "metal command buffer failed due to insufficient memory",
+)
+
+
+def _mlx_memory_failure(log_path: Path, offset: int) -> bool:
+    with log_path.open("rb") as handle:
+        handle.seek(offset)
+        tail = handle.read()[-16_384:].decode("utf-8", errors="replace").lower()
+    return any(marker in tail for marker in _MEMORY_ERRORS)
+
+
+def _lower_mlx_memory_settings(context: int, batch: int, workers: int) -> tuple[int, int] | None:
+    if context > 64:
+        return max(64, context // 2), batch
+    if batch > workers:
+        return context, max(workers, (batch // (2 * workers)) * workers)
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,7 +200,6 @@ class MlxBackend:
         )
         adapter_dir = layout.adapters / "mlx"
         log_path = layout.logs / "train.log"
-        adapter_dir.mkdir(parents=True, exist_ok=True)
         log_path.unlink(missing_ok=True)
 
         mlx_config = {
@@ -190,11 +215,12 @@ class MlxBackend:
             "learning_rate": config.learning_rate,
             "num_layers": config.num_layers,
             "max_seq_length": config.max_seq_length,
+            "osai_epochs": config.iterations,
             "grad_checkpoint": config.grad_checkpoint,
             "grad_accumulation_steps": config.grad_accumulation_steps,
             # Raw language-modelling rows do not have a prompt boundary to mask.
             "mask_prompt": config.mask_prompt and dataset.schema != "text",
-            "adapter_path": str(adapter_dir.resolve()),
+            "adapter_path": str((internal / "mlx-attempt-1").resolve()),
             "save_every": min(config.save_every, training_steps),
             "steps_per_report": config.steps_per_report,
             "steps_per_eval": config.steps_per_eval,
@@ -213,7 +239,6 @@ class MlxBackend:
             )
         config_path = internal / "mlx_lora_config.yaml"
         # JSON is a strict subset of YAML and avoids another serialization surface.
-        atomic_json(config_path, mlx_config)
         command = [
             str(self.python),
             "-m",
@@ -240,18 +265,69 @@ class MlxBackend:
                 "--",
                 *command[1:],
             ]
-        result = run_logged(
-            command,
-            log_path=log_path,
-            env=self.environment(),
-        )
+        context = config.max_seq_length
+        batch = config.batch_size
+        attempt = 0
+        elapsed = 0.0
+        while True:
+            attempt += 1
+            attempt_dir = internal / f"mlx-attempt-{attempt}"
+            mlx_config.update(
+                max_seq_length=context,
+                batch_size=batch,
+                adapter_path=str(attempt_dir.resolve()),
+            )
+            atomic_json(config_path, mlx_config)
+            print(
+                f"osai: training attempt engine=mlx attempt={attempt} "
+                f"context={context} batch={batch} windows=overlap",
+                file=sys.stderr,
+                flush=True,
+            )
+            attempt_offset = log_path.stat().st_size if log_path.exists() else 0
+            try:
+                result = run_logged(command, log_path=log_path, env=self.environment())
+                elapsed += result.elapsed_seconds
+                break
+            except TrainingError:
+                if not config.auto_settings or not _mlx_memory_failure(log_path, attempt_offset):
+                    raise
+                lowered = _lower_mlx_memory_settings(context, batch, workers)
+                if lowered is None:
+                    raise
+                next_context, next_batch = lowered
+                print(
+                    f"osai: auto retry engine=mlx attempt={attempt + 1} "
+                    f"context={context}->{next_context} batch={batch}->{next_batch} "
+                    "reason=oom",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                context, batch = lowered
+        attempt_adapter = attempt_dir / "adapters.safetensors"
+        if not attempt_adapter.is_file() or attempt_adapter.stat().st_size == 0:
+            raise TrainingError(f"MLX LM completed without a non-empty adapter: {attempt_adapter}")
+        if adapter_dir.exists():
+            raise TrainingError(f"adapter destination already exists: {adapter_dir}")
+        shutil.move(str(attempt_dir), str(adapter_dir))
         adapter_file = adapter_dir / "adapters.safetensors"
         adapter_config = adapter_dir / "adapter_config.json"
         if not adapter_file.is_file() or adapter_file.stat().st_size == 0:
             raise TrainingError(f"MLX LM completed without a non-empty adapter: {adapter_file}")
         if not adapter_config.is_file():
             raise TrainingError(f"MLX LM did not write adapter metadata: {adapter_config}")
+        adapter_metadata = json.loads(adapter_config.read_text(encoding="utf-8"))
+        adapter_metadata["adapter_path"] = str(adapter_dir.resolve())
+        atomic_json(adapter_config, adapter_metadata)
         log_text = _ANSI_RE.sub("", log_path.read_text(encoding="utf-8"))
+        plan = list(_WINDOW_PLAN_RE.finditer(log_text))
+        if plan:
+            training_steps = int(plan[-1].group(2))
+            optimizer_updates = training_steps // config.grad_accumulation_steps
+        with log_path.open("rb") as handle:
+            handle.seek(attempt_offset)
+            successful_log = handle.read().decode("utf-8", errors="replace")
+        log_text = _ANSI_RE.sub("", successful_log)
         matches = list(_LOSS_RE.finditer(log_text)) or list(_TABLE_LOSS_RE.finditer(log_text))
         losses = tuple(float(match.group(1)) for match in matches)
         if not losses:
@@ -262,12 +338,16 @@ class MlxBackend:
             raise TrainingError(f"training reported a non-finite loss; see {log_path}")
         test_loss = None
         if (data_path / "test.jsonl").is_file():
-            test_loss = self.evaluate(config, adapter_dir, data_path=data_path)
+            test_loss = self.evaluate(
+                replace(config, max_seq_length=context, batch_size=batch),
+                adapter_dir,
+                data_path=data_path,
+            )
         return MlxTrainingResult(
             adapter_dir=adapter_dir,
             adapter_file=adapter_file,
             log_file=log_path,
-            elapsed_seconds=result.elapsed_seconds,
+            elapsed_seconds=elapsed,
             losses=losses,
             test_loss=test_loss,
             epochs=config.iterations,

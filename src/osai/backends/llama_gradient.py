@@ -938,8 +938,11 @@ def _lower_auto_context(
         }
     )
     print(
-        f"osai: GPU training ran out of memory at context {settings.context}; "
-        f"retrying at context {context} without dropping assistant labels"
+        f"osai: auto retry engine=llama.cpp "
+        f"attempt={len(manifest['auto_context_retries']) + 1} "
+        f"context={settings.context}->{context} "
+        f"batch={settings.batch_size}->{batch_size} reason=oom; "
+        "overlapping windows preserve assistant labels"
     )
     return lowered
 

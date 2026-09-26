@@ -34,7 +34,11 @@ LoRA targets from the projections present in the model instead of assuming the
 last blocks share one topology. When a supervised row exceeds the selected
 GGUF context, llama.cpp uses overlapping windows so every assistant token
 remains supervised. Each window can see only its local context. Rows
-containing only raw text use full-token language-model loss.
+containing only raw text use full-token language-model loss. MLX text training
+uses the same one-token overlap between bounded windows, covering every
+supervised answer token. A window sees only its local context; Auto can reduce
+the window size and then batch size after a device-memory failure. The trainer
+reports each attempt and the actual count of tokenized windows.
 
 ## Hardware support
 
@@ -486,7 +490,7 @@ directly to alignment.
 | `--rank N` | LoRA rank. Default: `2`. |
 | `--scale NUMBER` | LoRA scaling value. Default: `4`. |
 | `--num-layers N` | Number of final model layers to adapt. Default: `1`. |
-| `--max-seq-length N` | GGUF context tokens per training window. Longer supervised rows are windowed without dropping assistant labels; each window sees only local context. Auto selects a hardware-aware value. |
+| `--max-seq-length N` | MLX or GGUF context tokens per training window. Longer supervised rows are windowed without dropping assistant labels; each window sees only local context. Auto selects a hardware-aware value. |
 | `--image-size WIDTH HEIGHT` | Resize local images before VLM preprocessing. Omit it to use the model processor's native size. |
 | `--video-fps NUMBER` | Frames sampled per second from local videos. Default: `2`. |
 | `--video-max-frames N` | Maximum frames loaded from each local video. Default: `32`. |

@@ -220,8 +220,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-seq-length",
         type=int,
         help=(
-            "maximum prompt and answer tokens per training example; longer supervised "
-            "records trim old prompt context while preserving assistant labels"
+            "maximum tokens per training window; longer supervised records use "
+            "overlapping windows without discarding trainable tokens"
         ),
     )
     train_parser.add_argument("--learning-rate", type=float)

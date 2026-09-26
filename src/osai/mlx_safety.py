@@ -8,6 +8,43 @@ from typing import TypeVar
 Token = TypeVar("Token")
 
 
+class WindowedDataset:
+    """Expose every supervised token through bounded, one-token-overlap windows.
+
+    The overlap is input context only: the shifted language-model loss starts at
+    the next token, so no target is trained twice. Prompt-only windows are
+    omitted, but the window at the answer boundary keeps preceding context.
+    """
+
+    def __init__(self, dataset, max_seq_length: int):
+        if max_seq_length < 2:
+            raise ValueError("max_seq_length must be at least 2")
+        self.dataset = dataset
+        self.windows: list[tuple[int, int, int, int]] = []
+        for index in range(len(dataset)):
+            sequence, offset = dataset[index]
+            length = len(sequence)
+            target = max(1, offset)
+            first = True
+            while target < length:
+                start = max(0, target - max_seq_length // 2) if first else target - 1
+                end = min(length, start + max_seq_length)
+                self.windows.append((index, start, end, max(0, offset - start)))
+                target = end
+                first = False
+
+    def __len__(self):
+        return len(self.windows)
+
+    def itemlen(self, index: int) -> int:
+        _, start, end, _ = self.windows[index]
+        return end - start
+
+    def __getitem__(self, index: int):
+        row, start, end, offset = self.windows[index]
+        return self.dataset[row][0][start:end], offset
+
+
 def truncate_completion_aware(
     sequence: Sequence[Token], prompt_offset: int, max_seq_length: int
 ) -> tuple[Sequence[Token], int]:

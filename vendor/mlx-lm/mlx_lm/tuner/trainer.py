@@ -11,7 +11,6 @@ import mlx.nn as nn
 import numpy as np
 from mlx.nn.utils import average_gradients
 from mlx.utils import tree_flatten, tree_map
-from osai.mlx_safety import truncate_completion_aware
 
 from ..cli_ui import TrainUI, rprint
 from .callbacks import TrainingCallback
@@ -117,11 +116,8 @@ def iterate_batches(
     else:
         len_fn = lambda idx: len(dataset[idx][0])
     idx = sorted(range(len(dataset)), key=len_fn)
-    if len(dataset) < batch_size:
-        raise ValueError(
-            f"Dataset must have at least batch_size={batch_size}"
-            f" examples but only has {len(dataset)}."
-        )
+    if not idx:
+        raise ValueError("Dataset has no trainable windows")
 
     # If running in distributed mode (N machines) then each one should skip N-1
     # samples
@@ -135,13 +131,14 @@ def iterate_batches(
         raise ValueError("The batch size must be divisible by the number of workers")
 
     # Make the batches:
-    batch_idx = [
-        idx[i + offset : i + offset + batch_size : step]
-        for i in range(0, len(idx) - batch_size + 1, batch_size)
-    ]
+    batch_idx = []
+    for i in range(0, len(idx), batch_size):
+        group = idx[i : i + batch_size]
+        if len(group) < batch_size:
+            group += [idx[j % len(idx)] for j in range(batch_size - len(group))]
+        batch_idx.append(group[offset:batch_size:step])
     if seed is not None:
         np.random.seed(seed)
-    warned_about_truncation = False
     while True:
         indices = np.random.permutation(len(batch_idx))
         for i in indices:
@@ -152,13 +149,11 @@ def iterate_batches(
                 offsets = [0] * len(batch)
             offsets = list(offsets)
             lengths = [len(x) for x in batch]
-            if max(lengths) > max_seq_length and not warned_about_truncation:
-                rprint(
-                    f"[WARNING] Some sequences are longer than {max_seq_length} tokens. "
-                    "They will be truncated to fit; completion-masked samples retain "
-                    "both the end of the prompt and trainable answer tokens."
+            if max(lengths) > max_seq_length:
+                raise ValueError(
+                    "MLX training received an oversized row; window the dataset "
+                    "before batching so no supervised tokens are discarded"
                 )
-                warned_about_truncation = True
 
             # Pad to one plus nearest multiple of pad_to or the maximum length
             pad_to = 32
@@ -168,20 +163,9 @@ def iterate_batches(
             batch_arr = np.zeros((batch_size // step, max_length_in_batch), np.int32)
 
             for j in range(batch_size // step):
-                truncated_length = min(lengths[j], max_seq_length)
+                truncated_length = lengths[j]
                 sequence = batch[j]
                 prompt_offset = offsets[j]
-                if lengths[j] > max_seq_length and 0 < prompt_offset < lengths[j]:
-                    # Keeping only the start of a long completion-masked sample can
-                    # discard its entire answer. Keep a balanced window around the
-                    # prompt/answer boundary instead: all of a short answer, or at
-                    # least half of the context for a long answer.
-                    sequence, prompt_offset = truncate_completion_aware(
-                        sequence, prompt_offset, max_seq_length
-                    )
-                    truncated_length = len(sequence)
-                else:
-                    sequence = sequence[:truncated_length]
                 batch_arr[j, :truncated_length] = sequence
                 offsets[j] = min(prompt_offset, truncated_length)
                 lengths[j] = (
