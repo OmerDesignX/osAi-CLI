@@ -737,6 +737,7 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
                 split_mode=config.split_mode,
                 tensor_split=config.tensor_split,
                 main_gpu=config.main_gpu,
+                auto_settings=config.auto_settings,
             ),
             accelerator=args.accelerator,
         )

@@ -16,6 +16,19 @@ def project_root() -> Path:
     if (source_root / "pyproject.toml").exists():
         return source_root
 
+    # The desktop app installs a wheel in .venv and keeps the downloaded
+    # repository beside it. Console entry points need to find that source too.
+    installation = Path(sys.executable).absolute()
+    if len(installation.parents) >= 3:
+        extracted = installation.parents[2] / "source"
+        if extracted.is_dir():
+            candidates = (extracted, *sorted(path for path in extracted.iterdir() if path.is_dir()))
+            for candidate in candidates:
+                if (candidate / "pyproject.toml").is_file() and (
+                    candidate / "vendor" / "llama.cpp" / "CMakeLists.txt"
+                ).is_file():
+                    return candidate.resolve()
+
     for candidate in (Path.cwd(), *Path.cwd().parents):
         if (candidate / "vendor" / "llama.cpp").is_dir():
             return candidate

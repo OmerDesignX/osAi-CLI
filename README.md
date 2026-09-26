@@ -32,7 +32,8 @@ AdamW optimizer is used for MLX while SGD is used for LLama.cpp models.
 Hybrid GGUF models may alternate attention and recurrent blocks. osAi resolves
 LoRA targets from the projections present in the model instead of assuming the
 last blocks share one topology. When a supervised row exceeds the selected
-context, llama.cpp trims prompt context while preserving answer labels. Rows
+GGUF context, llama.cpp uses overlapping windows so every assistant token
+remains supervised. Each window can see only its local context. Rows
 containing only raw text use full-token language-model loss.
 
 ## Hardware support
@@ -61,8 +62,8 @@ osCode V1 and V2 GGUF small models use the Qwen3.5 hybrid architecture. Since
 llama.cpp cannot backpropagate through its recurrent delta-net operation, the
 automatic profile trains the final block's `mlp.down_proj` LoRA only. The
 remaining blocks still participate in the frozen forward pass. Longer
-structured records keep assistant labels and trim older prompt context to the
-selected token limit; the CLI reports the number of trimmed records.
+structured records are windowed without discarding assistant labels; the CLI
+reports the number of windowed records.
 
 Training publishes both `base-plus-adapter` and a standalone lossless deployment
 bundle by default. In both MLX and GGUF bundles, fusion keeps the quantized base
@@ -336,8 +337,14 @@ model and accelerator. Each GPU used for GGUF data parallelism is probed
 separately. The largest passing `compact`, `balanced`, `performance`, or
 `maximum` profile must also fit conservative host and reported free-GPU-memory
 reserves for training. Benchmark results are cached for 12 hours per model,
-device set, and hardware state. Dataset size never changes the profile. The
-selected values are printed before training and stored in the run manifest.
+device set, and hardware state. Dataset size never changes the profile. GGUF
+profiles range from 256 to 2048 context tokens and use smaller native
+microbatches at larger contexts. Data-parallel GPUs each need a complete model
+and worker; their VRAM is not pooled. Long supervised records can take much
+longer to train because every assistant token remains in a window. Weighted
+alignment requires each full sequence to fit the selected context and fails
+explicitly otherwise. The selected values are printed before training and
+stored in the run manifest.
 Training epochs and learning rate remain user
 controlled because they affect training duration and quality rather than peak
 memory. One epoch means one full pass over the training split on both MLX and
@@ -479,7 +486,7 @@ directly to alignment.
 | `--rank N` | LoRA rank. Default: `2`. |
 | `--scale NUMBER` | LoRA scaling value. Default: `4`. |
 | `--num-layers N` | Number of final model layers to adapt. Default: `1`. |
-| `--max-seq-length N` | Maximum prompt + answer tokens per example. Longer supervised rows trim old prompt context while preserving answer labels. Auto selects a hardware-safe value. |
+| `--max-seq-length N` | GGUF context tokens per training window. Longer supervised rows are windowed without dropping assistant labels; each window sees only local context. Auto selects a hardware-aware value. |
 | `--image-size WIDTH HEIGHT` | Resize local images before VLM preprocessing. Omit it to use the model processor's native size. |
 | `--video-fps NUMBER` | Frames sampled per second from local videos. Default: `2`. |
 | `--video-max-frames N` | Maximum frames loaded from each local video. Default: `32`. |

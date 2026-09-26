@@ -6,6 +6,8 @@ from osai.auto_settings import select_auto_settings
 from osai.backends.llama_gradient import (
     LlamaGradientOptions,
     _gradient_command,
+    _lower_auto_context,
+    _memory_failure,
     _parse_best_checkpoint,
     _parse_epoch_losses,
     _parse_optimizer_steps,
@@ -81,6 +83,26 @@ def test_cpu_retry_requires_a_gpu_specific_failure(tmp_path: Path):
     assert _retryable_accelerator_failure(log)
     log.write_text("[osai] exit=3221225477")
     assert _retryable_accelerator_failure(log)
+
+
+def test_auto_context_retries_gpu_memory_errors_without_losing_labels(tmp_path: Path):
+    log = tmp_path / "train.log"
+    log.write_text("CUDA error: out of device memory")
+    assert _memory_failure(log)
+    with log.open("a") as handle:
+        handle.write("\nunsupported ggml op for backward pass")
+    assert not _memory_failure(log, len("CUDA error: out of device memory"))
+    settings = LlamaGradientOptions(context=1024, batch_size=2, auto_settings=True)
+    environment = {"OSAI_MAX_SEQ_LENGTH": "1024"}
+    manifest = {"options": {"context": 1024, "batch_size": 2}}
+
+    lowered = _lower_auto_context(settings, environment, manifest)
+
+    assert lowered.context == 512
+    assert lowered.batch_size == 2
+    assert environment["OSAI_MAX_SEQ_LENGTH"] == "512"
+    assert manifest["options"]["context"] == 512
+    assert manifest["auto_context_retries"][0]["reason"]
 
 
 def test_parallel_adapter_combination_preserves_weighted_lora_delta(tmp_path: Path):
@@ -187,7 +209,10 @@ def test_native_trainer_honors_the_selected_sequence_limit():
         / "finetune.cpp"
     ).read_text(encoding="utf-8")
     assert 'std::getenv("OSAI_MAX_SEQ_LENGTH")' in source
-    assert "trimmed prompt context while preserving assistant labels" in source
+    assert "without dropping assistant labels" in source
+    assert "start = stop - 1" in source
+    assert "weighted alignment requires each complete record" in source
+    assert "trimmed prompt context" not in source
     assert "osai_tokenize_training_record" in source
     assert "Plain-text corpora have no prompt/answer boundary" in source
 

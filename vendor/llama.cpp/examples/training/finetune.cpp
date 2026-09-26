@@ -109,14 +109,15 @@ static bool osai_tokenize_training_record(
         osai_append_tokens(
                 ctx, record.substr(span.offset, span.marker_size), false, tokens, train_mask);
         const size_t content_begin = span.offset + span.marker_size;
-        const auto labels_before = std::count(train_mask.begin(), train_mask.end(), true);
+        const size_t mask_before = train_mask.size();
         osai_append_tokens(
                 ctx, record.substr(content_begin, stop - content_begin),
                 span.assistant, tokens, train_mask);
         if (span.assistant) {
             found_assistant = true;
             assistant_has_labels = assistant_has_labels ||
-                    std::count(train_mask.begin(), train_mask.end(), true) > labels_before;
+                    std::any_of(train_mask.begin() + mask_before, train_mask.end(),
+                                [](bool train) { return train; });
         }
     }
     train_eos = spans.back().assistant;
@@ -145,6 +146,7 @@ static size_t osai_record_token_limit(llama_context * ctx) {
 static ggml_opt_dataset_t assistant_dataset_init(
         llama_context      * ctx,
         const std::string  & corpus,
+        bool                 weighted_alignment,
         int64_t            & trained_labels,
         int64_t            & n_examples,
         std::vector<int64_t> & label_counts,
@@ -155,7 +157,8 @@ static ggml_opt_dataset_t assistant_dataset_init(
     const size_t record_token_limit = osai_record_token_limit(ctx);
     std::vector<std::vector<llama_token>> examples;
     std::vector<std::vector<bool>> train_masks;
-    size_t truncated_records = 0;
+    size_t windowed_records = 0;
+    size_t prompt_only_windows = 0;
     for (size_t begin = 0; begin <= corpus.size();) {
         const size_t end = corpus.find(separator, begin);
         std::string record = corpus.substr(begin, end == std::string::npos ? end : end - begin);
@@ -176,30 +179,43 @@ static ggml_opt_dataset_t assistant_dataset_init(
                 train_token.push_back(train_eos);
             }
             if (tokens.size() > record_token_limit) {
-                const auto first_label = std::find(train_token.begin(), train_token.end(), true);
-                if (first_label == train_token.end()) {
-                    LOG_ERR("structured training record has no assistant labels\n");
+                if (weighted_alignment) {
+                    LOG_ERR("weighted alignment requires each complete record to fit the %zu-token "
+                            "context; increase context or shorten the record explicitly\n",
+                            record_token_limit);
                     return nullptr;
                 }
-                const size_t label_offset = static_cast<size_t>(first_label - train_token.begin());
-                const size_t completion = tokens.size() - label_offset;
-                const size_t completion_budget = std::min(
-                        completion, std::max<size_t>(1, record_token_limit / 2));
-                const size_t prompt_budget = record_token_limit - completion_budget;
-                const size_t start = label_offset > prompt_budget ? label_offset - prompt_budget : 0;
-                const size_t stop = std::min(tokens.size(), start + record_token_limit);
-                tokens = std::vector<llama_token>(tokens.begin() + start, tokens.begin() + stop);
-                train_token = std::vector<bool>(
-                        train_token.begin() + start, train_token.begin() + stop);
-                ++truncated_records;
-                if (truncated_records <= 3) {
-                    LOG_WRN("structured training record exceeded the %zu-token training limit; "
-                            "trimmed prompt context while preserving assistant labels\n",
-                            record_token_limit);
+                ++windowed_records;
+                if (windowed_records <= 3) {
+                    LOG_INF("structured training record has %zu tokens; using overlapping "
+                            "%zu-token windows without dropping assistant labels\n",
+                            tokens.size(), record_token_limit);
                 }
+                // Reuse the previous window's last token as the next window's
+                // first token. Its label was trained in the previous window;
+                // every new assistant token can then be trained exactly once.
+                for (size_t start = 0; start < tokens.size();) {
+                    const size_t stop = std::min(start + record_token_limit, tokens.size());
+                    const auto label_begin = train_token.begin() + start + 1;
+                    if (std::any_of(label_begin, train_token.begin() + stop,
+                                    [](bool train) { return train; })) {
+                        examples.emplace_back(tokens.begin() + start, tokens.begin() + stop);
+                        train_masks.emplace_back(train_token.begin() + start,
+                                                 train_token.begin() + stop);
+                    } else {
+                        // Prompt-only windows have no supervised loss. Keeping
+                        // them would allocate optimizer rows without training.
+                        ++prompt_only_windows;
+                    }
+                    if (stop == tokens.size()) {
+                        break;
+                    }
+                    start = stop - 1;
+                }
+            } else {
+                examples.push_back(std::move(tokens));
+                train_masks.push_back(std::move(train_token));
             }
-            examples.push_back(std::move(tokens));
-            train_masks.push_back(std::move(train_token));
         }
         if (end == std::string::npos) {
             break;
@@ -209,9 +225,10 @@ static ggml_opt_dataset_t assistant_dataset_init(
     if (examples.empty()) {
         return nullptr;
     }
-    if (truncated_records > 0) {
-        LOG_WRN("trimmed %zu structured training record(s) to %zu tokens\n",
-                truncated_records, record_token_limit);
+    if (windowed_records > 0) {
+        LOG_INF("windowed %zu structured training record(s) at %zu tokens; "
+                "%zu prompt-only windows need no backward pass\n",
+                windowed_records, record_token_limit, prompt_only_windows);
     }
 
     const int64_t n_ctx = llama_n_ctx(ctx);
@@ -345,7 +362,7 @@ int main(int argc, char ** argv) {
         int64_t trained_labels = 0;
         int64_t n_examples = 0;
         dataset = assistant_dataset_init(
-                ctx, params.prompt, trained_labels, n_examples,
+                ctx, params.prompt, weighted_alignment, trained_labels, n_examples,
                 label_counts, backward_batches);
         if (dataset == nullptr || trained_labels == 0) {
             LOG_ERR("%s: could not construct an assistant-only dataset\n", __func__);

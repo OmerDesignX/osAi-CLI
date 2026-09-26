@@ -54,6 +54,26 @@ def test_low_memory_backprop_uses_the_proven_safe_shape():
     assert settings.gguf_threads == 2
 
 
+@pytest.mark.parametrize(
+    ("profile", "context", "microbatch"),
+    [
+        ("compact", 256, 8),
+        ("balanced", 512, 4),
+        ("performance", 1024, 2),
+        ("maximum", 2048, 1),
+    ],
+)
+def test_gguf_profiles_trade_microbatch_for_context(profile, context, microbatch):
+    settings = select_auto_settings(
+        model(),
+        engine=Engine.LLAMA_CPP,
+        memory_bytes=64 * GIB,
+        profile_limit=profile,
+    )
+    assert settings.max_seq_length == context
+    assert settings.gguf_batch_size == microbatch
+
+
 def test_auto_profile_obeys_model_and_cpu_limits():
     settings = select_auto_settings(
         model(blocks=2, context=128),

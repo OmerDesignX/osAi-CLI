@@ -100,13 +100,13 @@ def select_auto_settings(
 
     if selected_engine is Engine.LLAMA_CPP:
         backprop_profiles = {
-            # llama.cpp rounds the hybrid osCode context allocation up to 256
-            # tokens, so smaller advertised values only discard usable data
-            # without reducing the native graph's memory footprint.
+            # The hybrid graph uses at least 256 tokens. Larger profiles spend
+            # available device memory on context, with smaller microbatches to
+            # keep backward activations bounded.
             "compact": (256, 1, 1, 8, _COMPACT_TARGETS),
-            "balanced": (256, 1, 2, 8, _COMPACT_TARGETS),
-            "performance": (256, 2, 4, 16, _BALANCED_TARGETS),
-            "maximum": (256, 4, 8, 16, _BALANCED_TARGETS),
+            "balanced": (512, 1, 2, 4, _COMPACT_TARGETS),
+            "performance": (1024, 2, 4, 2, _BALANCED_TARGETS),
+            "maximum": (2048, 4, 8, 1, _BALANCED_TARGETS),
         }
         context, layers, rank, gguf_batch, targets = backprop_profiles[profile]
 

@@ -45,6 +45,7 @@ _PROGRESS_RE = re.compile(r"data=\d+/(\d+)")
 _SUPERVISED_STEP_RE = re.compile(r"supervised optimizer step labels=\d+")
 _CHECKPOINT_RE = re.compile(r"checkpoint epoch=(\d+)\s+best_train_loss=([0-9.eE+-]+)")
 _SUPERVISED_EVAL_RE = re.compile(r"eval_loss=([0-9.eE+-]+)")
+_SUPERVISED_LABELS_RE = re.compile(r"assistant-only loss enabled for (\d+) labels")
 _SUPPORTED_TARGETS = frozenset(DEFAULT_TARGETS)
 
 
@@ -70,6 +71,7 @@ class LlamaGradientOptions:
     split_mode: str = "layer"
     tensor_split: tuple[float, ...] = ()
     main_gpu: int = 0
+    auto_settings: bool = False
 
     def validate(self) -> None:
         integers = {
@@ -299,71 +301,59 @@ def train_gradient_gguf(
             training_env["OSAI_MASK_PROMPT"] = "1" if settings.mask_prompt else "0"
             training_env["OSAI_MAX_SEQ_LENGTH"] = str(settings.context)
             if parallel_devices:
-                try:
-                    epoch_losses, optimizer_steps = _run_parallel_gradient(
-                        binary,
-                        base.path,
-                        base.architecture,
-                        dataset.path / "train.jsonl",
-                        initial_adapter,
-                        trained_adapter,
-                        internal,
-                        layout.logs,
-                        settings,
-                        training_accelerator,
-                        training_env,
-                        dataset.train_examples,
-                        initial_digest,
-                        np,
-                    )
-                except TrainingError:
-                    failed_gpu = any(
-                        _retryable_accelerator_failure(layout.logs / f"train-gpu-{index}.log")
-                        for index in range(len(parallel_devices))
-                    )
-                    if settings.multi_gpu == "on" or not failed_gpu:
-                        raise
-                    fallback_from = training_accelerator.value
-                    fallback_reason = "parallel accelerator rejected the backward graph"
-                    training_accelerator = Accelerator.CPU
-                    parallel_devices = ()
-                    print(f"osai: {fallback_from} parallel training failed; retrying with CPU")
-                else:
-                    best_index = min(range(len(epoch_losses)), key=epoch_losses.__getitem__)
-                    best_epoch, best_supervised_loss = best_index + 1, epoch_losses[best_index]
-                    manifest["parallel_training"] = {
-                        "method": "record-weighted mean of independent LoRA deltas",
-                        "devices": list(parallel_devices),
-                        "published_rank": settings.rank * len(parallel_devices),
-                    }
-                    atomic_json(manifest_path, manifest)
+                while True:
+                    try:
+                        epoch_losses, optimizer_steps = _run_parallel_gradient(
+                            binary,
+                            base.path,
+                            base.architecture,
+                            dataset.path / "train.jsonl",
+                            initial_adapter,
+                            trained_adapter,
+                            internal,
+                            layout.logs,
+                            settings,
+                            training_accelerator,
+                            training_env,
+                            dataset.train_examples,
+                            initial_digest,
+                            np,
+                        )
+                    except TrainingError:
+                        worker_logs = [
+                            layout.logs / f"train-gpu-{index}.log"
+                            for index in range(len(parallel_devices))
+                        ]
+                        if (
+                            settings.auto_settings
+                            and any(_memory_failure(log) for log in worker_logs)
+                            and settings.context > 256
+                        ):
+                            settings = _lower_auto_context(settings, training_env, manifest)
+                            atomic_json(manifest_path, manifest)
+                            continue
+                        failed_gpu = any(_retryable_accelerator_failure(log) for log in worker_logs)
+                        if settings.multi_gpu == "on" or not failed_gpu:
+                            raise
+                        fallback_from = training_accelerator.value
+                        fallback_reason = "parallel accelerator rejected the backward graph"
+                        training_accelerator = Accelerator.CPU
+                        parallel_devices = ()
+                        print(f"osai: {fallback_from} parallel training failed; retrying with CPU")
+                        break
+                    else:
+                        best_index = min(range(len(epoch_losses)), key=epoch_losses.__getitem__)
+                        best_epoch, best_supervised_loss = best_index + 1, epoch_losses[best_index]
+                        manifest["parallel_training"] = {
+                            "method": "label-weighted mean of independent LoRA deltas",
+                            "devices": list(parallel_devices),
+                            "published_rank": settings.rank * len(parallel_devices),
+                        }
+                        atomic_json(manifest_path, manifest)
+                        break
             if not parallel_devices:
-                command = _gradient_command(
-                    binary,
-                    base.path,
-                    initial_adapter,
-                    train_corpus,
-                    trained_adapter,
-                    settings,
-                    training_accelerator,
-                )
-                try:
-                    run_logged(command, log_path=log_path, env=training_env)
-                except TrainingError as exc:
-                    if training_accelerator is Accelerator.CPU:
-                        raise
-                    if settings.multi_gpu == "on":
-                        raise TrainingError(
-                            "required multi-GPU training failed; see the native training log "
-                            f"at {log_path}"
-                        ) from exc
-                    if not _retryable_accelerator_failure(log_path):
-                        raise
-                    fallback_from = training_accelerator.value
-                    fallback_reason = "accelerator rejected the backward graph"
-                    training_accelerator = Accelerator.CPU
-                    successful_offset = log_path.stat().st_size if log_path.exists() else 0
-                    print(f"osai: {fallback_from} backprop failed; retrying with CPU")
+                while True:
+                    attempt_offset = log_path.stat().st_size if log_path.exists() else 0
                     command = _gradient_command(
                         binary,
                         base.path,
@@ -373,7 +363,37 @@ def train_gradient_gguf(
                         settings,
                         training_accelerator,
                     )
-                    run_logged(command, log_path=log_path, env=training_env)
+                    try:
+                        run_logged(command, log_path=log_path, env=training_env)
+                        successful_offset = attempt_offset
+                        break
+                    except TrainingError as exc:
+                        if (
+                            settings.auto_settings
+                            and training_accelerator is not Accelerator.CPU
+                            and settings.context > 256
+                            and _memory_failure(log_path, attempt_offset)
+                        ):
+                            settings = _lower_auto_context(settings, training_env, manifest)
+                            atomic_json(manifest_path, manifest)
+                            trained_adapter.unlink(missing_ok=True)
+                            successful_offset = log_path.stat().st_size
+                            continue
+                        if training_accelerator is Accelerator.CPU:
+                            raise
+                        if settings.multi_gpu == "on":
+                            raise TrainingError(
+                                "required multi-GPU training failed; see the native training log "
+                                f"at {log_path}"
+                            ) from exc
+                        if not _retryable_accelerator_failure(log_path, attempt_offset):
+                            raise
+                        fallback_from = training_accelerator.value
+                        fallback_reason = "accelerator rejected the backward graph"
+                        training_accelerator = Accelerator.CPU
+                        successful_offset = log_path.stat().st_size
+                        print(f"osai: {fallback_from} backprop failed; retrying with CPU")
+                        trained_adapter.unlink(missing_ok=True)
 
             if not trained_adapter.is_file():
                 raise TrainingError(f"llama.cpp did not save a trained adapter; see {log_path}")
@@ -667,7 +687,10 @@ def _run_parallel_gradient(
 
     all_losses = []
     optimizer_steps = 0
-    for device, output, log in zip(devices, worker_outputs, worker_logs, strict=True):
+    training_weights: list[int] = []
+    for device, output, log, records in zip(
+        devices, worker_outputs, worker_logs, record_counts, strict=True
+    ):
         if not output.is_file():
             raise TrainingError(f"parallel training on {device} saved no adapter; see {log}")
         _verify_adapter(output, architecture)
@@ -679,21 +702,28 @@ def _run_parallel_gradient(
             raise TrainingError(f"parallel worker reported the wrong epoch count; see {log}")
         all_losses.append(losses)
         optimizer_steps += _parse_optimizer_steps(log_text, settings.epochs, settings.mask_prompt)
+        if settings.mask_prompt:
+            labels = _SUPERVISED_LABELS_RE.findall(log_text)
+            if not labels or int(labels[-1]) < 1:
+                raise TrainingError(f"parallel worker reported no supervised labels; see {log}")
+            training_weights.append(int(labels[-1]))
+        else:
+            training_weights.append(records)
 
     _combine_lora_adapters(
         tuple(worker_outputs),
-        tuple(record_counts),
+        tuple(training_weights),
         output_adapter,
         architecture,
         settings.scale * settings.rank,
         settings.rank,
         np,
     )
-    total = sum(record_counts)
+    total = sum(training_weights)
     epoch_losses = tuple(
         sum(
-            losses[epoch] * records
-            for losses, records in zip(all_losses, record_counts, strict=True)
+            losses[epoch] * weight
+            for losses, weight in zip(all_losses, training_weights, strict=True)
         )
         / total
         for epoch in range(settings.epochs)
@@ -887,11 +917,57 @@ def _verify_hybrid_adapter_tensors(base, parameters: dict) -> None:
         )
 
 
-def _retryable_accelerator_failure(log_path: Path) -> bool:
+def _lower_auto_context(
+    settings: LlamaGradientOptions,
+    environment: dict[str, str],
+    manifest: dict[str, Any],
+) -> LlamaGradientOptions:
+    context = max(256, settings.context // 2)
+    batch_size = min(settings.batch_size, context)
+    while context % batch_size:
+        batch_size -= 1
+    lowered = replace(settings, context=context, batch_size=batch_size)
+    environment["OSAI_MAX_SEQ_LENGTH"] = str(context)
+    manifest["options"]["context"] = context
+    manifest["options"]["batch_size"] = batch_size
+    manifest.setdefault("auto_context_retries", []).append(
+        {
+            "from": settings.context,
+            "to": context,
+            "reason": "native device memory allocation failed",
+        }
+    )
+    print(
+        f"osai: GPU training ran out of memory at context {settings.context}; "
+        f"retrying at context {context} without dropping assistant labels"
+    )
+    return lowered
+
+
+def _memory_failure(log_path: Path, offset: int = 0) -> bool:
     if not log_path.is_file():
         return False
     with log_path.open("rb") as handle:
-        handle.seek(max(0, log_path.stat().st_size - 16_384))
+        handle.seek(max(offset, log_path.stat().st_size - 16_384))
+        tail = handle.read().decode("utf-8", errors="replace").lower()
+    return any(
+        marker in tail
+        for marker in (
+            "out of device memory",
+            "cuda out of memory",
+            "failed to allocate gpu",
+            "failed to allocate buffer",
+            "failed to allocate cuda",
+            "out of memory",
+        )
+    )
+
+
+def _retryable_accelerator_failure(log_path: Path, offset: int = 0) -> bool:
+    if not log_path.is_file():
+        return False
+    with log_path.open("rb") as handle:
+        handle.seek(max(offset, log_path.stat().st_size - 16_384))
         tail = handle.read().decode("utf-8", errors="replace").lower()
     return (
         any(

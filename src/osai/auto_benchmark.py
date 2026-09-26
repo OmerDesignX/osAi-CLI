@@ -111,7 +111,7 @@ def benchmark_auto_settings(
         adapter / "adapters.safetensors" if adapter is not None and adapter.is_dir() else adapter
     )
     key_data = {
-        "schema": 1,
+        "schema": 2,
         "model": str(model.path.resolve()),
         "shards": [
             (str(shard), shard.stat().st_size, shard.stat().st_mtime_ns) for shard in model.shards
@@ -183,10 +183,10 @@ def _gpu_profile_fits(profile: str, model_bytes: int, free_bytes: int | None) ->
     if free_bytes is None:
         return True
     training_reserve = {
-        "compact": 1 * 1024**3,
-        "balanced": 2 * 1024**3,
-        "performance": 4 * 1024**3,
-        "maximum": 6 * 1024**3,
+        "compact": 2 * 1024**3,
+        "balanced": 3 * 1024**3,
+        "performance": 6 * 1024**3,
+        "maximum": 10 * 1024**3,
     }[profile]
     system_reserve = max(512 * 1024**2, free_bytes // 10)
     return model_bytes + training_reserve + system_reserve <= free_bytes
