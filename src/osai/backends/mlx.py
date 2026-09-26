@@ -42,8 +42,8 @@ _MEMORY_ERRORS = (
 
 def _mlx_memory_failure(log_path: Path, offset: int) -> bool:
     with log_path.open("rb") as handle:
-        handle.seek(offset)
-        tail = handle.read()[-16_384:].decode("utf-8", errors="replace").lower()
+        handle.seek(max(offset, log_path.stat().st_size - 16_384))
+        tail = handle.read(16_384).decode("utf-8", errors="replace").lower()
     return any(marker in tail for marker in _MEMORY_ERRORS)
 
 
