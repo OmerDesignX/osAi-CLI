@@ -4,22 +4,36 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
+import urllib.request
 import venv
+import zipfile
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REQUIREMENTS_ROOT = PROJECT_ROOT / "requirements"
 SUPPORTED_PYTHON = (3, 10), (3, 14)
+WINDOWS_LLVM_URL = (
+    "https://github.com/mstorsjo/llvm-mingw/releases/download/20260616/"
+    "llvm-mingw-20260616-ucrt-x86_64.zip"
+)
+WINDOWS_LLVM_SHA256 = "b9b68a4d276e16fa25802aaba458e4638f64b3884c290aaccdc2d87083b6ca35"
+WINDOWS_VULKAN_VERSION = "1.4.357.0"
+WINDOWS_VULKAN_URL = (
+    "https://sdk.lunarg.com/sdk/download/1.4.357.0/windows/vulkansdk-windows-X64-1.4.357.0.exe"
+)
+WINDOWS_VULKAN_SHA256 = "81f474711e9042f4cd22b31b2f7a8870db2e428b21586fb43dd80150be97310d"
 
 
 class SetupError(RuntimeError):
@@ -77,9 +91,7 @@ def build_plan(
         apple_silicon and macos_major is not None and macos_major >= 14
     ):
         raise SetupError("MLX Metal requires Apple silicon and macOS 14 or newer")
-    if selected_mlx == "cuda" and not (
-        system == "Linux" and cuda_major in {12, 13}
-    ):
+    if selected_mlx == "cuda" and not (system == "Linux" and cuda_major in {12, 13}):
         raise SetupError("MLX CUDA requires Linux and a CUDA 12 or CUDA 13 toolkit")
     if selected_mlx == "cpu" and system != "Linux":
         raise SetupError("the bundled MLX CPU build is supported on Linux")
@@ -127,9 +139,7 @@ def build_plan(
     )
 
 
-def detect_plan(
-    *, mlx_accelerator: str = "auto", llama_accelerator: str = "auto"
-) -> SetupPlan:
+def detect_plan(*, mlx_accelerator: str = "auto", llama_accelerator: str = "auto") -> SetupPlan:
     system = platform.system()
     if system == "Windows":
         windows_version = getattr(sys, "getwindowsversion", None)
@@ -206,6 +216,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         _require_supported_python()
+        _discover_local_sdks(install_missing=not args.dry_run)
         if args.jobs is not None and args.jobs < 1:
             raise SetupError("--jobs must be at least 1")
         wheelhouse = _wheelhouse(args.offline, args.wheelhouse)
@@ -235,9 +246,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             for command, _ in commands:
                 print(f"+ {_display_command(command)}")
             return 0
-        if not args.skip_llama_build and shutil.which("cmake") is None:
-            raise SetupError("CMake is required to build bundled llama.cpp")
-        environment = _child_environment()
+        environment = _child_environment(target_python)
+        if not args.skip_llama_build and plan.system == "Windows":
+            environment.update(_windows_compiler_environment(plan, target_python))
         for command, extra_environment in commands:
             merged_environment = environment | extra_environment
             _run(command, environment=merged_environment)
@@ -273,7 +284,7 @@ def _setup_commands(
             *arguments,
         ]
 
-    commands.append((pip_install("--upgrade", "pip", "setuptools", "wheel"), {}))
+    commands.append((pip_install("--upgrade", "pip", "setuptools", "wheel", "cmake", "ninja"), {}))
     commands.append((pip_install("-r", str(requirements)), {}))
     if dev:
         commands.append(
@@ -286,9 +297,7 @@ def _setup_commands(
         mlx_environment = {"PYPI_RELEASE": "1"}
         if plan.system == "Linux":
             use_cuda = "ON" if plan.mlx_accelerator == "cuda" else "OFF"
-            mlx_environment["CMAKE_ARGS"] = (
-                f"-DMLX_BUILD_CUDA={use_cuda} -DMLX_BUILD_CPU=ON"
-            )
+            mlx_environment["CMAKE_ARGS"] = f"-DMLX_BUILD_CUDA={use_cuda} -DMLX_BUILD_CPU=ON"
         commands.append(
             (
                 pip_install(
@@ -336,6 +345,8 @@ def _setup_commands(
             "--accelerator",
             plan.llama_accelerator,
         ]
+        if plan.llama_accelerator == "cuda" and _vulkan_available():
+            build_command.append("--also-vulkan")
         if jobs is not None:
             build_command.extend(["--jobs", str(jobs)])
         commands.append((build_command, {}))
@@ -411,10 +422,7 @@ def _require_supported_python() -> None:
 
 
 def _require_target_python(executable: Path) -> None:
-    check = (
-        "import sys; raise SystemExit(0 if (3, 10) <= sys.version_info[:2] "
-        "< (3, 14) else 1)"
-    )
+    check = "import sys; raise SystemExit(0 if (3, 10) <= sys.version_info[:2] < (3, 14) else 1)"
     completed = subprocess.run([str(executable), "-c", check], check=False)
     if completed.returncode != 0:
         raise SetupError(f"target environment uses an unsupported Python: {executable}")
@@ -428,8 +436,58 @@ def _macos_major() -> int | None:
         return None
 
 
+def _discover_local_sdks(*, install_missing: bool = False) -> None:
+    """Find conventional SDK installs without asking for environment configuration."""
+
+    if platform.system() == "Linux" and not os.environ.get("CUDA_PATH"):
+        for candidate in (Path("/usr/local/cuda"), Path("/opt/cuda")):
+            if (candidate / "bin" / "nvcc").is_file():
+                os.environ["CUDA_PATH"] = str(candidate)
+                break
+    if platform.system() != "Windows":
+        return
+    program_files = Path(os.environ.get("PROGRAMFILES", r"C:\Program Files"))
+    if not os.environ.get("CUDA_PATH"):
+        cuda_root = program_files / "NVIDIA GPU Computing Toolkit" / "CUDA"
+        candidates = sorted(cuda_root.glob("v*"), reverse=True)
+        for candidate in candidates:
+            if (candidate / "bin" / "nvcc.exe").is_file():
+                os.environ["CUDA_PATH"] = str(candidate)
+                break
+    if not os.environ.get("VULKAN_SDK"):
+        for root in (Path(r"C:\VulkanSDK"), program_files / "VulkanSDK"):
+            for candidate in sorted(root.glob("*"), reverse=True):
+                if (candidate / "Bin" / "glslc.exe").is_file():
+                    os.environ["VULKAN_SDK"] = str(candidate)
+                    break
+            if os.environ.get("VULKAN_SDK"):
+                break
+    if (
+        not os.environ.get("VULKAN_SDK")
+        and install_missing
+        and (
+            Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "System32" / "vulkan-1.dll"
+        ).is_file()
+    ):
+        try:
+            os.environ["VULKAN_SDK"] = str(_install_windows_vulkan_sdk())
+        except (
+            OSError,
+            SetupError,
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+        ) as exc:
+            print(f"osai setup: Vulkan SDK download unavailable ({exc}); continuing", flush=True)
+
+
 def _cuda_major() -> int | None:
     nvcc = shutil.which("nvcc")
+    if nvcc is None:
+        sdk = os.environ.get("CUDA_PATH")
+        if sdk:
+            candidate = Path(sdk) / "bin" / ("nvcc.exe" if os.name == "nt" else "nvcc")
+            if candidate.is_file():
+                nvcc = str(candidate)
     if nvcc is None:
         return None
     try:
@@ -444,16 +502,20 @@ def _cuda_major() -> int | None:
 
 def _vulkan_available() -> bool:
     sdk = os.environ.get("VULKAN_SDK")
-    if sdk and Path(sdk).is_dir():
+    if sdk and (Path(sdk) / ("Bin/glslc.exe" if os.name == "nt" else "bin/glslc")).is_file():
         return True
-    return any(
-        shutil.which(command)
-        for command in ("glslc", "glslangValidator", "vulkaninfo")
-    )
+    return shutil.which("glslc") is not None
 
 
-def _child_environment() -> dict[str, str]:
+def _child_environment(target_python: Path) -> dict[str, str]:
     environment = os.environ.copy()
+    current_path = next(
+        (value for key, value in environment.items() if key.casefold() == "path"), ""
+    )
+    for key in list(environment):
+        if key.casefold() == "path":
+            del environment[key]
+    environment["PATH"] = str(target_python.parent) + os.pathsep + current_path
     environment.update(
         {
             "DO_NOT_TRACK": "1",
@@ -466,6 +528,209 @@ def _child_environment() -> dict[str, str]:
         }
     )
     return environment
+
+
+def _windows_compiler_environment(plan: SetupPlan, target_python: Path) -> dict[str, str]:
+    """Select MSVC automatically, or install a verified portable C++ compiler."""
+
+    if plan.system != "Windows":
+        return {}
+    developer_command = os.environ.get("OSAI_VSDEVCMD")
+    if not developer_command:
+        program_files = os.environ.get("PROGRAMFILES(X86)")
+        if program_files:
+            vswhere = Path(program_files) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+            if vswhere.is_file():
+                result = subprocess.run(
+                    [
+                        str(vswhere),
+                        "-latest",
+                        "-products",
+                        "*",
+                        "-requires",
+                        "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                        "-property",
+                        "installationPath",
+                    ],
+                    text=True,
+                    capture_output=True,
+                    timeout=15,
+                    check=False,
+                )
+                installation = result.stdout.strip()
+                if result.returncode == 0 and installation:
+                    developer_command = str(
+                        Path(installation) / "Common7" / "Tools" / "VsDevCmd.bat"
+                    )
+    if developer_command and Path(developer_command).is_file():
+        if any(character in developer_command for character in ('"', "\r", "\n")):
+            raise SetupError("the Microsoft compiler setup path is invalid")
+        command = f'call "{developer_command}" -arch=amd64 >nul && set'
+        result = subprocess.run(
+            command,
+            shell=True,
+            executable=os.environ.get("COMSPEC", "cmd.exe"),
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        if result.returncode == 0:
+            compiler_environment = {}
+            for line in result.stdout.splitlines():
+                key, separator, value = line.partition("=")
+                if separator and key and not key.startswith("="):
+                    compiler_environment[key] = value
+            compiler_path = next(
+                (value for key, value in compiler_environment.items() if key.casefold() == "path"),
+                "",
+            )
+            for key in list(compiler_environment):
+                if key.casefold() == "path":
+                    del compiler_environment[key]
+            compiler_environment["CC"] = "cl"
+            compiler_environment["CXX"] = "cl"
+            compiler_environment["CMAKE_GENERATOR"] = "Ninja"
+            compiler_environment["PATH"] = str(target_python.parent) + os.pathsep + compiler_path
+            print("Using detected Microsoft C++ Build Tools", flush=True)
+            return compiler_environment
+    print("Downloading the verified portable C++ toolchain", flush=True)
+    tools = PROJECT_ROOT / "build" / "osai-tools"
+    compiler = tools / "llvm-mingw-20260616-ucrt-x86_64" / "bin" / "clang++.exe"
+    if not compiler.is_file():
+        archive = tools / "llvm-mingw.zip"
+        tools.mkdir(parents=True, exist_ok=True)
+        if not archive.is_file() or _file_sha256(archive) != WINDOWS_LLVM_SHA256:
+            archive.unlink(missing_ok=True)
+            _download_windows_toolchain(archive)
+        with zipfile.ZipFile(archive) as bundle:
+            total_size = 0
+            for member in bundle.infolist():
+                parts = PurePosixPath(member.filename).parts
+                total_size += member.file_size
+                if (
+                    member.filename.startswith("/")
+                    or "\\" in member.filename
+                    or ".." in parts
+                    or any(":" in part for part in parts)
+                    or stat.S_IFMT(member.external_attr >> 16) == stat.S_IFLNK
+                    or total_size > 4_000_000_000
+                ):
+                    raise SetupError("the portable C++ toolchain archive has an unsafe entry")
+            bundle.extractall(tools)
+        if not compiler.is_file():
+            raise SetupError("the portable C++ toolchain archive is incomplete")
+    binary_dir = compiler.parent
+    return {
+        "CC": str(binary_dir / "clang.exe"),
+        "CXX": str(compiler),
+        "CMAKE_GENERATOR": "Ninja",
+        "PATH": str(target_python.parent)
+        + os.pathsep
+        + str(binary_dir)
+        + os.pathsep
+        + os.environ.get("PATH", ""),
+    }
+
+
+def _download_windows_toolchain(archive: Path) -> None:
+    request = urllib.request.Request(WINDOWS_LLVM_URL, headers={"User-Agent": "osAi-CLI"})
+    for attempt in range(2):
+        temporary = archive.with_suffix(".part")
+        temporary.unlink(missing_ok=True)
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            with (
+                urllib.request.urlopen(request, timeout=120) as response,
+                temporary.open("wb") as output,
+            ):
+                if response.url.split("/", 3)[2] not in {
+                    "github.com",
+                    "objects.githubusercontent.com",
+                    "release-assets.githubusercontent.com",
+                }:
+                    raise SetupError("the C++ toolchain download redirected to an untrusted host")
+                while chunk := response.read(1024 * 1024):
+                    size += len(chunk)
+                    if size > 250_000_000:
+                        raise SetupError("the C++ toolchain download exceeded its size limit")
+                    output.write(chunk)
+                    digest.update(chunk)
+            if digest.hexdigest() == WINDOWS_LLVM_SHA256:
+                temporary.replace(archive)
+                return
+        finally:
+            temporary.unlink(missing_ok=True)
+        print(f"Toolchain checksum mismatch; retrying download ({attempt + 1}/2)", flush=True)
+    raise SetupError("the portable C++ toolchain failed SHA-256 verification")
+
+
+def _install_windows_vulkan_sdk() -> Path:
+    """Copy a verified Vulkan SDK into the private source build directory."""
+
+    tools = PROJECT_ROOT / "build" / "osai-tools"
+    sdk = tools / "vulkan-sdk" / WINDOWS_VULKAN_VERSION
+    if (sdk / "Bin" / "glslc.exe").is_file() and (
+        sdk / "Include" / "vulkan" / "vulkan.h"
+    ).is_file():
+        return sdk
+    if shutil.disk_usage(PROJECT_ROOT).free < 3 * 1024**3:
+        raise SetupError("at least 3 GiB free disk is needed for the Vulkan SDK")
+    tools.mkdir(parents=True, exist_ok=True)
+    installer = tools / f"vulkansdk-{WINDOWS_VULKAN_VERSION}.exe"
+    if not installer.is_file() or _file_sha256(installer) != WINDOWS_VULKAN_SHA256:
+        installer.unlink(missing_ok=True)
+        temporary = installer.with_suffix(".part")
+        temporary.unlink(missing_ok=True)
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            request = urllib.request.Request(WINDOWS_VULKAN_URL, headers={"User-Agent": "osAi-CLI"})
+            with (
+                urllib.request.urlopen(request, timeout=120) as response,
+                temporary.open("wb") as output,
+            ):
+                if response.url.split("/", 3)[2] not in {"sdk.lunarg.com", "vulkan.lunarg.com"}:
+                    raise SetupError("the Vulkan SDK download redirected to an untrusted host")
+                while chunk := response.read(1024 * 1024):
+                    size += len(chunk)
+                    if size > 350_000_000:
+                        raise SetupError("the Vulkan SDK download exceeded its size limit")
+                    output.write(chunk)
+                    digest.update(chunk)
+            if digest.hexdigest() != WINDOWS_VULKAN_SHA256:
+                raise SetupError("the Vulkan SDK failed SHA-256 verification")
+            temporary.replace(installer)
+        finally:
+            temporary.unlink(missing_ok=True)
+    sdk.parent.mkdir(parents=True, exist_ok=True)
+    print("Installing the verified Vulkan SDK into the local build cache", flush=True)
+    subprocess.run(
+        [
+            str(installer),
+            "--root",
+            str(sdk),
+            "--accept-licenses",
+            "--default-answer",
+            "--confirm-command",
+            "install",
+            "copy_only=1",
+        ],
+        check=True,
+        timeout=30 * 60,
+    )
+    if not (sdk / "Bin" / "glslc.exe").is_file():
+        raise SetupError("the downloaded Vulkan SDK did not contain glslc.exe")
+    return sdk
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _run(command: list[str], *, environment: dict[str, str]) -> None:
@@ -489,9 +754,7 @@ def _print_plan(
             "python": str(target_python),
             "install_target": str(install_target),
             "offline": bool(args.offline),
-            "build_bundled_mlx": bool(
-                plan.mlx_accelerator is not None and not args.skip_mlx_build
-            ),
+            "build_bundled_mlx": bool(plan.mlx_accelerator is not None and not args.skip_mlx_build),
             "build_bundled_llama_cpp": not args.skip_llama_build,
         }
     )

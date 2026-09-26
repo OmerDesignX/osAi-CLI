@@ -44,6 +44,26 @@ containing only raw text use full-token language-model loss.
 | Windows 10 or 11 | llama.cpp on CUDA, Vulkan, or CPU |
 | Debian 12 / Ubuntu 22.04 or newer | MLX and llama.cpp on CUDA or CPU; llama.cpp also supports Vulkan |
 
+The selected llama.cpp accelerator is checked against the binary that was
+actually compiled. The App downloads this CLI on first launch, and the setup
+script compiles llama.cpp on that computer. It installs CMake and Ninja into
+the private Python environment. On Windows it detects Microsoft C++ Build
+Tools, CUDA, and Vulkan SDK installations without manual path settings. When
+the Vulkan runtime is present but its SDK is missing, setup downloads a
+SHA-256-verified SDK into its private build cache. When Microsoft C++ Build
+Tools are absent it downloads a verified portable C++ toolchain for CPU and
+Vulkan builds. CUDA compilation requires Microsoft C++ Build Tools and a CUDA
+Toolkit. Linux can also use distribution Vulkan
+development packages and `glslc` without defining `VULKAN_SDK`. A failed GPU
+build falls back to another available backend, then CPU.
+
+osCode V1 and V2 GGUF small models use the Qwen3.5 hybrid architecture. Since
+llama.cpp cannot backpropagate through its recurrent delta-net operation, the
+automatic profile trains the final block's `mlp.down_proj` LoRA only. The
+remaining blocks still participate in the frozen forward pass. Longer
+structured records keep assistant labels and trim older prompt context to the
+selected token limit; the CLI reports the number of trimmed records.
+
 Training publishes both `base-plus-adapter` and a standalone lossless deployment
 bundle by default. In both MLX and GGUF bundles, fusion keeps the quantized base
 files byte-for-byte unchanged and embeds the exact adapter residual. The fusion
@@ -52,9 +72,10 @@ path performs no model dequantization or requantization.
 ## Install
 
 Supported Python versions are **3.10, 3.11, 3.12, and 3.13**. Python 3.9 and
-older and Python 3.14+ are rejected. Install CMake and a C/C++ compiler first.
-CUDA and Vulkan builds also require their platform SDK/toolkit; the script falls
-back to CPU if an automatically selected llama.cpp GPU build fails.
+older and Python 3.14+ are rejected. The setup script installs CMake and Ninja;
+macOS and Linux still need their native C/C++ compiler. CUDA and Vulkan builds
+require their SDK/toolkit. A failed GPU build falls back to another available
+backend and then CPU.
 
 ### Recommended: one-command setup
 
@@ -74,13 +95,13 @@ py -3.13 scripts\setup_osai.py
 
 The script:
 
-1. Detects the OS, architecture, macOS version, CUDA toolkit, and Vulkan tools.
+1. Detects the OS, architecture, macOS version, CUDA toolkit, and Vulkan tools, including conventional Windows SDK locations.
 2. Creates or reuses `.venv`.
 3. Selects the correct file from `requirements/` and installs it.
 4. Installs `dist/osai-0.1.2-py3-none-any.whl`, or builds from the local
    project if the wheel is absent.
 5. Builds the bundled MLX and MLX-LM sources when the platform supports MLX.
-6. Builds bundled llama.cpp for Metal, CUDA, Vulkan, or CPU.
+6. Builds vendored llama.cpp on this computer for Metal, CUDA, Vulkan, or CPU.
 7. Runs `osai doctor`.
 
 | Detected host | Requirements selected | Bundled engines built |
@@ -297,18 +318,27 @@ surrogate without a learned critic model.
 
 ## Multi-GPU: Metal/CUDA/Vulkan
 
-On llama.cpp, `--multi-gpu auto` uses all devices reported by the selected
-Metal, CUDA, or Vulkan backend and defaults to layer splitting. CUDA/Vulkan
-systems can set explicit devices and tensor proportions. Apple silicon normally
-exposes one unified Metal GPU, so there is nothing to split on a single Mac.
-MLX uses local NCCL data parallelism on multi-GPU Linux CUDA systems; its Metal
-runtime uses the one unified Apple GPU.
+For GGUF training, `--multi-gpu auto` discovers compatible Metal, CUDA, or
+Vulkan devices. The CLI runs one native trainer per GPU concurrently, assigns
+distinct round-robin training-record shards, then publishes the record-weighted
+mean of their LoRA deltas. The resulting adapter rank is the selected rank
+times the GPU count. These workers optimize independently and average only at
+the end of the run; gradients are not synchronized after each step. Native
+llama.cpp tensor or layer splitting is not used for GGUF backpropagation.
+`--multi-gpu on` requires at least two GPUs and at least one record per GPU.
+On Vulkan and Metal systems, automatic GGUF training prefers discrete cards
+over recognized integrated adapters. Intel Macs can use a Metal eGPU when
+llama.cpp lists it; Apple silicon Macs do not support eGPUs. MLX uses local
+NCCL data parallelism on multi-GPU Linux CUDA systems.
 
-Automatic settings reserve 25% of physical RAM for the operating system and
-runtime, reject a base model larger than 55% of RAM, and select the largest
-conservative `compact`, `balanced`, `performance`, or `maximum` profile that
-fits the remaining budget. The selected values are printed before training and
-stored in the run manifest. Training epochs and learning rate remain user
+Automatic settings run a bounded one-turn inference benchmark using the selected
+model and accelerator. Each GPU used for GGUF data parallelism is probed
+separately. The largest passing `compact`, `balanced`, `performance`, or
+`maximum` profile must also fit conservative host and reported free-GPU-memory
+reserves for training. Benchmark results are cached for 12 hours per model,
+device set, and hardware state. Dataset size never changes the profile. The
+selected values are printed before training and stored in the run manifest.
+Training epochs and learning rate remain user
 controlled because they affect training duration and quality rather than peak
 memory. One epoch means one full pass over the training split on both MLX and
 llama.cpp. A manual flag such as `--rank 8` overrides that one automatic value.
@@ -331,6 +361,12 @@ osai train \
   --engine auto \
   --data /path/to/data
 ```
+
+To continue a finished run, use its `outputs/merged-model/` folder as the
+custom model. It already has the required `gguf/` or `mlx/` layout. The CLI
+resumes its embedded LoRA adapter, then writes a new adapter and merged model
+into the next session. Automatic settings retain the adapter's rank and target
+shape so previous learning is preserved.
 
 ## Output
 
@@ -436,7 +472,7 @@ directly to alignment.
 | `--tensor-split LIST` | Comma-separated llama.cpp device proportions, such as `3,1`. |
 | `--main-gpu N` | llama.cpp main GPU index. Default: `0`. |
 | `--distributed-workers N` | MLX Linux CUDA/NCCL worker count. `0` chooses a safe count. |
-| `--auto-settings`, `--no-auto-settings` | Select a RAM-aware profile for batch size, context, LoRA rank/layers/targets, and threads. Disabled by default; explicit tuning flags override its choices. |
+| `--auto-settings`, `--no-auto-settings` | Benchmark the selected model on this hardware, then choose memory-bounded context, batch size, LoRA rank/layers/targets, and threads. Disabled by default; explicit tuning flags override its choices. |
 | `--epochs N` | Complete passes over the fine-tuning dataset on MLX or llama.cpp. Default: `1`. |
 | `--iterations N` | Compatibility alias for `--epochs`. |
 | `--batch-size N` | MLX training batch size. Default: `1`. |
@@ -488,6 +524,8 @@ directly to alignment.
 | `select` | `--bundled-root PATH` | Override the official-model download directory. |
 | `select` | `--download-model`, `--no-download-model` | Download and verify a missing tier, or require it to exist locally. |
 | `select` | `--custom-root PATH` | Override the custom-model directory. |
+| `auto-devices` | `--accelerator auto\|metal\|cuda\|vulkan\|cpu` | List currently available native GPU devices without loading a model. |
+| `auto-benchmark` | `--tier` or `--custom`, plus model and accelerator options | Run the local inference probe and print selected training settings as JSON. `--refresh` bypasses the cache. |
 | `export-gguf` | `--adapter PATH` | Source MLX adapter directory. Required. |
 | `export-gguf` | `--base PATH` | Matching GGUF base model. Required. |
 | `export-gguf` | `--output PATH` | Destination GGUF adapter file. Required. |

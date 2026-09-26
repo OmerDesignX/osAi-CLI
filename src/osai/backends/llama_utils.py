@@ -37,6 +37,33 @@ _MODULE_BY_GGUF_NAME = {value: key for key, value in _MODULE_NAMES.items()}
 _BLOCK_TENSOR_RE = re.compile(r"^blk\.(\d+)\.([^.]+)\.weight$")
 
 
+def gguf_adapter_training_shape(path: Path) -> tuple[int, int, tuple[str, ...], float]:
+    """Read the LoRA shape that a fused custom model must resume with."""
+
+    gguf = _import_gguf()
+    reader = gguf.GGUFReader(path)
+    ranks: set[int] = set()
+    blocks: dict[str, set[int]] = {}
+    names = {str(tensor.name) for tensor in reader.tensors}
+    for tensor in reader.tensors:
+        name = str(tensor.name)
+        if not name.endswith(".lora_a"):
+            continue
+        if name.removesuffix(".lora_a") + ".lora_b" not in names:
+            raise VerificationError(f"incomplete LoRA tensor pair in {path}: {name}")
+        match = _BLOCK_TENSOR_RE.fullmatch(name.removesuffix(".lora_a"))
+        if match is None or match.group(2) not in _MODULE_BY_GGUF_NAME:
+            raise VerificationError(f"unsupported LoRA tensor in {path}: {name}")
+        module = _MODULE_BY_GGUF_NAME[match.group(2)]
+        blocks.setdefault(module, set()).add(int(match.group(1)))
+        ranks.add(int(tensor.data.shape[0]))
+    if not blocks or len(ranks) != 1:
+        raise VerificationError(f"fused GGUF adapter has inconsistent LoRA rank: {path}")
+    rank = ranks.pop()
+    alpha = float(reader.get_field(gguf.Keys.Adapter.LORA_ALPHA).contents())
+    return rank, max(map(len, blocks.values())), tuple(sorted(blocks)), alpha / rank
+
+
 class AdapterSettings(DeviceSettings, Protocol):
     rank: int
     num_layers: int
@@ -168,6 +195,70 @@ def _write_adapter(path: Path, architecture: str, parameters, alpha: float, np) 
         raise
 
 
+def _combine_lora_adapters(
+    adapters: tuple[Path, ...],
+    record_counts: tuple[int, ...],
+    destination: Path,
+    architecture: str,
+    alpha: float,
+    rank: int,
+    np,
+) -> None:
+    """Publish the record-weighted mean of independently trained LoRA deltas.
+
+    Concatenating factors keeps the average exact: for N workers, the output
+    rank is N*r and alpha stays r*scale, making its scale 1/N per block.
+    """
+
+    if (
+        len(adapters) < 2
+        or len(adapters) != len(record_counts)
+        or any(count < 1 for count in record_counts)
+    ):
+        raise ConfigurationError("parallel LoRA aggregation needs nonempty worker shards")
+    gguf = _import_gguf()
+    total = sum(record_counts)
+    workers: list[dict[str, object]] = []
+    for adapter in adapters:
+        _verify_adapter(adapter, architecture)
+        reader = gguf.GGUFReader(adapter)
+        actual_alpha = float(reader.get_field(gguf.Keys.Adapter.LORA_ALPHA).contents())
+        if not math.isclose(actual_alpha, alpha, rel_tol=1e-5):
+            raise VerificationError(f"worker adapter has unexpected LoRA alpha: {adapter}")
+        workers.append(
+            {
+                str(tensor.name): np.asarray(tensor.data, dtype=np.float32).copy()
+                for tensor in reader.tensors
+            }
+        )
+    names = set(workers[0])
+    if not names or any(set(worker) != names for worker in workers[1:]):
+        raise VerificationError("parallel LoRA workers produced different tensor sets")
+    parameters = {}
+    for name in sorted(names):
+        values = [worker[name] for worker in workers]
+        if name.endswith(".lora_a"):
+            if any(value.ndim != 2 or value.shape[0] != rank for value in values):
+                raise VerificationError(f"invalid worker LoRA A shape: {name}")
+            parameters[name] = np.concatenate(values, axis=0)
+        elif name.endswith(".lora_b"):
+            if any(value.ndim != 2 or value.shape[1] != rank for value in values):
+                raise VerificationError(f"invalid worker LoRA B shape: {name}")
+            parameters[name] = np.concatenate(
+                [
+                    value * (len(workers) * count / total)
+                    for value, count in zip(values, record_counts, strict=True)
+                ],
+                axis=1,
+            )
+        else:
+            raise VerificationError(f"unexpected worker LoRA tensor: {name}")
+        if not np.isfinite(parameters[name]).all():
+            raise VerificationError(f"non-finite worker LoRA values: {name}")
+    _write_adapter(destination, architecture, parameters, alpha, np)
+    _verify_adapter(destination, architecture)
+
+
 def _evaluate_loss(
     binary: Path,
     model: Path,
@@ -243,25 +334,48 @@ def _write_corpus(
     *,
     repeat_to_minimum: bool = True,
     record_separator: str = "\n\n",
+    shard_index: int = 0,
+    shard_count: int = 1,
 ) -> Path:
-    sections: list[str] = []
-    with source.open("r", encoding="utf-8-sig") as handle:
-        for line_number, line in enumerate(handle, 1):
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ConfigurationError(
-                    f"invalid JSON at {source}:{line_number}: {exc.msg}"
-                ) from exc
-            normalized = normalize_sft_example(record, source, line_number)
-            sections.append(normalized_record_text(normalized.record))
-    corpus = record_separator.join(sections).strip() + "\n"
-    minimum_characters = context * 16
-    if repeat_to_minimum and len(corpus) < minimum_characters:
-        corpus = (corpus * (minimum_characters // max(1, len(corpus)) + 1))[
-            : minimum_characters * 2
-        ]
-    destination.write_text(corpus, encoding="utf-8")
+    # A multi-gigabyte JSONL corpus must not be collected and joined in RAM.
+    # The native trainer still tokenizes its input, but this preparation step
+    # now uses bounded Python memory regardless of the dataset size.
+    if shard_count < 1 or not 0 <= shard_index < shard_count:
+        raise ConfigurationError("invalid training corpus shard index or count")
+    written = 0
+    try:
+        with (
+            source.open("r", encoding="utf-8-sig") as handle,
+            destination.open("w", encoding="utf-8", newline="\n") as output,
+        ):
+            for line_number, line in enumerate(handle, 1):
+                if (line_number - 1) % shard_count != shard_index:
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ConfigurationError(
+                        f"invalid JSON at {source}:{line_number}: {exc.msg}"
+                    ) from exc
+                normalized = normalize_sft_example(record, source, line_number)
+                section = normalized_record_text(normalized.record)
+                if written:
+                    output.write(record_separator)
+                output.write(section)
+                written += len(section) + (len(record_separator) if written else 0)
+            output.write("\n")
+        if not written:
+            raise ConfigurationError(f"training shard {shard_index + 1} has no records")
+        minimum_characters = context * 16
+        if repeat_to_minimum and written + 1 < minimum_characters:
+            corpus = destination.read_text(encoding="utf-8").strip() + "\n"
+            corpus = (corpus * (minimum_characters // max(1, len(corpus)) + 1))[
+                : minimum_characters * 2
+            ]
+            destination.write_text(corpus, encoding="utf-8")
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        raise
     return destination
 
 

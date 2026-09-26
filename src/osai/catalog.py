@@ -9,8 +9,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from .config import ModelFormat
 from .errors import ConfigurationError, ModelFormatError
-from .formats import inspect_gguf, inspect_mlx
+from .formats import inspect_mlx, inspect_model
 from .hardware import Engine, HardwareReport, detect_hardware, select_engine
 from .model_download import (
     DEFAULT_MODEL_VERSION,
@@ -114,7 +115,13 @@ def custom_entry(name: str, root: Path | None = None) -> CatalogEntry:
         raise ModelFormatError(f"custom model folder does not exist: {folder}")
     mlx = _contained_path(folder / "mlx", folder, "custom MLX folder")
     gguf_dir = _contained_path(folder / "gguf", folder, "custom GGUF folder")
-    gguf = _choose_gguf(gguf_dir) if gguf_dir.is_dir() else None
+    gguf = (
+        gguf_dir
+        if (gguf_dir / "osai_fusion.json").is_file()
+        else _choose_gguf(gguf_dir)
+        if gguf_dir.is_dir()
+        else None
+    )
     return CatalogEntry(
         name=name,
         source="custom",
@@ -225,7 +232,7 @@ def _inspect_selection(engine: Engine, path: Path) -> None:
     if engine is Engine.MLX:
         inspect_mlx(path)
     else:
-        inspect_gguf(path)
+        inspect_model(path, ModelFormat.GGUF)
 
 
 def _mlx_materialized(path: Path) -> bool:
@@ -239,9 +246,9 @@ def _mlx_materialized(path: Path) -> bool:
 
 def _gguf_materialized(path: Path) -> bool:
     try:
-        from .formats import discover_gguf_shards
-
-        return all(_materialized_file(shard) for shard in discover_gguf_shards(path))
+        return all(
+            _materialized_file(shard) for shard in inspect_model(path, ModelFormat.GGUF).shards
+        )
     except (OSError, ModelFormatError):
         return False
 

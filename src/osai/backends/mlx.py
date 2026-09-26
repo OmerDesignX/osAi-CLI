@@ -15,6 +15,7 @@ from pathlib import Path
 from ..config import TrainingConfig
 from ..dataset import prepare_mlx_dataset, validate_dataset
 from ..errors import ConfigurationError, DependencyError, TrainingError
+from ..fusion import resolve_mlx_fusion_adapter
 from ..hardware import Accelerator, macos_version_at_least
 from ..io import atomic_json
 from ..offline import offline_environment
@@ -159,9 +160,7 @@ class MlxBackend:
         layout = SessionLayout.at(config.output)
         layout.create()
         internal = layout.work
-        data_path = prepare_mlx_dataset(
-            config.data, internal / "mlx-dataset"
-        )
+        data_path = prepare_mlx_dataset(config.data, internal / "mlx-dataset")
         dataset = validate_dataset(config.data)
         training_steps = resolve_mlx_training_steps(config, dataset.train_examples)
         optimizer_updates = training_steps // config.grad_accumulation_steps
@@ -207,18 +206,23 @@ class MlxBackend:
                 "keys": list(config.target_modules),
             },
         }
+        resume_adapter = resolve_mlx_fusion_adapter(config.training_model)
+        if resume_adapter is not None:
+            mlx_config["resume_adapter_file"] = str(
+                (resume_adapter / "adapters.safetensors").resolve()
+            )
         config_path = internal / "mlx_lora_config.yaml"
         # JSON is a strict subset of YAML and avoids another serialization surface.
         atomic_json(config_path, mlx_config)
         command = [
-                str(self.python),
-                "-m",
-                "osai._offline_runner",
-                "mlx_lm",
-                "lora",
-                "--config",
-                str(config_path),
-            ]
+            str(self.python),
+            "-m",
+            "osai._offline_runner",
+            "mlx_lm",
+            "lora",
+            "--config",
+            str(config_path),
+        ]
         workers = _resolve_distributed_workers(config, report)
         if workers > 1:
             command = [

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import re
+import subprocess
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Protocol
 
 from .errors import ConfigurationError
@@ -15,6 +18,90 @@ class DeviceSettings(Protocol):
     split_mode: str
     tensor_split: Sequence[float]
     main_gpu: int
+
+
+def available_llama_devices(
+    binary: Path | None, accelerator: Accelerator, *, include_integrated: bool = False
+) -> tuple[str, ...]:
+    """Resolve native IDs, preferring external cards and optionally including integrated GPUs."""
+
+    if binary is None or accelerator is Accelerator.CPU:
+        return ()
+    try:
+        result = subprocess.run(
+            [str(binary), "--list-devices"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ()
+    if result.returncode:
+        return ()
+    prefix = {
+        Accelerator.CUDA: "CUDA",
+        Accelerator.VULKAN: "Vulkan",
+        Accelerator.METAL: "MTL",
+    }.get(accelerator)
+    if prefix is None:
+        return ()
+    devices = re.findall(
+        rf"^\s*({prefix}\d+):\s*(.+)$",
+        result.stdout + "\n" + (getattr(result, "stderr", "") or ""),
+        re.M | re.I,
+    )
+    if accelerator in {Accelerator.VULKAN, Accelerator.METAL}:
+        integrated = re.compile(
+            r"Radeon\(TM\) Graphics|Intel.*(?:UHD|Iris|HD).*Graphics|Integrated Graphics",
+            re.I,
+        )
+        discrete = [(device, label) for device, label in devices if not integrated.search(label)]
+        if discrete:
+            external = re.compile(r"\b(?:eGPU|external|removable)\b", re.I)
+            discrete.sort(key=lambda item: not bool(external.search(item[1])))
+            preferred = discrete + (
+                [(device, label) for device, label in devices if integrated.search(label)]
+                if include_integrated
+                else []
+            )
+            return tuple(device for device, _label in preferred)
+    return tuple(device for device, _label in devices)
+
+
+def llama_device_free_bytes(binary: Path | None, accelerator: Accelerator) -> dict[str, int]:
+    """Read the native backend's current free-memory estimates when available."""
+
+    if binary is None or accelerator is Accelerator.CPU:
+        return {}
+    try:
+        result = subprocess.run(
+            [str(binary), "--list-devices"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {}
+    if result.returncode:
+        return {}
+    prefix = {
+        Accelerator.CUDA: "CUDA",
+        Accelerator.VULKAN: "Vulkan",
+        Accelerator.METAL: "MTL",
+    }.get(accelerator)
+    if prefix is None:
+        return {}
+    output = result.stdout + "\n" + (getattr(result, "stderr", "") or "")
+    return {
+        device: int(free) * 1024**2
+        for device, free in re.findall(
+            rf"^\s*({prefix}\d+):[^\n]*?\b(\d+)\s+MiB\s+free\b",
+            output,
+            re.M | re.I,
+        )
+    }
 
 
 def llama_device_arguments(
@@ -41,7 +128,5 @@ def llama_device_arguments(
     mode = "none" if settings.multi_gpu == "off" else settings.split_mode
     arguments.extend(["-sm", mode, "-mg", str(settings.main_gpu)])
     if settings.tensor_split and settings.multi_gpu != "off":
-        arguments.extend(
-            ["-ts", ",".join(format(value, ".8g") for value in settings.tensor_split)]
-        )
+        arguments.extend(["-ts", ",".join(format(value, ".8g") for value in settings.tensor_split)])
     return arguments

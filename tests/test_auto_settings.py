@@ -66,6 +66,15 @@ def test_auto_profile_obeys_model_and_cpu_limits():
     assert settings.gguf_threads == 3
 
 
+def test_qwen35_gguf_auto_uses_only_the_final_mlp_block():
+    settings = select_auto_settings(
+        model(), engine=Engine.LLAMA_CPP, memory_bytes=64 * GIB, cpu_count=12
+    )
+    assert settings.profile == "maximum"
+    assert settings.num_layers == 1
+    assert settings.target_modules == ("mlp.down_proj",)
+
+
 def test_auto_profile_rejects_a_model_without_safe_headroom():
     with pytest.raises(ConfigurationError, match="55% RAM safety limit"):
         select_auto_settings(

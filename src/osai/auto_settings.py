@@ -49,6 +49,7 @@ def select_auto_settings(
     engine: str | Engine,
     memory_bytes: int | None = None,
     cpu_count: int | None = None,
+    profile_limit: str | None = None,
 ) -> AutoTrainingSettings:
     """Choose the largest conservative preset for the model and host RAM.
 
@@ -83,6 +84,12 @@ def select_auto_settings(
     else:
         profile = "maximum"
 
+    order = ("compact", "balanced", "performance", "maximum")
+    if profile_limit is not None:
+        if profile_limit not in order:
+            raise ConfigurationError("unknown automatic training profile")
+        profile = order[min(order.index(profile), order.index(profile_limit))]
+
     profiles = {
         "compact": (1, 64, 1, 2, 8, 2, _COMPACT_TARGETS),
         "balanced": (1, 128, 2, 4, 8, 4, _BALANCED_TARGETS),
@@ -102,6 +109,14 @@ def select_auto_settings(
             "maximum": (256, 4, 8, 16, _BALANCED_TARGETS),
         }
         context, layers, rank, gguf_batch, targets = backprop_profiles[profile]
+
+        # Qwen3.5 mixes recurrent delta-net and full-attention blocks. ggml
+        # cannot backpropagate through the fused recurrent op. Adapting only
+        # the final block's MLP leaves every recurrent block upstream of the
+        # trainable weights, so its forward pass still runs on CPU or GPU.
+        if model.architecture.lower() in {"qwen35", "qwen35moe"}:
+            layers = 1
+            targets = _COMPACT_TARGETS
 
     if model.context_length is not None:
         context = min(context, model.context_length)

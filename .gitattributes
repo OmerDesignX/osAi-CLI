@@ -1,0 +1,6 @@
+# Keep text identical across Windows, macOS, and Linux checkouts.
+* text=auto eol=lf
+
+# Windows command launchers use native line endings.
+*.bat text eol=crlf
+*.cmd text eol=crlf

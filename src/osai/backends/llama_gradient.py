@@ -6,7 +6,10 @@ import hashlib
 import math
 import os
 import re
-from dataclasses import asdict, dataclass
+import shutil
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -14,15 +17,18 @@ from ..config import DEFAULT_TARGETS, ModelFormat
 from ..dataset import require_text_training, validate_dataset
 from ..errors import ConfigurationError, DependencyError, TrainingError, VerificationError
 from ..formats import inspect_model
+from ..fusion import resolve_gguf_fusion_bundle
 from ..hardware import Accelerator, select_llama_accelerator
 from ..io import OutputLock, atomic_json, fingerprint
-from ..multi_gpu import llama_device_arguments
+from ..multi_gpu import available_llama_devices, llama_device_arguments
 from ..offline import offline_environment
 from ..paths import llama_binary
 from ..process import run_logged
 from ..session import SessionLayout, record_dataset
 from ..system import doctor, physical_memory_bytes
+from .llama_cpp import ensure_runtime_accelerator
 from .llama_utils import (
+    _combine_lora_adapters,
     _evaluate_loss,
     _import_gguf,
     _import_numpy,
@@ -119,6 +125,8 @@ def train_gradient_gguf(
     settings.validate()
     _validate_memory_budget(settings, physical_memory_bytes())
     base = inspect_model(model, ModelFormat.GGUF)
+    _validate_hybrid_training_path(base, settings)
+    ensure_runtime_accelerator(accelerator)
     dataset = validate_dataset(data)
     require_text_training(dataset)
     destination = Path(output).expanduser().resolve()
@@ -129,6 +137,28 @@ def train_gradient_gguf(
     manifest_path = layout.run_manifest
 
     requested_accelerator = select_llama_accelerator(accelerator)
+    if requested_accelerator is not Accelerator.CPU and not settings.devices:
+        discovered = available_llama_devices(
+            llama_binary("llama-completion"),
+            requested_accelerator,
+            include_integrated=settings.multi_gpu == "on",
+        )
+        if discovered:
+            settings = replace(settings, devices=discovered)
+            print(
+                f"osai: selected {requested_accelerator.value} device(s): "
+                f"{', '.join(settings.devices)}"
+            )
+    if settings.multi_gpu == "on" and len(settings.devices) < 2:
+        raise ConfigurationError(
+            "multi-GPU was required, but fewer than two usable devices were found"
+        )
+    if settings.multi_gpu != "off" and len(settings.devices) > dataset.train_examples:
+        if settings.multi_gpu == "on":
+            raise ConfigurationError(
+                "required multi-GPU training needs at least one record per GPU"
+            )
+        settings = replace(settings, devices=settings.devices[: dataset.train_examples])
     training_accelerator = requested_accelerator
     fallback_from: str | None = None
     fallback_reason: str | None = None
@@ -169,6 +199,27 @@ def train_gradient_gguf(
 
             np = _import_numpy()
             parameters = _initialize_parameters(base, settings, np)
+            source = Path(model).expanduser().resolve()
+            fused = (
+                resolve_gguf_fusion_bundle(source)
+                if source.is_dir() and (source / "osai_fusion.json").is_file()
+                else None
+            )
+            if fused is not None:
+                reader = _import_gguf().GGUFReader(fused.adapter)
+                resumed = {
+                    str(tensor.name): np.asarray(tensor.data, dtype=np.float32).copy()
+                    for tensor in reader.tensors
+                }
+                if set(resumed) != set(parameters) or any(
+                    resumed[name].shape != parameters[name].shape for name in parameters
+                ):
+                    raise ConfigurationError(
+                        "the fused custom model's LoRA shape differs from the selected "
+                        "rank, layers, or targets; use Auto settings to resume it"
+                    )
+                parameters = resumed
+            _verify_hybrid_adapter_tensors(base, parameters)
             manifest["options"]["selected_base_tensors"] = sorted(
                 {name.removesuffix(".lora_a").removesuffix(".lora_b") for name in parameters}
             )
@@ -179,13 +230,16 @@ def train_gradient_gguf(
             trained_adapter.unlink(missing_ok=True)
             final_adapter = layout.adapters / "gguf" / "adapter.gguf"
             final_adapter.parent.mkdir(parents=True, exist_ok=True)
-            _write_adapter(
-                initial_adapter,
-                base.architecture,
-                parameters,
-                settings.scale * settings.rank,
-                np,
-            )
+            if fused is not None:
+                shutil.copy2(fused.adapter, initial_adapter)
+            else:
+                _write_adapter(
+                    initial_adapter,
+                    base.architecture,
+                    parameters,
+                    settings.scale * settings.rank,
+                    np,
+                )
             initial_digest = _adapter_tensor_digest(initial_adapter, np)
 
             # Hybrid llama.cpp models round small contexts up to 256 tokens. A
@@ -213,7 +267,14 @@ def train_gradient_gguf(
                 else None
             )
 
-            evaluation_accelerator = requested_accelerator
+            parallel_devices = (
+                settings.devices
+                if training_accelerator is not Accelerator.CPU
+                and settings.multi_gpu != "off"
+                and len(settings.devices) > 1
+                else ()
+            )
+            evaluation_accelerator = Accelerator.CPU if parallel_devices else requested_accelerator
             initial_loss = math.nan
             perplexity_binary = None
             if not settings.mask_prompt:
@@ -226,7 +287,7 @@ def train_gradient_gguf(
                     initial_adapter,
                     train_corpus,
                     settings.context,
-                    requested_accelerator,
+                    evaluation_accelerator,
                     layout.logs / "evaluate-before.log",
                     settings,
                 )
@@ -234,28 +295,49 @@ def train_gradient_gguf(
             log_path = layout.logs / "train.log"
             log_path.unlink(missing_ok=True)
             successful_offset = 0
-            command = _gradient_command(
-                binary,
-                base.path,
-                initial_adapter,
-                train_corpus,
-                trained_adapter,
-                settings,
-                training_accelerator,
-            )
             training_env = offline_environment()
             training_env["OSAI_MASK_PROMPT"] = "1" if settings.mask_prompt else "0"
             training_env["OSAI_MAX_SEQ_LENGTH"] = str(settings.context)
-            try:
-                run_logged(command, log_path=log_path, env=training_env)
-            except TrainingError:
-                if training_accelerator is Accelerator.CPU:
-                    raise
-                fallback_from = training_accelerator.value
-                fallback_reason = "accelerator rejected the backward graph"
-                training_accelerator = Accelerator.CPU
-                successful_offset = log_path.stat().st_size if log_path.exists() else 0
-                print(f"osai: {fallback_from} backprop failed; retrying with CPU")
+            if parallel_devices:
+                try:
+                    epoch_losses, optimizer_steps = _run_parallel_gradient(
+                        binary,
+                        base.path,
+                        base.architecture,
+                        dataset.path / "train.jsonl",
+                        initial_adapter,
+                        trained_adapter,
+                        internal,
+                        layout.logs,
+                        settings,
+                        training_accelerator,
+                        training_env,
+                        dataset.train_examples,
+                        initial_digest,
+                        np,
+                    )
+                except TrainingError:
+                    failed_gpu = any(
+                        _retryable_accelerator_failure(layout.logs / f"train-gpu-{index}.log")
+                        for index in range(len(parallel_devices))
+                    )
+                    if settings.multi_gpu == "on" or not failed_gpu:
+                        raise
+                    fallback_from = training_accelerator.value
+                    fallback_reason = "parallel accelerator rejected the backward graph"
+                    training_accelerator = Accelerator.CPU
+                    parallel_devices = ()
+                    print(f"osai: {fallback_from} parallel training failed; retrying with CPU")
+                else:
+                    best_index = min(range(len(epoch_losses)), key=epoch_losses.__getitem__)
+                    best_epoch, best_supervised_loss = best_index + 1, epoch_losses[best_index]
+                    manifest["parallel_training"] = {
+                        "method": "record-weighted mean of independent LoRA deltas",
+                        "devices": list(parallel_devices),
+                        "published_rank": settings.rank * len(parallel_devices),
+                    }
+                    atomic_json(manifest_path, manifest)
+            if not parallel_devices:
                 command = _gradient_command(
                     binary,
                     base.path,
@@ -265,18 +347,47 @@ def train_gradient_gguf(
                     settings,
                     training_accelerator,
                 )
-                run_logged(command, log_path=log_path, env=training_env)
+                try:
+                    run_logged(command, log_path=log_path, env=training_env)
+                except TrainingError as exc:
+                    if training_accelerator is Accelerator.CPU:
+                        raise
+                    if settings.multi_gpu == "on":
+                        raise TrainingError(
+                            "required multi-GPU training failed; see the native training log "
+                            f"at {log_path}"
+                        ) from exc
+                    if not _retryable_accelerator_failure(log_path):
+                        raise
+                    fallback_from = training_accelerator.value
+                    fallback_reason = "accelerator rejected the backward graph"
+                    training_accelerator = Accelerator.CPU
+                    successful_offset = log_path.stat().st_size if log_path.exists() else 0
+                    print(f"osai: {fallback_from} backprop failed; retrying with CPU")
+                    command = _gradient_command(
+                        binary,
+                        base.path,
+                        initial_adapter,
+                        train_corpus,
+                        trained_adapter,
+                        settings,
+                        training_accelerator,
+                    )
+                    run_logged(command, log_path=log_path, env=training_env)
 
             if not trained_adapter.is_file():
                 raise TrainingError(f"llama.cpp did not save a trained adapter; see {log_path}")
-            with log_path.open("r", encoding="utf-8", errors="replace") as handle:
-                handle.seek(successful_offset)
-                successful_log = handle.read()
-            epoch_losses = _parse_epoch_losses(successful_log, log_path)
-            optimizer_steps = _parse_optimizer_steps(
-                successful_log, settings.epochs, settings.mask_prompt
-            )
-            best_epoch, best_supervised_loss = _parse_best_checkpoint(successful_log, epoch_losses)
+            if not parallel_devices:
+                with log_path.open("r", encoding="utf-8", errors="replace") as handle:
+                    handle.seek(successful_offset)
+                    successful_log = handle.read()
+                epoch_losses = _parse_epoch_losses(successful_log, log_path)
+                optimizer_steps = _parse_optimizer_steps(
+                    successful_log, settings.epochs, settings.mask_prompt
+                )
+                best_epoch, best_supervised_loss = _parse_best_checkpoint(
+                    successful_log, epoch_losses
+                )
             if settings.mask_prompt:
                 initial_loss = epoch_losses[0]
 
@@ -289,27 +400,38 @@ def train_gradient_gguf(
             _verify_adapter(final_adapter, base.architecture)
 
             if settings.mask_prompt:
-                final_loss = _evaluate_supervised_loss(
+                evaluation_settings = (
+                    replace(
+                        settings,
+                        multi_gpu="off",
+                        devices=(settings.devices[0],),
+                        tensor_split=(),
+                        main_gpu=0,
+                    )
+                    if settings.devices and training_accelerator is not Accelerator.CPU
+                    else settings
+                )
+                final_loss, evaluation_accelerator = _run_supervised_evaluation(
                     binary,
                     base.path,
                     final_adapter,
                     train_corpus,
-                    settings,
+                    evaluation_settings,
                     layout.logs / "evaluate-after.log",
+                    training_accelerator,
                 )
-                test_loss = (
-                    _evaluate_supervised_loss(
+                if test_corpus:
+                    test_loss, evaluation_accelerator = _run_supervised_evaluation(
                         binary,
                         base.path,
                         final_adapter,
                         test_corpus,
-                        settings,
+                        evaluation_settings,
                         layout.logs / "evaluate-test.log",
+                        evaluation_accelerator,
                     )
-                    if test_corpus
-                    else None
-                )
-                evaluation_accelerator = Accelerator.CPU
+                else:
+                    test_loss = None
             else:
                 assert perplexity_binary is not None
                 final_loss, evaluation_accelerator = _evaluate_loss(
@@ -387,6 +509,12 @@ def train_gradient_gguf(
                 }
             )
             atomic_json(manifest_path, manifest)
+            # The original JSONL remains at its recorded path. Large runs can
+            # otherwise leave several gigabytes of duplicate text per session.
+            for prepared in (train_corpus, test_corpus, *internal.glob("train-gpu-*.txt")):
+                if prepared is not None:
+                    with suppress(OSError):
+                        prepared.unlink()
             return LlamaGradientResult(
                 destination,
                 final_adapter,
@@ -454,6 +582,135 @@ def _gradient_command(
     return command
 
 
+def _run_parallel_gradient(
+    binary: Path,
+    model: Path,
+    architecture: str,
+    source: Path,
+    initial_adapter: Path,
+    output_adapter: Path,
+    work: Path,
+    logs: Path,
+    settings: LlamaGradientOptions,
+    accelerator: Accelerator,
+    environment: dict[str, str],
+    record_count: int,
+    initial_digest: str,
+    np,
+) -> tuple[tuple[float, ...], int]:
+    """Train independent data shards concurrently, then average exact LoRA deltas."""
+
+    devices = settings.devices
+    count = len(devices)
+    if count < 2 or record_count < count:
+        raise ConfigurationError("parallel GGUF training needs one record per device")
+    print(f"osai: data-parallel LoRA training on {', '.join(devices)}")
+    separator = "\n<|osai_record_end|>\n" if settings.mask_prompt else "\n\n"
+    worker_outputs: list[Path] = []
+    worker_logs: list[Path] = []
+    record_counts: list[int] = []
+    commands: list[list[str]] = []
+    for index, device in enumerate(devices):
+        shard = _write_corpus(
+            source,
+            work / f"train-gpu-{index}.txt",
+            max(settings.context, 128),
+            repeat_to_minimum=not settings.mask_prompt,
+            record_separator=separator,
+            shard_index=index,
+            shard_count=count,
+        )
+        worker_output = work / f"adapter-gpu-{index}.gguf"
+        worker_output.unlink(missing_ok=True)
+        worker_log = logs / f"train-gpu-{index}.log"
+        worker_log.unlink(missing_ok=True)
+        worker_settings = replace(
+            settings,
+            multi_gpu="off",
+            devices=(device,),
+            tensor_split=(),
+            main_gpu=0,
+        )
+        commands.append(
+            _gradient_command(
+                binary,
+                model,
+                initial_adapter,
+                shard,
+                worker_output,
+                worker_settings,
+                accelerator,
+            )
+        )
+        worker_outputs.append(worker_output)
+        worker_logs.append(worker_log)
+        record_counts.append((record_count + count - 1 - index) // count)
+
+    with ThreadPoolExecutor(max_workers=count) as pool:
+        futures = [
+            pool.submit(
+                run_logged,
+                command,
+                log_path=log,
+                env=environment,
+                output_prefix=f"[{device}] ",
+            )
+            for device, command, log in zip(devices, commands, worker_logs, strict=True)
+        ]
+        for device, log, future in zip(devices, worker_logs, futures, strict=True):
+            try:
+                future.result()
+            except TrainingError as exc:
+                raise TrainingError(
+                    f"parallel training failed on {device}; see native log: {log}"
+                ) from exc
+
+    all_losses = []
+    optimizer_steps = 0
+    for device, output, log in zip(devices, worker_outputs, worker_logs, strict=True):
+        if not output.is_file():
+            raise TrainingError(f"parallel training on {device} saved no adapter; see {log}")
+        _verify_adapter(output, architecture)
+        if _adapter_tensor_digest(output, np) == initial_digest:
+            raise VerificationError(f"parallel optimizer did not change LoRA tensors on {device}")
+        log_text = log.read_text(encoding="utf-8", errors="replace")
+        losses = _parse_epoch_losses(log_text, log)
+        if len(losses) != settings.epochs:
+            raise TrainingError(f"parallel worker reported the wrong epoch count; see {log}")
+        all_losses.append(losses)
+        optimizer_steps += _parse_optimizer_steps(log_text, settings.epochs, settings.mask_prompt)
+
+    _combine_lora_adapters(
+        tuple(worker_outputs),
+        tuple(record_counts),
+        output_adapter,
+        architecture,
+        settings.scale * settings.rank,
+        settings.rank,
+        np,
+    )
+    total = sum(record_counts)
+    epoch_losses = tuple(
+        sum(
+            losses[epoch] * records
+            for losses, records in zip(all_losses, record_counts, strict=True)
+        )
+        / total
+        for epoch in range(settings.epochs)
+    )
+    (logs / "train.log").write_text(
+        "[osai] parallel devices="
+        + ",".join(devices)
+        + "\n"
+        + "\n".join(
+            f"[osai] {device} log={log}" for device, log in zip(devices, worker_logs, strict=True)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return epoch_losses, optimizer_steps
+
+
 def _evaluate_supervised_loss(
     binary: Path,
     model: Path,
@@ -466,6 +723,32 @@ def _evaluate_supervised_loss(
     example_weights: tuple[float, ...] | None = None,
 ) -> float:
     """Evaluate the same sparse assistant labels used by native backprop."""
+
+    loss, _ = _run_supervised_evaluation(
+        binary,
+        model,
+        adapter,
+        corpus,
+        settings,
+        log_path,
+        accelerator,
+        example_weights=example_weights,
+    )
+    return loss
+
+
+def _run_supervised_evaluation(
+    binary: Path,
+    model: Path,
+    adapter: Path,
+    corpus: Path,
+    settings: LlamaGradientOptions,
+    log_path: Path,
+    accelerator: Accelerator,
+    *,
+    example_weights: tuple[float, ...] | None = None,
+) -> tuple[float, Accelerator]:
+    """Run supervised evaluation and report the accelerator actually used."""
 
     log_path.unlink(missing_ok=True)
     command = _gradient_command(
@@ -488,8 +771,10 @@ def _evaluate_supervised_loss(
     try:
         run_logged(command, log_path=log_path, env=environment)
     except TrainingError:
-        if accelerator is Accelerator.CPU:
+        if accelerator is Accelerator.CPU or not _retryable_accelerator_failure(log_path):
             raise
+        print(f"osai: {accelerator.value} evaluation failed; retrying with CPU")
+        accelerator = Accelerator.CPU
         command = _gradient_command(
             binary,
             model,
@@ -501,7 +786,7 @@ def _evaluate_supervised_loss(
         )
         run_logged(command, log_path=log_path, env=environment)
     output = log_path.read_text(encoding="utf-8", errors="replace")
-    return _parse_supervised_loss(output, log_path)
+    return _parse_supervised_loss(output, log_path), accelerator
 
 
 def _parse_supervised_loss(output: str, log_path: Path) -> float:
@@ -572,3 +857,60 @@ def _validate_memory_budget(settings: LlamaGradientOptions, physical_memory: int
             + ", ".join(unsafe)
             + "; use one target, one layer, context <= 256, and microbatch <= 8"
         )
+
+
+def _validate_hybrid_training_path(base, settings: LlamaGradientOptions) -> None:
+    if base.architecture.lower() not in {"qwen35", "qwen35moe"}:
+        return
+    safe_targets = {"mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"}
+    if (
+        settings.num_layers != 1
+        or not settings.target_modules
+        or not set(settings.target_modules) <= safe_targets
+    ):
+        raise ConfigurationError(
+            "Qwen3.5 GGUF training can adapt only the final block's MLP projections "
+            "because llama.cpp cannot backpropagate through GATED_DELTA_NET. "
+            "Use --num-layers 1 and an mlp.* target, or enable --auto-settings."
+        )
+
+
+def _verify_hybrid_adapter_tensors(base, parameters: dict) -> None:
+    if base.architecture.lower() not in {"qwen35", "qwen35moe"}:
+        return
+    final_block = (base.block_count or 0) - 1
+    if final_block < 0 or any(
+        not name.startswith(f"blk.{final_block}.ffn_") for name in parameters
+    ):
+        raise ConfigurationError(
+            "Qwen3.5 GGUF training requires compatible MLP projections in the final model block"
+        )
+
+
+def _retryable_accelerator_failure(log_path: Path) -> bool:
+    if not log_path.is_file():
+        return False
+    with log_path.open("rb") as handle:
+        handle.seek(max(0, log_path.stat().st_size - 16_384))
+        tail = handle.read().decode("utf-8", errors="replace").lower()
+    return (
+        any(
+            marker in tail
+            for marker in (
+                "out of device memory",
+                "cuda out of memory",
+                "cuda error",
+                "vulkan error",
+                "failed to allocate gpu",
+                "failed to allocate buffer",
+                "device lost",
+                "no usable gpu found",
+                # A native GPU backend can terminate before it emits a driver
+                # diagnostic. Retry once on CPU for these access-violation codes.
+                "exit=3221225477",
+                "exit=139",
+                "exit=-11",
+            )
+        )
+        and "unsupported ggml op for backward pass" not in tail
+    )

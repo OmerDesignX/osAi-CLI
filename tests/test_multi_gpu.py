@@ -6,7 +6,11 @@ from osai.backends.mlx import _resolve_distributed_workers
 from osai.config import ModelFormat, TrainingConfig
 from osai.errors import ConfigurationError
 from osai.hardware import Accelerator
-from osai.multi_gpu import llama_device_arguments
+from osai.multi_gpu import (
+    available_llama_devices,
+    llama_device_arguments,
+    llama_device_free_bytes,
+)
 
 
 def _config(tmp_path: Path, **changes) -> TrainingConfig:
@@ -56,16 +60,91 @@ def test_llama_single_gpu_disables_splitting(tmp_path: Path):
     assert command[command.index("-sm") + 1] == "none"
 
 
+def test_vulkan_auto_prefers_nvidia_cards_over_integrated_adapter(monkeypatch, tmp_path):
+    class Completed:
+        returncode = 0
+        stdout = (
+            "Available devices:\n"
+            "  Vulkan0: AMD Radeon(TM) Graphics (32700 MiB)\n"
+            "  Vulkan1: NVIDIA GeForce RTX 3060 (12324 MiB)\n"
+            "  Vulkan2: NVIDIA GeForce RTX 3060 (12329 MiB)\n"
+        )
+
+    monkeypatch.setattr("osai.multi_gpu.subprocess.run", lambda *_args, **_kwargs: Completed())
+    assert available_llama_devices(tmp_path / "llama-completion", Accelerator.VULKAN) == (
+        "Vulkan1",
+        "Vulkan2",
+    )
+
+
+def test_vulkan_auto_keeps_discrete_cards_from_multiple_vendors(monkeypatch, tmp_path):
+    class Completed:
+        returncode = 0
+        stdout = (
+            "Available devices:\n"
+            "  Vulkan0: AMD Radeon(TM) Graphics (32700 MiB)\n"
+            "  Vulkan1: AMD Radeon RX 7900 XTX (24576 MiB)\n"
+            "  Vulkan2: NVIDIA GeForce RTX 3060 (12000 MiB)\n"
+            "  Vulkan3: Intel Arc A770 Graphics (16384 MiB)\n"
+        )
+
+    monkeypatch.setattr("osai.multi_gpu.subprocess.run", lambda *_args, **_kwargs: Completed())
+    assert available_llama_devices(tmp_path / "llama-completion", Accelerator.VULKAN) == (
+        "Vulkan1",
+        "Vulkan2",
+        "Vulkan3",
+    )
+
+
+def test_cuda_auto_discovers_both_native_devices(monkeypatch, tmp_path):
+    class Completed:
+        returncode = 0
+        stdout = (
+            "Available devices:\n"
+            "  CUDA0: NVIDIA GeForce RTX 3060 (12000 MiB)\n"
+            "  CUDA1: NVIDIA GeForce RTX 3060 (12000 MiB)\n"
+        )
+
+    monkeypatch.setattr("osai.multi_gpu.subprocess.run", lambda *_args, **_kwargs: Completed())
+    assert available_llama_devices(tmp_path / "llama-completion", Accelerator.CUDA) == (
+        "CUDA0",
+        "CUDA1",
+    )
+
+
+def test_metal_prefers_external_gpu_over_integrated_card(monkeypatch, tmp_path):
+    class Completed:
+        returncode = 0
+        stdout = (
+            "Available devices:\n"
+            "  MTL0: Intel Iris Plus Graphics\n"
+            "  MTL1: AMD Radeon RX 6800 XT eGPU\n"
+        )
+
+    monkeypatch.setattr("osai.multi_gpu.subprocess.run", lambda *_args, **_kwargs: Completed())
+    assert available_llama_devices(tmp_path / "llama-completion", Accelerator.METAL) == ("MTL1",)
+    assert available_llama_devices(
+        tmp_path / "llama-completion", Accelerator.METAL, include_integrated=True
+    ) == ("MTL1", "MTL0")
+
+
+def test_native_device_inventory_reports_free_gpu_memory(monkeypatch, tmp_path):
+    class Completed:
+        returncode = 0
+        stdout = "Available devices:\n  MTL1: AMD Radeon eGPU (8192 MiB, 6144 MiB free)\n"
+
+    monkeypatch.setattr("osai.multi_gpu.subprocess.run", lambda *_args, **_kwargs: Completed())
+    assert llama_device_free_bytes(tmp_path / "llama-completion", Accelerator.METAL) == {
+        "MTL1": 6144 * 1024**2
+    }
+
+
 def test_mlx_auto_uses_divisible_cuda_worker_count(tmp_path: Path):
     settings = _config(tmp_path, multi_gpu="auto", distributed_workers=0)
-    assert _resolve_distributed_workers(
-        settings, {"accelerator": "cuda", "gpu_count": 3}
-    ) == 2
+    assert _resolve_distributed_workers(settings, {"accelerator": "cuda", "gpu_count": 3}) == 2
 
 
 def test_mlx_rejects_required_multi_gpu_on_metal(tmp_path: Path):
     settings = _config(tmp_path, multi_gpu="on")
     with pytest.raises(ConfigurationError, match="Metal"):
-        _resolve_distributed_workers(
-            settings, {"accelerator": "metal", "gpu_count": 1}
-        )
+        _resolve_distributed_workers(settings, {"accelerator": "metal", "gpu_count": 1})

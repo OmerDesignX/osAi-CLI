@@ -1,6 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+from osai.auto_settings import select_auto_settings
 from osai.cli import (
     _choose_combined_alignment,
     _resolve_training_settings,
@@ -246,6 +247,12 @@ def test_manual_values_override_the_auto_profile(monkeypatch, tmp_path: Path):
     )
     monkeypatch.setattr("osai.cli.inspect_model", lambda *_: inspection)
     monkeypatch.setattr("osai.auto_settings.physical_memory_bytes", lambda: 8 * 1024**3)
+    monkeypatch.setattr(
+        "osai.cli.benchmark_auto_settings",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            settings=select_auto_settings(inspection, engine=Engine.LLAMA_CPP)
+        ),
+    )
     config = TrainingConfig(
         model=inspection.path,
         format=ModelFormat.GGUF,

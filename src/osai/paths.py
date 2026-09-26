@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 
@@ -25,6 +26,21 @@ def llama_cpp_root() -> Path:
     return project_root() / "vendor" / "llama.cpp"
 
 
+def llama_runtime_build() -> Path:
+    """Writable native build cache, separate from the installed application."""
+
+    override = os.environ.get("OSAI_LLAMA_BUILD_DIR")
+    if override:
+        return Path(override).expanduser().resolve()
+    if os.name == "nt":
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Caches"
+    else:
+        base = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    return base / "osAi" / "llama-build"
+
+
 def mlx_lm_root() -> Path:
     return project_root() / "vendor" / "mlx-lm"
 
@@ -40,13 +56,20 @@ def llama_binary(name: str) -> Path | None:
     # llama-cli to llama-completion.  Accept both so osai remains
     # compatible with vendored snapshots on either side of that change.
     aliases = (name, "llama-completion") if name == "llama-cli" else (name,)
+    from_cache = llama_runtime_build()
+    build_roots = (
+        (from_cache, root / "build")
+        if (from_cache / "OSAI_BUILD.json").is_file()
+        else (root / "build",)
+    )
     candidates = tuple(
         candidate
+        for build in build_roots
         for alias in aliases
         for candidate in (
-            root / "build" / "bin" / f"{alias}{suffix}",
-            root / "build" / "bin" / "Release" / f"{alias}{suffix}",
-            root / "build" / "Release" / f"{alias}{suffix}",
+            build / "bin" / f"{alias}{suffix}",
+            build / "bin" / "Release" / f"{alias}{suffix}",
+            build / "Release" / f"{alias}{suffix}",
         )
     )
     return next((path for path in candidates if path.is_file()), None)

@@ -174,7 +174,7 @@ def publish_base_adapter_bundle(
         "base_source": str(base.path),
         "base": base_result.as_dict(),
         "adapters": {
-            name: str(path.resolve().relative_to(layout.base_adapter))
+            name: path.resolve().relative_to(layout.base_adapter).as_posix()
             for name, path in sorted(adapters.items())
         },
         "quantization": asdict(base.quantization),
@@ -234,10 +234,9 @@ def clone_or_copy(source: Path, destination: Path) -> str:
             )
         if source.samefile(destination):
             destination.unlink()
-        elif (
-            destination.stat().st_size == source.stat().st_size
-            and sha256_file(destination) == sha256_file(source)
-        ):
+        elif destination.stat().st_size == source.stat().st_size and sha256_file(
+            destination
+        ) == sha256_file(source):
             return "existing"
         else:
             raise VerificationError(

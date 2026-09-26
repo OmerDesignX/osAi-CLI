@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from osai.auto_settings import select_auto_settings
 from osai.backends.llama_gradient import (
     LlamaGradientOptions,
     _gradient_command,
@@ -9,11 +10,21 @@ from osai.backends.llama_gradient import (
     _parse_epoch_losses,
     _parse_optimizer_steps,
     _parse_supervised_loss,
+    _retryable_accelerator_failure,
+    _validate_hybrid_training_path,
     _validate_memory_budget,
 )
+from osai.backends.llama_utils import (
+    _combine_lora_adapters,
+    _import_gguf,
+    _write_adapter,
+    gguf_adapter_training_shape,
+)
 from osai.cli import build_parser
+from osai.config import ModelFormat
 from osai.errors import ConfigurationError
-from osai.hardware import Accelerator
+from osai.formats import ModelInspection, QuantizationSpec
+from osai.hardware import Accelerator, Engine
 
 
 def test_gradient_options_reject_non_divisible_batch():
@@ -38,6 +49,62 @@ def test_low_memory_guard_accepts_the_native_256_token_floor():
         LlamaGradientOptions(context=256, batch_size=8),
         8 * 1024**3,
     )
+
+
+def test_qwen35_manual_graph_crossing_is_rejected_before_training():
+    base = ModelInspection(
+        format=ModelFormat.GGUF,
+        path=Path("v2.gguf"),
+        architecture="qwen35",
+        quantization=QuantizationSpec("Q4_K_M"),
+        size_bytes=2_500_000_000,
+        shards=(Path("v2.gguf"),),
+        block_count=28,
+    )
+    with pytest.raises(ConfigurationError, match="GATED_DELTA_NET"):
+        _validate_hybrid_training_path(
+            base,
+            LlamaGradientOptions(num_layers=4, target_modules=("mlp.down_proj",)),
+        )
+    auto = select_auto_settings(base, engine=Engine.LLAMA_CPP, memory_bytes=64 * 1024**3)
+    _validate_hybrid_training_path(
+        base,
+        LlamaGradientOptions(num_layers=auto.num_layers, target_modules=auto.target_modules),
+    )
+
+
+def test_cpu_retry_requires_a_gpu_specific_failure(tmp_path: Path):
+    log = tmp_path / "train.log"
+    log.write_text("unsupported ggml op for backward pass: GATED_DELTA_NET")
+    assert not _retryable_accelerator_failure(log)
+    log.write_text("CUDA error: out of device memory")
+    assert _retryable_accelerator_failure(log)
+    log.write_text("[osai] exit=3221225477")
+    assert _retryable_accelerator_failure(log)
+
+
+def test_parallel_adapter_combination_preserves_weighted_lora_delta(tmp_path: Path):
+    np = pytest.importorskip("numpy")
+    first = {
+        "blk.0.ffn_down.weight.lora_a": np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float32),
+        "blk.0.ffn_down.weight.lora_b": np.array([[1, 2], [3, 4]], dtype=np.float32),
+    }
+    second = {
+        "blk.0.ffn_down.weight.lora_a": np.array([[2, 1, 0], [0, 1, 2]], dtype=np.float32),
+        "blk.0.ffn_down.weight.lora_b": np.array([[2, 3], [4, 5]], dtype=np.float32),
+    }
+    paths = (tmp_path / "one.gguf", tmp_path / "two.gguf")
+    for path, tensors in zip(paths, (first, second), strict=True):
+        _write_adapter(path, "llama", tensors, 4.0, np)
+    assert gguf_adapter_training_shape(paths[0]) == (2, 1, ("mlp.down_proj",), 2.0)
+    combined = tmp_path / "combined.gguf"
+    _combine_lora_adapters(paths, (1, 3), combined, "llama", 4.0, 2, np)
+    tensors = {str(t.name): np.asarray(t.data) for t in _import_gguf().GGUFReader(combined).tensors}
+    actual = tensors["blk.0.ffn_down.weight.lora_b"] @ tensors["blk.0.ffn_down.weight.lora_a"]
+    expected = 0.25 * (
+        2 * first["blk.0.ffn_down.weight.lora_b"] @ first["blk.0.ffn_down.weight.lora_a"]
+    ) + 0.75 * (2 * second["blk.0.ffn_down.weight.lora_b"] @ second["blk.0.ffn_down.weight.lora_a"])
+    np.testing.assert_allclose(actual, expected)
 
 
 def test_cpu_gradient_command_disables_repack_and_devices():

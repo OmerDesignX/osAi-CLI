@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from osai.errors import ConfigurationError, VerificationError
+from osai.errors import VerificationError
 from osai.fusion import (
     FUSION_MANIFEST,
     GGUF_FUSION_KIND,
@@ -40,11 +40,24 @@ def test_mlx_fusion_keeps_base_bytes_and_embeds_adapter(tmp_path: Path):
     assert manifest["requires_full_precision_intermediate"] is False
 
 
-def test_mlx_fusion_refuses_an_already_fused_base(tmp_path: Path):
+def test_mlx_fusion_rejects_an_invalid_existing_manifest(tmp_path: Path):
     base, adapter = _sources(tmp_path)
     (base / FUSION_MANIFEST).write_text("{}", encoding="utf-8")
-    with pytest.raises(ConfigurationError, match="already fused"):
+    with pytest.raises(VerificationError, match="unsupported MLX fusion manifest"):
         create_mlx_fusion_bundle(base, adapter, tmp_path / "merged")
+
+
+def test_mlx_fusion_can_continue_without_nesting_previous_adapter(tmp_path: Path):
+    base, adapter = _sources(tmp_path)
+    first = create_mlx_fusion_bundle(base, adapter, tmp_path / "first")
+    (adapter / "adapters.safetensors").write_bytes(b"updated-residual")
+
+    second = create_mlx_fusion_bundle(first.path, adapter, tmp_path / "second")
+
+    assert (second.path / "model.safetensors").read_bytes() == b"quantized-weights"
+    assert (second.adapter / "adapters.safetensors").read_bytes() == b"updated-residual"
+    assert not (second.adapter / "osai_adapter").exists()
+    assert resolve_mlx_fusion_adapter(second.path) == second.adapter
 
 
 def test_mlx_fusion_rejects_adapter_path_traversal(tmp_path: Path):

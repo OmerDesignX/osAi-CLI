@@ -29,6 +29,7 @@ def run_logged(
     cwd: str | Path | None = None,
     env: Mapping[str, str] | None = None,
     timeout: float | None = None,
+    output_prefix: str = "",
 ) -> ProcessResult:
     argv = tuple(os.fspath(part) for part in command)
     destination = Path(log_path)
@@ -64,7 +65,12 @@ def run_logged(
                 line = process.stdout.readline()
                 if line:
                     log.write(line)
-                    sys.stdout.write(line)
+                    # Windows terminals may still use cp1252 while llama.cpp
+                    # prints Unicode progress characters. Keep the complete
+                    # UTF-8 log and replace only unrepresentable console glyphs.
+                    encoding = sys.stdout.encoding or "utf-8"
+                    visible = output_prefix + line
+                    sys.stdout.write(visible.encode(encoding, errors="replace").decode(encoding))
                     sys.stdout.flush()
                     continue
                 if process.poll() is not None:

@@ -13,18 +13,26 @@ from typing import Any
 
 from . import __version__
 from .alignment import AlignmentType, load_alignment_dataset
-from .auto_settings import select_auto_settings
+from .auto_benchmark import benchmark_auto_settings
 from .backends.alignment import AlignmentOptions, align_gguf, align_mlx
 from .backends.llama_cpp import build_llama_cpp, validate_adapter
 from .backends.llama_gradient import LlamaGradientOptions, train_gradient_gguf
+from .backends.llama_utils import gguf_adapter_training_shape
 from .bundle import verify_model_bundle
 from .catalog import ModelTier, bundled_root, list_catalog, resolve_model
 from .config import ModelFormat, TrainingConfig
 from .dataset import validate_dataset
 from .errors import ConfigurationError, DependencyError, OsAiError, TrainingError
 from .formats import inspect_model
+from .fusion import resolve_gguf_fusion_bundle, resolve_mlx_fusion_adapter
 from .gguf_adapter import convert_mlx_adapter
-from .hardware import Accelerator, Engine, detect_hardware, select_engine
+from .hardware import (
+    Accelerator,
+    Engine,
+    detect_hardware,
+    select_engine,
+    select_llama_accelerator,
+)
 from .health import check_sessions
 from .io import OutputLock, atomic_json
 from .learning_proof import prove_learning
@@ -36,7 +44,8 @@ from .model_download import (
     ModelDownload,
     ensure_official_model,
 )
-from .paths import project_root
+from .multi_gpu import available_llama_devices
+from .paths import llama_binary, project_root
 from .rollouts import RolloutSettings
 from .session import (
     BaseBundleResult,
@@ -359,6 +368,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     select_parser.set_defaults(handler=_select)
 
+    benchmark_parser = subparsers.add_parser(
+        "auto-benchmark", help="probe local inference and choose safe automatic training settings"
+    )
+    benchmark_source = benchmark_parser.add_mutually_exclusive_group(required=True)
+    benchmark_source.add_argument("--tier", choices=[tier.value for tier in ModelTier])
+    benchmark_source.add_argument("--custom", dest="custom_model")
+    benchmark_parser.add_argument(
+        "--model-version", choices=MODEL_VERSIONS, default=DEFAULT_MODEL_VERSION
+    )
+    benchmark_parser.add_argument(
+        "--engine", choices=[engine.value for engine in Engine], default="auto"
+    )
+    benchmark_parser.add_argument(
+        "--accelerator", choices=[value.value for value in Accelerator], default="auto"
+    )
+    benchmark_parser.add_argument("--multi-gpu", choices=["auto", "on", "off"], default="auto")
+    benchmark_parser.add_argument("--device", action="append", dest="devices")
+    benchmark_parser.add_argument("--bundled-root", type=Path)
+    benchmark_parser.add_argument("--custom-root", type=Path)
+    benchmark_parser.add_argument(
+        "--download-model", action=argparse.BooleanOptionalAction, default=True
+    )
+    benchmark_parser.add_argument("--refresh", action="store_true")
+    benchmark_parser.set_defaults(handler=_auto_benchmark)
+
+    devices_parser = subparsers.add_parser(
+        "auto-devices", help="list currently available native GPU devices"
+    )
+    devices_parser.add_argument(
+        "--accelerator", choices=[value.value for value in Accelerator], default="auto"
+    )
+    devices_parser.set_defaults(handler=_auto_devices)
+
     export_parser = subparsers.add_parser(
         "export-gguf", help="convert an MLX adapter to a llama.cpp GGUF adapter"
     )
@@ -380,6 +422,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     build_parser.add_argument(
         "--no-cpu-fallback", action="store_false", dest="cpu_fallback", default=True
+    )
+    build_parser.add_argument(
+        "--also-vulkan",
+        action="store_true",
+        help="include Vulkan alongside CUDA when the SDK is available",
     )
     build_parser.set_defaults(handler=_build_llama)
 
@@ -974,10 +1021,14 @@ def _resolve_training_settings(
     if args.auto_settings:
         expected = ModelFormat.MLX if engine is Engine.MLX else ModelFormat.GGUF
         model_path = config.training_model if engine is Engine.MLX else config.model
-        selected = select_auto_settings(
+        selected = benchmark_auto_settings(
             inspect_model(model_path, expected),
             engine=engine,
-        )
+            accelerator=args.accelerator,
+            multi_gpu=config.multi_gpu,
+            devices=config.devices,
+            adapter=_embedded_adapter(config.model, engine),
+        ).settings
         config = replace(
             config,
             auto_settings=True,
@@ -1053,7 +1104,29 @@ def _resolve_training_settings(
         overrides["main_gpu"] = args.main_gpu
     if args.distributed_workers is not None:
         overrides["distributed_workers"] = args.distributed_workers
-    return replace(config, **overrides)
+    config = replace(config, **overrides)
+    fused = config.model if config.model.is_dir() else None
+    if fused is not None and (fused / "osai_fusion.json").is_file():
+        rank, layers, targets, scale = _fused_lora_shape(fused, engine)
+        if args.auto_settings:
+            config = replace(
+                config,
+                rank=rank,
+                num_layers=layers,
+                target_modules=targets,
+                scale=scale,
+            )
+        elif (
+            config.rank != rank
+            or config.num_layers != layers
+            or config.target_modules != targets
+            or config.scale != scale
+        ):
+            raise ConfigurationError(
+                "manual LoRA shape differs from the merged custom model; use Auto "
+                "settings to resume its embedded adapter"
+            )
+    return config
 
 
 def _select_optimizer(
@@ -1174,6 +1247,73 @@ def _select(args: argparse.Namespace) -> int:
     return 0
 
 
+def _auto_benchmark(args: argparse.Namespace) -> int:
+    selection = _resolve_cli_model(args)
+    expected = ModelFormat.MLX if selection.engine is Engine.MLX else ModelFormat.GGUF
+    model_path = (
+        selection.companion_mlx or selection.model
+        if selection.engine is Engine.MLX
+        else selection.model
+    )
+    result = benchmark_auto_settings(
+        inspect_model(model_path, expected),
+        engine=selection.engine,
+        accelerator=args.accelerator,
+        multi_gpu=args.multi_gpu,
+        devices=tuple(args.devices or ()),
+        adapter=_embedded_adapter(selection.model, selection.engine),
+        force=args.refresh,
+    )
+    fused = selection.model if selection.model.is_dir() else None
+    if fused is not None and (fused / "osai_fusion.json").is_file():
+        rank, layers, targets, _scale = _fused_lora_shape(fused, selection.engine)
+        result = replace(
+            result,
+            settings=replace(
+                result.settings,
+                rank=rank,
+                num_layers=layers,
+                target_modules=targets,
+            ),
+        )
+    _print_json(result.as_dict())
+    return 0
+
+
+def _auto_devices(args: argparse.Namespace) -> int:
+    report = detect_hardware()
+    accelerator = select_llama_accelerator(args.accelerator, report)
+    devices = available_llama_devices(llama_binary("llama-completion"), accelerator)
+    _print_json({"accelerator": accelerator.value, "devices": list(devices)})
+    return 0
+
+
+def _embedded_adapter(model: Path, engine: Engine) -> Path | None:
+    if model.is_dir() and (model / "osai_fusion.json").is_file():
+        return (
+            resolve_gguf_fusion_bundle(model).adapter
+            if engine is Engine.LLAMA_CPP
+            else resolve_mlx_fusion_adapter(model)
+        )
+    return None
+
+
+def _fused_lora_shape(model: Path, engine: Engine):
+    if engine is Engine.LLAMA_CPP:
+        return gguf_adapter_training_shape(resolve_gguf_fusion_bundle(model).adapter)
+    adapter = resolve_mlx_fusion_adapter(model)
+    if adapter is None:
+        raise ConfigurationError("merged MLX model has no embedded adapter")
+    metadata = json.loads((adapter / "adapter_config.json").read_text(encoding="utf-8"))
+    lora = metadata["lora_parameters"]
+    return (
+        int(lora["rank"]),
+        int(metadata["num_layers"]),
+        tuple(lora["keys"]),
+        float(lora["scale"]),
+    )
+
+
 def _resolve_cli_model(args: argparse.Namespace):
     hardware = detect_hardware()
     engine = select_engine(args.engine, hardware)
@@ -1227,6 +1367,7 @@ def _build_llama(args: argparse.Namespace) -> int:
         jobs=args.jobs,
         accelerator=args.accelerator,
         cpu_fallback=args.cpu_fallback,
+        also_vulkan=args.also_vulkan,
     )
     _print_json(
         {

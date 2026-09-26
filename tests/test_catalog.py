@@ -20,6 +20,17 @@ def test_custom_models_live_in_named_format_folders(tmp_path: Path):
     assert entry.gguf == folder / "gguf" / "model-Q4_K_M.gguf"
 
 
+def test_merged_gguf_custom_model_preserves_its_fusion_folder(tmp_path: Path):
+    folder = tmp_path / "merged-model"
+    gguf = folder / "gguf"
+    gguf.mkdir(parents=True)
+    (gguf / "osai_fusion.json").write_text("{}", encoding="utf-8")
+
+    entry = custom_entry("merged-model", tmp_path)
+
+    assert entry.gguf == gguf
+
+
 def test_official_gguf_models_use_atomic_tier_directories(tmp_path: Path):
     entry = bundled_entry("small", tmp_path, "v1")
 

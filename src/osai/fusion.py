@@ -76,6 +76,8 @@ def create_mlx_fusion_bundle(
             if not source.is_file() or ".git" in source.parts:
                 continue
             relative = source.relative_to(base_path)
+            if relative.parts[0] == MLX_EMBEDDED_ADAPTER or relative.name == FUSION_MANIFEST:
+                continue
             copied = target / relative
             modes.append(clone_or_copy(source, copied))
             base_files.append(copied)
@@ -196,11 +198,9 @@ def create_gguf_fusion_bundle(
                 "schema_version": 1,
                 "kind": GGUF_FUSION_KIND,
                 "format": "gguf",
-                "model_path": str(copied_model.relative_to(target)),
-                "shards": [str(path.relative_to(target)) for path in copied_shards],
-                "projectors": [
-                    str(path.relative_to(target)) for path in copied_projectors
-                ],
+                "model_path": copied_model.relative_to(target).as_posix(),
+                "shards": [path.relative_to(target).as_posix() for path in copied_shards],
+                "projectors": [path.relative_to(target).as_posix() for path in copied_projectors],
                 "adapter_path": GGUF_EMBEDDED_ADAPTER,
                 "base_weights_unchanged": True,
                 "adapter_residual_embedded": True,
@@ -243,9 +243,7 @@ def resolve_gguf_fusion_bundle(model: str | Path) -> GgufFusionBundle:
     raw_projectors = payload.get("projectors", [])
     if not isinstance(raw_projectors, list):
         raise VerificationError(f"GGUF fusion manifest has invalid projectors: {manifest}")
-    projector_paths = tuple(
-        _safe_bundle_path(root, value, manifest) for value in raw_projectors
-    )
+    projector_paths = tuple(_safe_bundle_path(root, value, manifest) for value in raw_projectors)
     required = (*shard_paths, *projector_paths, model_path, adapter_path)
     missing = [str(path) for path in required if not path.is_file() or path.stat().st_size == 0]
     if missing:
@@ -291,7 +289,7 @@ def _validate_mlx_sources(base: Path, adapter: Path, destination: Path) -> None:
     if not base.is_dir():
         raise ConfigurationError(f"MLX fusion base does not exist: {base}")
     if (base / FUSION_MANIFEST).exists():
-        raise ConfigurationError("cannot fuse another adapter into an already fused MLX bundle")
+        resolve_mlx_fusion_adapter(base)
     if not adapter.is_dir():
         raise ConfigurationError(f"MLX adapter directory does not exist: {adapter}")
     for name in ("adapter_config.json", "adapters.safetensors"):

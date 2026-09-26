@@ -105,7 +105,10 @@ class OutputLock:
 
         for _ in range(self._CREATE_ATTEMPTS):
             try:
-                descriptor = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                descriptor = os.open(
+                    self.path,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0),
+                )
             except FileExistsError as exc:
                 if self._reclaim_stale_lock():
                     continue
