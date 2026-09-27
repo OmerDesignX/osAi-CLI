@@ -105,3 +105,21 @@ def test_setup_selects_wheel_for_current_revision(monkeypatch, tmp_path: Path):
     new_wheel.touch()
     monkeypatch.setattr(setup_osai, "PROJECT_ROOT", tmp_path)
     assert setup_osai._install_target(None) == new_wheel
+
+
+def test_gpu_setup_does_not_silently_install_cpu_backend(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(setup_osai, "_vulkan_available", lambda: True)
+    commands = setup_osai._setup_commands(
+        target_python=tmp_path / "python",
+        plan=plan(system="Windows", cuda_major=12, vulkan_available=True),
+        requirements=tmp_path / "requirements.txt",
+        install_target=tmp_path / "osai.whl",
+        wheelhouse=None,
+        dev=False,
+        skip_mlx_build=True,
+        skip_llama_build=False,
+        jobs=2,
+    )
+    build = next(command for command, _ in commands if "build-llama" in command)
+    assert "--also-vulkan" in build
+    assert "--no-cpu-fallback" in build

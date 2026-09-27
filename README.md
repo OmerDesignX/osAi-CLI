@@ -437,7 +437,7 @@ Commands:
 | `check-sessions` | Validate published sessions. |
 | `select` | Show which local model and engine would be selected. |
 | `export-gguf` | Convert an MLX LoRA adapter to GGUF adapter format. |
-| `build-llama` | Build the bundled llama.cpp tools. |
+| `build-llama` | Build the vendored llama.cpp tools in a writable native build directory. Managed App installations use a short per-install directory so CUDA compiler output paths stay within Windows limits. |
 | `validate-gguf` | Load a GGUF base and adapter together. |
 | `prove-learning` | Compare deterministic output before and after an adapter. |
 

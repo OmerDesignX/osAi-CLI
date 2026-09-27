@@ -347,6 +347,9 @@ def _setup_commands(
         ]
         if plan.llama_accelerator == "cuda" and _vulkan_available():
             build_command.append("--also-vulkan")
+        if plan.llama_accelerator != "cpu":
+            # An available GPU must not silently become a CPU-only install.
+            build_command.append("--no-cpu-fallback")
         if jobs is not None:
             build_command.extend(["--jobs", str(jobs)])
         commands.append((build_command, {}))

@@ -45,6 +45,14 @@ def llama_runtime_build() -> Path:
     override = os.environ.get("OSAI_LLAMA_BUILD_DIR")
     if override:
         return Path(override).expanduser().resolve()
+    # Installed App backends have a long, revision-named source checkout. CUDA's
+    # nvcc cannot create some object files below that checkout on Windows.
+    # Keep each installation's native build beside its .venv instead.
+    executable = Path(sys.executable).absolute()
+    if len(executable.parents) >= 3:
+        installation = executable.parents[2]
+        if (installation / ".venv").is_dir() and (installation / "source").is_dir():
+            return installation / "native"
     if os.name == "nt":
         base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
     elif sys.platform == "darwin":

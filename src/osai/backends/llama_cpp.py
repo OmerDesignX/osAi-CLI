@@ -6,6 +6,7 @@ import os
 import platform
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -57,12 +58,12 @@ def build_llama_cpp(
     root = llama_cpp_root()
     if not root.is_dir():
         raise DependencyError(f"vendored llama.cpp source not found: {root}")
-    cmake = shutil.which("cmake")
+    cmake = _cmake_executable()
     if cmake is None:
         raise DependencyError("CMake is required to build vendored llama.cpp")
     if jobs is not None and jobs < 1:
         raise DependencyError("build jobs must be at least 1")
-    build = build_dir or root / "build"
+    build = build_dir or llama_runtime_build()
     build.mkdir(parents=True, exist_ok=True)
     (build / "OSAI_BUILD.json").unlink(missing_ok=True)
     destination = Path(log_path)
@@ -70,9 +71,9 @@ def build_llama_cpp(
     destination.unlink(missing_ok=True)
     requested = select_llama_accelerator(accelerator, for_build=True)
     candidates = [(requested, also_vulkan and requested is Accelerator.CUDA)]
-    if cpu_fallback and candidates[0][1]:
+    if candidates[0][1]:
         candidates.append((Accelerator.CUDA, False))
-    if cpu_fallback and requested is Accelerator.CUDA and _vulkan_build_available():
+    if requested is Accelerator.CUDA and _vulkan_build_available():
         candidates.append((Accelerator.VULKAN, False))
     if cpu_fallback and requested is not Accelerator.CPU:
         candidates.append((Accelerator.CPU, False))
@@ -194,7 +195,7 @@ def ensure_runtime_accelerator(requested: str | Accelerator) -> None:
         raise DependencyError(
             "Vulkan training requires the Vulkan SDK or a system glslc compiler to build llama.cpp"
         )
-    if shutil.which("cmake") is None:
+    if _cmake_executable() is None:
         if choice is Accelerator.AUTO:
             packaged = report.compiled_llama_accelerator or "available"
             print(f"osai: CMake is unavailable; using the packaged {packaged} trainer")
@@ -216,6 +217,19 @@ def ensure_runtime_accelerator(requested: str | Accelerator) -> None:
         if choice is not Accelerator.AUTO:
             raise
         print(f"osai: {candidate.value} build failed; continuing with the available backend")
+
+
+def _cmake_executable() -> str | None:
+    """Find CMake from PATH or the Python environment running this CLI."""
+
+    configured = os.environ.get("OSAI_CMAKE")
+    if configured and Path(configured).is_file():
+        return configured
+    candidate = shutil.which("cmake")
+    if candidate:
+        return candidate
+    sibling = Path(sys.executable).parent / ("cmake.exe" if os.name == "nt" else "cmake")
+    return str(sibling) if sibling.is_file() else None
 
 
 def _configure(

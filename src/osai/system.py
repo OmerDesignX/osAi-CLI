@@ -5,13 +5,13 @@ from __future__ import annotations
 import importlib.util
 import os
 import platform
-import shutil
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from .backends.llama_cpp import _cmake_executable
 from .hardware import detect_hardware, macos_version_at_least
 from .paths import llama_binary, llama_cpp_root, project_root
 
@@ -70,7 +70,7 @@ def doctor() -> SystemReport:
         mlx_platform_supported=mlx_supported,
         mlx_importable=_module_importable("mlx.core"),
         mlx_lm_importable=_module_importable("mlx_lm"),
-        cmake=shutil.which("cmake"),
+        cmake=_cmake_executable(),
         llama_cpp_source=str(llama_cpp_root()) if llama_cpp_root().is_dir() else None,
         llama_cli=_path_or_none(llama_binary("llama-cli")),
         llama_finetune=_path_or_none(llama_binary("llama-finetune")),
