@@ -3,4 +3,7 @@ certifi>=2024.8,<2027
 numpy>=1.26,<3
 pyyaml>=5.1,<7
 safetensors>=0.5,<1
+pyarrow>=20,<26
+ijson>=3.4,<4
+tokenizers>=0.22,<1
 tomli>=2,<3; python_version < "3.11"

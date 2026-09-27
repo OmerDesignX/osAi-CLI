@@ -4,6 +4,7 @@
 #include "llama.h"
 
 #include <clocale>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -15,6 +16,8 @@
 #if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <fcntl.h>
+#include <io.h>
 #endif
 
 static void print_usage(int argc, char ** argv) {
@@ -99,13 +102,23 @@ int main(int argc, char ** argv) {
 
     common_init();
 
-    if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_TOKENIZE, print_usage)) {
+    bool osai_record_counts = false;
+    std::vector<char *> parsed_argv;
+    for (int i = 0; i < argc; ++i) {
+        if (strcmp(argv[i], "--osai-record-counts") == 0) {
+            osai_record_counts = true;
+        } else {
+            parsed_argv.push_back(argv[i]);
+        }
+    }
+    if (!common_params_parse((int) parsed_argv.size(), parsed_argv.data(),
+                             params, LLAMA_EXAMPLE_TOKENIZE, print_usage)) {
         return 1;
     }
 
     // -f and -p both land in params.prompt; -f also sets prompt_file. -f and -p
     // resolve like the other tools (no mutual exclusion), --stdin takes precedence.
-    const bool use_stdin = params.tokenize_stdin;
+    const bool use_stdin = params.tokenize_stdin || osai_record_counts;
     const bool use_file  = !params.prompt_file.empty();
 
     // must have some prompt
@@ -151,6 +164,51 @@ int main(int argc, char ** argv) {
     }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    if (osai_record_counts) {
+#if defined(_WIN32)
+        _setmode(_fileno(stdin), _O_BINARY);
+#endif
+        size_t records = 0;
+        size_t largest = 0;
+        while (true) {
+            unsigned char length_bytes[8];
+            std::cin.read(reinterpret_cast<char *>(length_bytes), 8);
+            if (std::cin.gcount() == 0 && std::cin.eof()) {
+                break;
+            }
+            if (std::cin.gcount() != 8) {
+                LOG_ERR("error: incomplete osAi record length\n");
+                llama_model_free(model);
+                return 1;
+            }
+            uint64_t length = 0;
+            for (int i = 0; i < 8; ++i) {
+                length |= (uint64_t) length_bytes[i] << (8 * i);
+            }
+            if (length > 128 * 1024 * 1024) {
+                LOG_ERR("error: osAi record is too large to tokenize safely\n");
+                llama_model_free(model);
+                return 1;
+            }
+            std::string record((size_t) length, '\0');
+            std::cin.read(record.data(), (std::streamsize) length);
+            if ((uint64_t) std::cin.gcount() != length) {
+                LOG_ERR("error: incomplete osAi record content\n");
+                llama_model_free(model);
+                return 1;
+            }
+            const auto tokens = common_tokenize(
+                vocab, record, llama_vocab_get_add_bos(vocab), false);
+            if (tokens.size() > largest) {
+                largest = tokens.size();
+            }
+            ++records;
+        }
+        printf("osai_max_tokens=%zu records=%zu\n", largest, records);
+        llama_model_free(model);
+        return 0;
+    }
 
     llama_context_params ctx_params = llama_context_default_params();
     llama_context * ctx = llama_init_from_model(model, ctx_params);

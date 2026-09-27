@@ -22,6 +22,7 @@ from .bundle import verify_model_bundle
 from .catalog import ModelTier, bundled_root, list_catalog, resolve_model
 from .config import ModelFormat, TrainingConfig
 from .dataset import validate_dataset
+from .dataset_source import largest_training_context, prepare_dataset_source
 from .errors import ConfigurationError, DependencyError, OsAiError, TrainingError
 from .formats import inspect_model
 from .fusion import resolve_gguf_fusion_bundle, resolve_mlx_fusion_adapter
@@ -223,6 +224,11 @@ def build_parser() -> argparse.ArgumentParser:
             "maximum tokens per training window; longer supervised records use "
             "overlapping windows without discarding trainable tokens"
         ),
+    )
+    train_parser.add_argument(
+        "--full-content-context",
+        action="store_true",
+        help="scan the largest training record and request a context that holds it whole",
     )
     train_parser.add_argument("--learning-rate", type=float)
     train_parser.add_argument("--dropout", type=float)
@@ -605,6 +611,36 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
         )
         config = replace(config, output=session)
     config = _resolve_training_settings(config, args, engine)
+    config = replace(
+        config,
+        data=prepare_dataset_source(config.data, session / ".prepared-dataset"),
+    )
+    if getattr(args, "full_content_context", False):
+        tokenizer_root = config.training_model if engine is Engine.MLX else config.model.parent
+        maximum = largest_training_context(
+            config.data,
+            tokenizer_root,
+            gguf_model=config.model if engine is Engine.LLAMA_CPP else None,
+        )
+        model_limit = inspect_model(
+            config.training_model if engine is Engine.MLX else config.model,
+            ModelFormat.MLX if engine is Engine.MLX else ModelFormat.GGUF,
+        ).context_length
+        if model_limit and maximum["context"] > model_limit:
+            raise ConfigurationError(
+                f"largest training record needs about {maximum['context']} tokens, "
+                f"above this model's {model_limit}-token limit; use overlapping windows"
+            )
+        config = replace(config, max_seq_length=maximum["context"])
+        print(
+            "osai: full content "
+            f"records={maximum['records']} files={maximum['files']} "
+            f"largest_tokens={maximum['largest_tokens']} "
+            f"context={maximum['context']} exact={str(maximum['exact']).lower()} "
+            f"source={maximum['largest_file']}",
+            file=sys.stderr,
+            flush=True,
+        )
     selected_optimizer = _select_optimizer(args, config, engine)
     dataset_summary = validate_dataset(config.data)
     multimodal = bool(set(dataset_summary.modalities) - {"text"})
@@ -775,15 +811,27 @@ def _alignment_stage(
 ) -> dict[str, Any]:
     if args.alignment_data is None:
         raise ConfigurationError("--alignment-data is required for alignment")
-    dataset = load_alignment_dataset(
+    session = getattr(args, "_session_override", None)
+    if session is None:
+        label = (
+            args.session_name
+            or args.tier
+            or args.custom_model
+            or (args.config.stem if args.config else "alignment")
+        )
+        session = timestamped_session_path(args.sessions_root, f"{label}-alignment")
+    alignment_source = prepare_dataset_source(
         args.alignment_data,
+        session / ".prepared-alignment",
+    )
+    dataset = load_alignment_dataset(
+        alignment_source,
         args.alignment_type or AlignmentType.AUTO,
         live_rollouts=args.live_rollouts,
     )
-    session = getattr(args, "_session_override", None)
     if args.config:
         pending = session or args.sessions_root.expanduser().resolve() / ".pending"
-        config = TrainingConfig.from_file(args.config, data=args.alignment_data, output=pending)
+        config = TrainingConfig.from_file(args.config, data=alignment_source, output=pending)
         if model is not None:
             config = replace(
                 config,
@@ -806,7 +854,7 @@ def _alignment_stage(
         config = TrainingConfig(
             model=model,
             format=ModelFormat.MLX if engine is Engine.MLX else ModelFormat.GGUF,
-            data=args.alignment_data,
+            data=alignment_source,
             output=session or args.sessions_root.expanduser().resolve() / ".pending",
             batch_size=1 if args.batch_size is None else args.batch_size,
             max_seq_length=64 if args.max_seq_length is None else args.max_seq_length,
@@ -825,14 +873,6 @@ def _alignment_stage(
             ),
         )
     assert engine is not None
-    if session is None:
-        label = (
-            args.session_name
-            or args.tier
-            or args.custom_model
-            or (args.config.stem if args.config else "alignment")
-        )
-        session = timestamped_session_path(args.sessions_root, f"{label}-alignment")
     config = replace(config, output=session)
     config = _resolve_training_settings(config, args, engine)
     selected_optimizer = _select_optimizer(args, config, engine)

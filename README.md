@@ -103,7 +103,7 @@ The script:
 1. Detects the OS, architecture, macOS version, CUDA toolkit, and Vulkan tools, including conventional Windows SDK locations.
 2. Creates or reuses `.venv`.
 3. Selects the correct file from `requirements/` and installs it.
-4. Installs `dist/osai-0.1.2-py3-none-any.whl`, or builds from the local
+4. Installs `dist/osai-0.1.3-py3-none-any.whl`, or builds from the local
    project if the wheel is absent.
 5. Builds the bundled MLX and MLX-LM sources when the platform supports MLX.
 6. Builds vendored llama.cpp on this computer for Metal, CUDA, Vulkan, or CPU.
@@ -150,7 +150,7 @@ To install the wheel yourself first:
 ```sh
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install dist/osai-0.1.2-py3-none-any.whl
+python -m pip install dist/osai-0.1.3-py3-none-any.whl
 python scripts/setup_osai.py --current-environment
 ```
 
@@ -160,10 +160,14 @@ hardware-specific libraries, builds the bundled engines, and runs diagnostics.
 
 ## Train
 
-`--data` points to a directory containing `train.jsonl`, with optional
-`valid.jsonl` and `test.jsonl` splits. UTF-8 and UTF-8-with-BOM files are
-accepted. Equivalent supervised layouts can be mixed; osAi validates every row
-and writes one canonical chat dataset inside the session before training.
+`--data` accepts one JSON, JSONL, NDJSON, or Parquet file, or a folder of
+such files. Every supported file in the folder and its subfolders is used.
+Names beginning with `valid`, `validation`, or `dev` form the validation
+split; names beginning with `test` form the test split; other data files train.
+Known metadata files are ignored. Parquet is converted in bounded batches to
+session-local JSONL before training; source files are not changed. UTF-8 and
+UTF-8-with-BOM JSON files are accepted. Equivalent supervised layouts can be
+mixed; osAi validates every row and writes canonical splits inside the session.
 
 | Dataset layout | Accepted fields |
 | --- | --- |
@@ -491,6 +495,7 @@ directly to alignment.
 | `--scale NUMBER` | LoRA scaling value. Default: `4`. |
 | `--num-layers N` | Number of final model layers to adapt. Default: `1`. |
 | `--max-seq-length N` | MLX or GGUF context tokens per training window. Longer supervised rows are windowed without dropping assistant labels; each window sees only local context. Auto selects a hardware-aware value. |
+| `--full-content-context` | Scan every training record and use a context sized for the largest one. GGUF uses the model's native tokenizer; MLX uses its `tokenizer.json`. A record beyond the model context limit is rejected. Device memory failures still trigger smaller overlapping windows when Auto is enabled. |
 | `--image-size WIDTH HEIGHT` | Resize local images before VLM preprocessing. Omit it to use the model processor's native size. |
 | `--video-fps NUMBER` | Frames sampled per second from local videos. Default: `2`. |
 | `--video-max-frames N` | Maximum frames loaded from each local video. Default: `32`. |

@@ -86,6 +86,7 @@ def build_llama_cpp(
         "Release",
         "--target",
         "llama-completion",
+        "llama-tokenize",
         "llama-finetune",
         "llama-perplexity",
         "llama-quantize",
