@@ -7,12 +7,16 @@ import math
 import os
 import re
 import shutil
+import sys
+import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
+from ..checkpoints import CheckpointPublisher
 from ..config import DEFAULT_TARGETS, ModelFormat
 from ..dataset import require_text_training, validate_dataset
 from ..errors import ConfigurationError, DependencyError, TrainingError, VerificationError
@@ -300,6 +304,16 @@ def train_gradient_gguf(
             training_env = offline_environment()
             training_env["OSAI_MASK_PROMPT"] = "1" if settings.mask_prompt else "0"
             training_env["OSAI_MAX_SEQ_LENGTH"] = str(settings.context)
+            checkpoint_dir = layout.root / "outputs" / "checkpoint"
+            (checkpoint_dir / "adapter").mkdir(parents=True, exist_ok=True)
+            training_env["OSAI_CHECKPOINT_REQUEST"] = os.environ.get(
+                "OSAI_CHECKPOINT_REQUEST", str(layout.root / "checkpoint.request")
+            )
+            training_env["OSAI_CHECKPOINT_OUTPUT"] = str(
+                checkpoint_dir / "adapter" / "last.gguf"
+            )
+            training_env["OSAI_CHECKPOINT_ACK"] = str(checkpoint_dir / "last.ack")
+            training_env["OSAI_CHECKPOINT_INTERVAL_SECONDS"] = "300"
             if parallel_devices:
                 while True:
                     try:
@@ -307,6 +321,7 @@ def train_gradient_gguf(
                             binary,
                             base.path,
                             base.architecture,
+                            base.shards,
                             dataset.path / "train.jsonl",
                             initial_adapter,
                             trained_adapter,
@@ -364,7 +379,13 @@ def train_gradient_gguf(
                         training_accelerator,
                     )
                     try:
-                        run_logged(command, log_path=log_path, env=training_env)
+                        with CheckpointPublisher(
+                            kind="gguf",
+                            model=base.path,
+                            shards=base.shards,
+                            latest=checkpoint_dir / "adapter" / "last.gguf",
+                        ):
+                            run_logged(command, log_path=log_path, env=training_env)
                         successful_offset = attempt_offset
                         break
                     except TrainingError as exc:
@@ -606,6 +627,7 @@ def _run_parallel_gradient(
     binary: Path,
     model: Path,
     architecture: str,
+    shards: tuple[Path, ...],
     source: Path,
     initial_adapter: Path,
     output_adapter: Path,
@@ -630,6 +652,12 @@ def _run_parallel_gradient(
     worker_logs: list[Path] = []
     record_counts: list[int] = []
     commands: list[list[str]] = []
+    checkpoint_dir = work.parent / "outputs" / "checkpoint"
+    (checkpoint_dir / "adapter").mkdir(parents=True, exist_ok=True)
+    request = Path(environment["OSAI_CHECKPOINT_REQUEST"])
+    checkpoint_outputs: list[Path] = []
+    checkpoint_acks: list[Path] = []
+    worker_environments: list[dict[str, str]] = []
     for index, device in enumerate(devices):
         shard = _write_corpus(
             source,
@@ -644,6 +672,17 @@ def _run_parallel_gradient(
         worker_output.unlink(missing_ok=True)
         worker_log = logs / f"train-gpu-{index}.log"
         worker_log.unlink(missing_ok=True)
+        snapshot = work / f"checkpoint-gpu-{index}.gguf"
+        ack = work / f"checkpoint-gpu-{index}.ack"
+        snapshot.unlink(missing_ok=True)
+        ack.unlink(missing_ok=True)
+        worker_environment = dict(environment)
+        worker_environment["OSAI_CHECKPOINT_OUTPUT"] = str(snapshot)
+        worker_environment["OSAI_CHECKPOINT_ACK"] = str(ack)
+        worker_environment["OSAI_CHECKPOINT_INTERVAL_SECONDS"] = "0"
+        worker_environments.append(worker_environment)
+        checkpoint_outputs.append(snapshot)
+        checkpoint_acks.append(ack)
         worker_settings = replace(
             settings,
             multi_gpu="off",
@@ -666,17 +705,79 @@ def _run_parallel_gradient(
         worker_logs.append(worker_log)
         record_counts.append((record_count + count - 1 - index) // count)
 
-    with ThreadPoolExecutor(max_workers=count) as pool:
+    with (
+        CheckpointPublisher(
+            kind="gguf",
+            model=model,
+            shards=shards,
+            latest=checkpoint_dir / "adapter" / "last.gguf",
+        ),
+        ThreadPoolExecutor(max_workers=count) as pool,
+    ):
         futures = [
             pool.submit(
                 run_logged,
                 command,
                 log_path=log,
-                env=environment,
+                env=worker_environment,
                 output_prefix=f"[{device}] ",
             )
-            for device, command, log in zip(devices, commands, worker_logs, strict=True)
+            for device, command, log, worker_environment in zip(
+                devices, commands, worker_logs, worker_environments, strict=True
+            )
         ]
+        published = ""
+        next_auto = time.monotonic() + 300
+        while not all(future.done() for future in futures):
+            try:
+                token = request.read_text(encoding="utf-8").strip() if request.is_file() else ""
+            except OSError:
+                token = ""
+            if len(token) > 128:
+                token = ""
+            if time.monotonic() >= next_auto and (not token or token == published):
+                token = uuid.uuid4().hex
+                pending = request.with_name(request.name + ".pending")
+                pending.write_text(token + "\n", encoding="utf-8")
+                os.replace(pending, request)
+                next_auto = time.monotonic() + 300
+            if token and token != published and all(
+                ack.is_file() and ack.read_text(encoding="utf-8").strip() == token
+                for ack in checkpoint_acks
+            ):
+                try:
+                    weights = []
+                    for log, records in zip(worker_logs, record_counts, strict=True):
+                        with log.open("r", encoding="utf-8", errors="replace") as handle:
+                            labels = _SUPERVISED_LABELS_RE.findall(handle.read(32768))
+                        weights.append(
+                            int(labels[-1]) if settings.mask_prompt and labels else records
+                        )
+                    _combine_lora_adapters(
+                        tuple(checkpoint_outputs),
+                        tuple(weights),
+                        checkpoint_dir / "adapter" / "last.gguf",
+                        architecture,
+                        settings.scale * settings.rank,
+                        settings.rank,
+                        np,
+                    )
+                    ack = checkpoint_dir / "last.ack"
+                    pending_ack = checkpoint_dir / "last.ack.pending"
+                    pending_ack.write_text(token + "\n", encoding="utf-8")
+                    os.replace(pending_ack, ack)
+                    print(
+                        "osai: checkpoint saved "
+                        f"path={checkpoint_dir / 'adapter' / 'last.gguf'} generation={token}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                except Exception as exc:
+                    print(f"osai: checkpoint failed reason={exc}", file=sys.stderr, flush=True)
+                published = token
+            if any(future.done() and future.exception() for future in futures):
+                break
+            time.sleep(0.5)
         for device, log, future in zip(devices, worker_logs, futures, strict=True):
             try:
                 future.result()
@@ -684,6 +785,9 @@ def _run_parallel_gradient(
                 raise TrainingError(
                     f"parallel training failed on {device}; see native log: {log}"
                 ) from exc
+    for snapshot, ack in zip(checkpoint_outputs, checkpoint_acks, strict=True):
+        snapshot.unlink(missing_ok=True)
+        ack.unlink(missing_ok=True)
 
     all_losses = []
     optimizer_steps = 0
@@ -719,6 +823,18 @@ def _run_parallel_gradient(
         settings.rank,
         np,
     )
+    latest = checkpoint_dir / "adapter" / "last.gguf"
+    with CheckpointPublisher(
+        kind="gguf", model=model, shards=shards, latest=latest
+    ):
+        pending = latest.with_name("last.gguf.pending")
+        shutil.copyfile(output_adapter, pending)
+        os.replace(pending, latest)
+        print(
+            f"osai: checkpoint saved path={latest} generation=final",
+            file=sys.stderr,
+            flush=True,
+        )
     total = sum(training_weights)
     epoch_losses = tuple(
         sum(

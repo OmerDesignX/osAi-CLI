@@ -103,7 +103,7 @@ The script:
 1. Detects the OS, architecture, macOS version, CUDA toolkit, and Vulkan tools, including conventional Windows SDK locations.
 2. Creates or reuses `.venv`.
 3. Selects the correct file from `requirements/` and installs it.
-4. Installs `dist/osai-0.1.3-py3-none-any.whl`, or builds from the local
+4. Installs `dist/osai-0.1.4-py3-none-any.whl`, or builds from the local
    project if the wheel is absent.
 5. Builds the bundled MLX and MLX-LM sources when the platform supports MLX.
 6. Builds vendored llama.cpp on this computer for Metal, CUDA, Vulkan, or CPU.
@@ -150,7 +150,7 @@ To install the wheel yourself first:
 ```sh
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install dist/osai-0.1.3-py3-none-any.whl
+python -m pip install dist/osai-0.1.4-py3-none-any.whl
 python scripts/setup_osai.py --current-environment
 ```
 
@@ -389,9 +389,24 @@ shape so previous learning is preserved.
 sessions/2026-09-05_14-30-00_small-auto/
 ├── manifests/
 ├── logs/
+├── outputs/checkpoint/
+│   ├── adapter/               # one replaceable latest adapter
+│   └── merged-model/          # reusable model with the latest adapter
 ├── outputs/base-plus-adapter/
 └── outputs/merged-model/
 ```
+
+During a run, GGUF saves the current LoRA roughly every five minutes at the
+next safe step and at completion; alignment also saves after each native
+update. MLX saves every `--save-every` updates and at completion. A request
+written to `checkpoint.request` in the session folder
+also saves at the next optimizer step; replace its text with a new unique
+value for each request. Multi-GPU GGUF training waits for every worker's
+snapshot before publishing one combined adapter. The adapter and the
+`merged-model/` bundle are replaced in place, so numbered checkpoint copies
+do not accumulate. The bundle can be selected as a custom model for a later
+run. A checkpoint contains model weights, not optimizer state, so starting a
+new run from it does not reproduce the interrupted optimizer exactly.
 
 Combined runs place the supervised stage below `stages/fine-tuning/` and place
 the final aligned adapter and merged model in the parent session's `outputs/`.
@@ -505,7 +520,7 @@ directly to alignment.
 | `--seed N` | Fine-tuning random seed. Default: `0`. |
 | `--gradient-accumulation-steps N` | MLX microbatches accumulated before each optimizer update. Default: `1`. |
 | `--gradient-checkpointing`, `--no-gradient-checkpointing` | Recompute MLX activations during backward to reduce memory use, or retain them for speed. Enabled by default. |
-| `--save-every N` | Save the MLX adapter every N updates. Default: `10`. |
+| `--save-every N` | Replace the latest MLX adapter every N updates. Default: `10`. |
 | `--steps-per-report N` | Report MLX training metrics every N updates. Default: `1`. |
 | `--steps-per-eval N` | Evaluate the MLX adapter every N updates. Default: `10`. |
 | `--val-batches N` | MLX validation batches; `-1` uses the complete validation split. Default: `1`. |

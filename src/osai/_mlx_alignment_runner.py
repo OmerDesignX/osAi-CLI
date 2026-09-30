@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import sys
 from pathlib import Path
+
+from .checkpoints import LatestCheckpoint
 
 
 def run(config_path: str | Path) -> int:
@@ -109,6 +112,24 @@ def run(config_path: str | Path) -> int:
         return total / len(indices)
 
     value_and_grad = nn.value_and_grad(model, objective)
+    output = Path(config["output"])
+    checkpoint = (
+        LatestCheckpoint() if os.environ.get("OSAI_CHECKPOINT_OUTPUT") and rank == 0 else None
+    )
+    if rank == 0:
+        output.mkdir(parents=True, exist_ok=True)
+        metadata = json.loads(
+            (Path(config["adapter"]) / "adapter_config.json").read_text(encoding="utf-8")
+        )
+        metadata["alignment"] = {
+            "type": method,
+            "iterations": int(config["iterations"]),
+            "beta": float(config["beta"]),
+            "optimizer": optimizer_name,
+        }
+        (output / "adapter_config.json").write_text(
+            json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
     losses: list[float] = []
     initial_loss: float | None = None
     local_batch = max(1, int(config["batch_size"]) // world_size)
@@ -146,24 +167,27 @@ def run(config_path: str | Path) -> int:
         losses.append(value)
         if rank == 0:
             print(f"alignment_step={step + 1} loss={value:.8f}", flush=True)
+            if checkpoint is not None:
+                due, generation = checkpoint.due(step + 1, int(config["save_every"]))
+                if due:
+                    weights = dict(tree_flatten(model.trainable_parameters()))
+                    checkpoint.save(
+                        output / "adapters.safetensors",
+                        lambda path, current_weights=weights: mx.save_safetensors(
+                            str(path), current_weights
+                        ),
+                        generation,
+                    )
 
-    output = Path(config["output"])
     if rank == 0:
-        output.mkdir(parents=True, exist_ok=True)
         weights = dict(tree_flatten(model.trainable_parameters()))
-        mx.save_safetensors(str(output / "adapters.safetensors"), weights)
-        metadata = json.loads(
-            (Path(config["adapter"]) / "adapter_config.json").read_text(encoding="utf-8")
-        )
-        metadata["alignment"] = {
-            "type": method,
-            "iterations": int(config["iterations"]),
-            "beta": float(config["beta"]),
-            "optimizer": optimizer_name,
-        }
-        (output / "adapter_config.json").write_text(
-            json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-        )
+        if checkpoint is not None:
+            checkpoint.save(
+                output / "adapters.safetensors",
+                lambda path: mx.save_safetensors(str(path), weights),
+            )
+        else:
+            mx.save_safetensors(str(output / "adapters.safetensors"), weights)
         (output / "alignment_result.json").write_text(
             json.dumps(
                 {

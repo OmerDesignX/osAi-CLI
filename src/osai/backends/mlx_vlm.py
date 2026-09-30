@@ -10,6 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from ..checkpoints import CheckpointPublisher
 from ..config import TrainingConfig
 from ..dataset import prepare_mlx_vlm_dataset, validate_dataset
 from ..errors import DependencyError, TrainingError
@@ -140,7 +141,26 @@ class MlxVlmBackend(MlxBackend):
             ]
         log_path = layout.logs / "train.log"
         log_path.unlink(missing_ok=True)
-        result = run_logged(command, log_path=log_path, env=self.environment())
+        checkpoint_dir = layout.root / "outputs" / "checkpoint"
+        (checkpoint_dir / "adapter").mkdir(parents=True, exist_ok=True)
+        checkpoint_environment = self.environment()
+        checkpoint_environment.update(
+            OSAI_CHECKPOINT_REQUEST=os.environ.get(
+                "OSAI_CHECKPOINT_REQUEST", str(layout.root / "checkpoint.request")
+            ),
+            OSAI_CHECKPOINT_OUTPUT=str(
+                checkpoint_dir / "adapter" / "adapters.safetensors"
+            ),
+            OSAI_CHECKPOINT_ACK=str(checkpoint_dir / "last.ack"),
+        )
+        with CheckpointPublisher(
+            kind="mlx",
+            model=config.training_model,
+            latest=checkpoint_dir / "adapter" / "adapters.safetensors",
+        ):
+            result = run_logged(
+                command, log_path=log_path, env=checkpoint_environment
+            )
         adapter_file = adapter_dir / "adapters.safetensors"
         adapter_config = adapter_dir / "adapter_config.json"
         if not adapter_file.is_file() or adapter_file.stat().st_size == 0:

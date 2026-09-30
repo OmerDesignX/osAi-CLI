@@ -1,5 +1,6 @@
 # Copyright © 2026 MLX-VLM
 
+import os
 import time
 from dataclasses import dataclass, field
 from functools import partial
@@ -351,6 +352,11 @@ def train(
     grad_accum_steps = args.gradient_accumulation_steps
     if grad_accum_steps < 1 and args:
         raise ValueError("gradient_accumulation_steps must be at least 1")
+    checkpoint = None
+    if os.environ.get("OSAI_CHECKPOINT_OUTPUT"):
+        from osai.checkpoints import LatestCheckpoint
+
+        checkpoint = LatestCheckpoint()
 
     # Create loss function with partial application
     loss_fn_partial = partial(
@@ -485,21 +491,34 @@ def train(
             train_time = 0
 
         # Save checkpoint
-        if it % args.steps_per_save == 0 and rank == 0:
+        if checkpoint is not None and rank == 0 and it % grad_accum_steps == 0:
+            due, generation = checkpoint.due(
+                it // grad_accum_steps, args.steps_per_save
+            )
+            if due:
+                checkpoint.save(
+                    Path(args.adapter_file),
+                    lambda path: save_adapter(model, path),
+                    generation,
+                )
+        elif checkpoint is None and it % args.steps_per_save == 0 and rank == 0:
             save_adapter(model, args.adapter_file)
-            checkpoint = (
+            checkpoint_file = (
                 Path(args.adapter_file).parent / f"{it:07d}_adapters.safetensors"
             )
-            save_adapter(model, checkpoint)
+            save_adapter(model, checkpoint_file)
             print(
                 f"{Colors.OKBLUE}Iter {it}: Saved adapter weights to "
-                f"{args.adapter_file} and {checkpoint}.{Colors.ENDC}",
+                f"{args.adapter_file} and {checkpoint_file}.{Colors.ENDC}",
                 flush=True,
             )
 
     # Save final weights
     if rank == 0:
-        save_adapter(model, args.adapter_file)
+        if checkpoint is not None:
+            checkpoint.save(Path(args.adapter_file), lambda path: save_adapter(model, path))
+        else:
+            save_adapter(model, args.adapter_file)
         print(
             f"{Colors.OKGREEN}Saved final adapter weights to {args.adapter_file}.{Colors.ENDC}"
         )

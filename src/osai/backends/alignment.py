@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,7 @@ from ..alignment import (
     preference_loss,
     reward_advantages,
 )
+from ..checkpoints import CheckpointPublisher
 from ..config import ModelFormat, TrainingConfig
 from ..errors import ConfigurationError, DependencyError, TrainingError, VerificationError
 from ..formats import inspect_model
@@ -128,6 +130,7 @@ def align_mlx(
         "optimizer": options.optimizer,
         "max_seq_length": options.max_seq_length,
         "batch_size": options.batch_size,
+        "save_every": config.save_every,
     }
     atomic_json(layout.work / "mlx_alignment.json", runner_config)
     manifest = _manifest(
@@ -152,8 +155,27 @@ def align_mlx(
             "-n", str(workers), "--backend", "nccl", "--hosts", "127.0.0.1",
             "--python", str(backend.python), "--", *command[1:],
         ]
+    checkpoint_dir = layout.root / "outputs" / "checkpoint"
+    (checkpoint_dir / "adapter").mkdir(parents=True, exist_ok=True)
+    checkpoint_environment = backend.environment()
+    checkpoint_environment.update(
+        OSAI_CHECKPOINT_REQUEST=os.environ.get(
+            "OSAI_CHECKPOINT_REQUEST", str(layout.root / "checkpoint.request")
+        ),
+        OSAI_CHECKPOINT_OUTPUT=str(checkpoint_dir / "adapter" / "adapters.safetensors"),
+        OSAI_CHECKPOINT_ACK=str(checkpoint_dir / "last.ack"),
+    )
     try:
-        run_logged(command, log_path=layout.logs / "alignment.log", env=backend.environment())
+        with CheckpointPublisher(
+            kind="mlx",
+            model=base.path,
+            latest=checkpoint_dir / "adapter" / "adapters.safetensors",
+        ):
+            run_logged(
+                command,
+                log_path=layout.logs / "alignment.log",
+                env=checkpoint_environment,
+            )
         adapter_file = adapter_dir / "adapters.safetensors"
         result_file = adapter_dir / "alignment_result.json"
         if not adapter_file.is_file() or not result_file.is_file():
@@ -361,17 +383,23 @@ def align_gguf(
                 if item.rejected is not None:
                     weights.append(-dpr)
                 next_path = layout.work / f"alignment-{step}-{index}.gguf"
-                training_accelerator = _native_alignment_step(
-                    binary,
-                    base.path,
-                    current_path,
-                    _pair_corpus(layout, corpora[index], step, index),
-                    next_path,
-                    eval_options,
-                    weights,
-                    training_accelerator,
-                    layout.logs / f"backprop-{step}-{index}.log",
-                )
+                with CheckpointPublisher(
+                    kind="gguf",
+                    model=base.path,
+                    shards=base.shards,
+                    latest=layout.root / "outputs" / "checkpoint" / "adapter" / "last.gguf",
+                ):
+                    training_accelerator = _native_alignment_step(
+                        binary,
+                        base.path,
+                        current_path,
+                        _pair_corpus(layout, corpora[index], step, index),
+                        next_path,
+                        eval_options,
+                        weights,
+                        training_accelerator,
+                        layout.logs / f"backprop-{step}-{index}.log",
+                    )
                 current_path = next_path
             losses.append(score(current_path))
             atomic_json(
@@ -512,6 +540,17 @@ def _native_alignment_step(
     environment["OSAI_EXAMPLE_WEIGHTS"] = ",".join(
         format(value, ".17g") for value in weights
     )
+    checkpoint_dir = output.parent.parent / "outputs" / "checkpoint"
+    (checkpoint_dir / "adapter").mkdir(parents=True, exist_ok=True)
+    checkpoint_output = checkpoint_dir / "adapter" / "last.gguf"
+    checkpoint_request = Path(
+        os.environ.get("OSAI_CHECKPOINT_REQUEST", str(output.parent.parent / "checkpoint.request"))
+    )
+    checkpoint_ack = checkpoint_dir / "last.ack"
+    environment["OSAI_CHECKPOINT_REQUEST"] = str(checkpoint_request)
+    environment["OSAI_CHECKPOINT_OUTPUT"] = str(checkpoint_output)
+    environment["OSAI_CHECKPOINT_ACK"] = str(checkpoint_ack)
+    environment["OSAI_CHECKPOINT_INTERVAL_SECONDS"] = "300"
     command = _gradient_command(
         binary, model, adapter, corpus, output, settings, accelerator
     )
@@ -528,6 +567,25 @@ def _native_alignment_step(
         accelerator = Accelerator.CPU
     if not output.is_file() or output.stat().st_size == 0:
         raise TrainingError(f"llama.cpp did not save an aligned adapter; see {log_path}")
+    pending = checkpoint_output.with_name("last.gguf.pending")
+    shutil.copyfile(output, pending)
+    os.replace(pending, checkpoint_output)
+    token = (
+        checkpoint_request.read_text(encoding="utf-8").strip()
+        if checkpoint_request.is_file()
+        else ""
+    )
+    if token and (
+        not checkpoint_ack.is_file()
+        or checkpoint_ack.read_text(encoding="utf-8").strip() != token
+    ):
+        pending_ack = checkpoint_ack.with_name("last.ack.pending")
+        pending_ack.write_text(token + "\n", encoding="utf-8")
+        os.replace(pending_ack, checkpoint_ack)
+    print(
+        f"osai: checkpoint saved path={checkpoint_output} generation={token or 'auto'}",
+        flush=True,
+    )
     return accelerator
 
 

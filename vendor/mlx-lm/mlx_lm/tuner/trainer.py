@@ -1,6 +1,7 @@
 # Copyright © 2024 Apple Inc.
 
 
+import os
 import time
 from dataclasses import dataclass, field
 from functools import partial
@@ -271,6 +272,11 @@ def train(
     trained_tokens = 0
     train_time = 0
     grad_accum = None
+    checkpoint = None
+    if os.environ.get("OSAI_CHECKPOINT_OUTPUT"):
+        from osai.checkpoints import LatestCheckpoint
+
+        checkpoint = LatestCheckpoint()
 
     ui = TrainUI(args.iters, rank=rank)
     with ui:
@@ -369,16 +375,35 @@ def train(
                 train_time = 0
 
             # Save adapter weights
-            if it % args.steps_per_save == 0 and rank == 0:
+            if checkpoint is not None and rank == 0 and it % grad_accum_steps == 0:
+                due, generation = checkpoint.due(
+                    it // grad_accum_steps, args.steps_per_save
+                )
+                if due:
+                    adapter_weights = dict(tree_flatten(model.trainable_parameters()))
+                    checkpoint.save(
+                        Path(args.adapter_file),
+                        lambda path, current_weights=adapter_weights: mx.save_safetensors(
+                            str(path), current_weights
+                        ),
+                        generation,
+                    )
+            elif checkpoint is None and it % args.steps_per_save == 0 and rank == 0:
                 adapter_weights = dict(tree_flatten(model.trainable_parameters()))
                 mx.save_safetensors(str(args.adapter_file), adapter_weights)
-                checkpoint = (
+                checkpoint_file = (
                     Path(args.adapter_file).parent / f"{it:07d}_adapters.safetensors"
                 )
-                mx.save_safetensors(str(checkpoint), adapter_weights)
-                ui.report_save(checkpoint)
+                mx.save_safetensors(str(checkpoint_file), adapter_weights)
+                ui.report_save(checkpoint_file)
 
     # Save final weights
     if rank == 0:
         adapter_weights = dict(tree_flatten(model.trainable_parameters()))
-        mx.save_safetensors(str(args.adapter_file), adapter_weights)
+        if checkpoint is not None:
+            checkpoint.save(
+                Path(args.adapter_file),
+                lambda path: mx.save_safetensors(str(path), adapter_weights),
+            )
+        else:
+            mx.save_safetensors(str(args.adapter_file), adapter_weights)

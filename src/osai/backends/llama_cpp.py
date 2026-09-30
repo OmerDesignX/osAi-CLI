@@ -65,6 +65,7 @@ def build_llama_cpp(
         raise DependencyError("build jobs must be at least 1")
     build = build_dir or llama_runtime_build()
     build.mkdir(parents=True, exist_ok=True)
+    _repair_stale_ninja_cache(build)
     (build / "OSAI_BUILD.json").unlink(missing_ok=True)
     destination = Path(log_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -231,6 +232,45 @@ def _cmake_executable() -> str | None:
         return candidate
     sibling = Path(sys.executable).parent / ("cmake.exe" if os.name == "nt" else "cmake")
     return str(sibling) if sibling.is_file() else None
+
+
+def _repair_stale_ninja_cache(build: Path) -> None:
+    """A cached Vulkan shader build may refer to a removed app build tool."""
+
+    cache = (
+        build
+        / "ggml"
+        / "src"
+        / "ggml-vulkan"
+        / "vulkan-shaders-gen-prefix"
+        / "src"
+        / "vulkan-shaders-gen-build"
+        / "CMakeCache.txt"
+    )
+    if not cache.is_file():
+        return
+    contents = cache.read_text(encoding="utf-8", errors="replace")
+    for line in contents.splitlines():
+        if not line.startswith("CMAKE_MAKE_PROGRAM:"):
+            continue
+        key, _, configured = line.partition("=")
+        if Path(configured).is_file() or shutil.which(configured):
+            return
+        ninja = shutil.which("ninja")
+        if not ninja:
+            sibling = Path(sys.executable).parent / (
+                "ninja.exe" if os.name == "nt" else "ninja"
+            )
+            ninja = str(sibling) if sibling.is_file() else None
+        if ninja:
+            pending = cache.with_name("CMakeCache.txt.pending")
+            pending.write_text(
+                contents.replace(line, f"{key}={Path(ninja).as_posix()}", 1),
+                encoding="utf-8",
+            )
+            os.replace(pending, cache)
+            print("osai: repaired stale Ninja path in Vulkan build cache", flush=True)
+        return
 
 
 def _configure(

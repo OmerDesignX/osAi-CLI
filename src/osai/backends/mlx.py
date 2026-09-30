@@ -13,6 +13,7 @@ import sys
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from ..checkpoints import CheckpointPublisher
 from ..config import TrainingConfig
 from ..dataset import prepare_mlx_dataset, validate_dataset
 from ..errors import ConfigurationError, DependencyError, TrainingError
@@ -199,6 +200,18 @@ class MlxBackend:
             flush=True,
         )
         adapter_dir = layout.adapters / "mlx"
+        checkpoint_dir = layout.root / "outputs" / "checkpoint"
+        (checkpoint_dir / "adapter").mkdir(parents=True, exist_ok=True)
+        checkpoint_environment = self.environment()
+        checkpoint_environment.update(
+            OSAI_CHECKPOINT_REQUEST=os.environ.get(
+                "OSAI_CHECKPOINT_REQUEST", str(layout.root / "checkpoint.request")
+            ),
+            OSAI_CHECKPOINT_OUTPUT=str(
+                checkpoint_dir / "adapter" / "adapters.safetensors"
+            ),
+            OSAI_CHECKPOINT_ACK=str(checkpoint_dir / "last.ack"),
+        )
         log_path = layout.logs / "train.log"
         log_path.unlink(missing_ok=True)
 
@@ -286,7 +299,14 @@ class MlxBackend:
             )
             attempt_offset = log_path.stat().st_size if log_path.exists() else 0
             try:
-                result = run_logged(command, log_path=log_path, env=self.environment())
+                with CheckpointPublisher(
+                    kind="mlx",
+                    model=config.training_model,
+                    latest=checkpoint_dir / "adapter" / "adapters.safetensors",
+                ):
+                    result = run_logged(
+                        command, log_path=log_path, env=checkpoint_environment
+                    )
                 elapsed += result.elapsed_seconds
                 break
             except TrainingError:

@@ -11,15 +11,112 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <chrono>
+#include <filesystem>
+#include <fstream>
+#include <system_error>
 #include <limits>
 #include <numeric>
 #include <sstream>
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267)  // possible loss of data
 #endif
+
+struct osai_checkpoint_state {
+    llama_adapter_lora * adapter = nullptr;
+    std::string request_path;
+    std::string output_path;
+    std::string ack_path;
+    std::string generation;
+    std::chrono::steady_clock::time_point last_save = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point next_poll = std::chrono::steady_clock::now();
+    int interval_seconds = 300;
+};
+
+static osai_checkpoint_state osai_checkpoint;
+
+static bool osai_replace_file(const std::filesystem::path & source, const std::filesystem::path & target) {
+#if defined(_WIN32)
+    return MoveFileExW(source.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    std::error_code error;
+    std::filesystem::rename(source, target, error);
+    return !error;
+#endif
+}
+
+static bool osai_save_checkpoint(const std::string & generation) {
+    const std::filesystem::path output(osai_checkpoint.output_path);
+    const std::filesystem::path temporary(osai_checkpoint.output_path + ".pending");
+    std::error_code error;
+    std::filesystem::remove(temporary, error);
+    if (llama_adapter_lora_save_to_file(osai_checkpoint.adapter, temporary.string().c_str()) != 0 ||
+            !osai_replace_file(temporary, output)) {
+        LOG_ERR("osai: checkpoint failed path=%s\n", output.string().c_str());
+        return false;
+    }
+    if (!generation.empty() && !osai_checkpoint.ack_path.empty()) {
+        const std::filesystem::path ack(osai_checkpoint.ack_path);
+        const std::filesystem::path pending(osai_checkpoint.ack_path + ".pending");
+        {
+            std::ofstream stream(pending, std::ios::trunc);
+            stream << generation << '\n';
+            stream.flush();
+            if (!stream.good()) {
+                LOG_ERR("osai: checkpoint acknowledgement failed\n");
+                return false;
+            }
+        }
+        if (!osai_replace_file(pending, ack)) {
+            LOG_ERR("osai: checkpoint acknowledgement failed\n");
+            return false;
+        }
+    }
+    osai_checkpoint.last_save = std::chrono::steady_clock::now();
+    LOG_INF("osai: checkpoint saved path=%s generation=%s\n",
+            output.string().c_str(), generation.empty() ? "auto" : generation.c_str());
+    return true;
+}
+
+static void osai_checkpoint_callback(
+        bool train, ggml_opt_context_t opt_ctx, ggml_opt_dataset_t dataset,
+        ggml_opt_result_t result, int64_t ibatch, int64_t ibatch_max, int64_t t_start_us) {
+    ggml_opt_epoch_callback_progress_bar(train, opt_ctx, dataset, result, ibatch, ibatch_max, t_start_us);
+    if (!train || osai_checkpoint.adapter == nullptr || osai_checkpoint.output_path.empty()) {
+        return;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now < osai_checkpoint.next_poll) {
+        return;
+    }
+    osai_checkpoint.next_poll = now + std::chrono::seconds(1);
+    std::string generation;
+    if (!osai_checkpoint.request_path.empty()) {
+        std::ifstream stream(osai_checkpoint.request_path);
+        std::getline(stream, generation);
+        if (generation.size() > 128) {
+            generation.clear();
+        }
+    }
+    const bool requested = !generation.empty() && generation != osai_checkpoint.generation;
+    const bool due = osai_checkpoint.interval_seconds > 0 &&
+            now - osai_checkpoint.last_save >= std::chrono::seconds(osai_checkpoint.interval_seconds);
+    if ((requested || due) && osai_save_checkpoint(requested ? generation : "")) {
+        if (requested) {
+            osai_checkpoint.generation = generation;
+        }
+    }
+}
 
 static bool lora_param_filter(const ggml_tensor * tensor, void * userdata) {
     GGML_UNUSED(userdata);
@@ -453,17 +550,39 @@ int main(int argc, char ** argv) {
     }
     double best_train_loss = std::numeric_limits<double>::infinity();
     bool saved_best_adapter = false;
+    if (adapter_only) {
+        const char * output = std::getenv("OSAI_CHECKPOINT_OUTPUT");
+        if (output != nullptr && output[0] != '\0') {
+            osai_checkpoint.adapter = llama_init->lora().front().get();
+            osai_checkpoint.output_path = output;
+            if (const char * request = std::getenv("OSAI_CHECKPOINT_REQUEST")) {
+                osai_checkpoint.request_path = request;
+            }
+            if (const char * ack = std::getenv("OSAI_CHECKPOINT_ACK")) {
+                osai_checkpoint.ack_path = ack;
+                std::ifstream stream(osai_checkpoint.ack_path);
+                std::getline(stream, osai_checkpoint.generation);
+            }
+            if (const char * interval = std::getenv("OSAI_CHECKPOINT_INTERVAL_SECONDS")) {
+                const long parsed = std::strtol(interval, nullptr, 10);
+                if (parsed >= 0 && parsed <= 86400) {
+                    osai_checkpoint.interval_seconds = static_cast<int>(parsed);
+                }
+            }
+            osai_checkpoint.last_save = std::chrono::steady_clock::now();
+        }
+    }
 
     for (lr.epoch = 0; lr.epoch < lr.epochs; ++lr.epoch) {
         if (weighted_alignment) {
             llama_opt_epoch_weighted(
                     ctx, dataset, result_train, result_eval, idata_split,
                     example_weights.data(), label_counts.data(),
-                    ggml_opt_epoch_callback_progress_bar,
+                    osai_checkpoint_callback,
                     ggml_opt_epoch_callback_progress_bar);
         } else {
             llama_opt_epoch(ctx, dataset, result_train, result_eval, idata_split,
-                            ggml_opt_epoch_callback_progress_bar,
+                            osai_checkpoint_callback,
                             ggml_opt_epoch_callback_progress_bar);
         }
         fprintf(stderr, "\n");
@@ -506,6 +625,17 @@ int main(int argc, char ** argv) {
         }
     } else {
         llama_model_save_to_file(model, params.out_file.c_str());
+    }
+    if (adapter_only && osai_checkpoint.adapter != nullptr) {
+        std::string generation;
+        if (!osai_checkpoint.request_path.empty()) {
+            std::ifstream stream(osai_checkpoint.request_path);
+            std::getline(stream, generation);
+            if (generation.size() > 128 || generation == osai_checkpoint.generation) {
+                generation.clear();
+            }
+        }
+        osai_save_checkpoint(generation);
     }
 
     ggml_opt_dataset_free(dataset);
