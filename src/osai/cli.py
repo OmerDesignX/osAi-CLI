@@ -19,6 +19,7 @@ from .backends.llama_cpp import build_llama_cpp, validate_adapter
 from .backends.llama_gradient import LlamaGradientOptions, train_gradient_gguf
 from .backends.llama_utils import gguf_adapter_training_shape
 from .bundle import verify_model_bundle
+from .calibration import calibrate_training
 from .catalog import ModelTier, bundled_root, list_catalog, resolve_model
 from .config import ModelFormat, TrainingConfig
 from .dataset import validate_dataset
@@ -399,6 +400,49 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark_parser.add_argument("--refresh", action="store_true")
     benchmark_parser.set_defaults(handler=_auto_benchmark)
 
+    calibration_parser = subparsers.add_parser(
+        "calibrate", help="run a bounded training pilot on the selected local dataset"
+    )
+    calibration_source = calibration_parser.add_mutually_exclusive_group(required=True)
+    calibration_source.add_argument("--tier", choices=[tier.value for tier in ModelTier])
+    calibration_source.add_argument("--custom", dest="custom_model")
+    calibration_parser.add_argument(
+        "--model-version", choices=MODEL_VERSIONS, default=DEFAULT_MODEL_VERSION
+    )
+    calibration_parser.add_argument("--data", required=True, type=Path)
+    calibration_parser.add_argument(
+        "--engine", choices=[engine.value for engine in Engine], default="auto"
+    )
+    calibration_parser.add_argument(
+        "--accelerator", choices=[value.value for value in Accelerator], default="auto"
+    )
+    calibration_parser.add_argument("--multi-gpu", choices=["auto", "on", "off"], default="auto")
+    calibration_parser.add_argument("--device", action="append", dest="devices")
+    calibration_parser.add_argument("--optimizer", choices=["auto", "sgd", "adamw"], default="auto")
+    calibration_parser.add_argument("--scale", type=float, default=4.0)
+    calibration_parser.add_argument("--dropout", type=float, default=0.0)
+    calibration_parser.add_argument("--seed", type=int, default=0)
+    calibration_parser.add_argument("--grad-accumulation-steps", type=int, default=1)
+    calibration_parser.add_argument(
+        "--gradient-checkpointing", action=argparse.BooleanOptionalAction, default=True
+    )
+    calibration_parser.add_argument(
+        "--mask-prompt", action=argparse.BooleanOptionalAction, default=True
+    )
+    calibration_parser.add_argument(
+        "--split-mode", choices=["none", "layer", "row", "tensor"], default="layer"
+    )
+    calibration_parser.add_argument("--tensor-split")
+    calibration_parser.add_argument("--main-gpu", type=int, default=0)
+    calibration_parser.add_argument("--distributed-workers", type=int, default=0)
+    calibration_parser.add_argument("--bundled-root", type=Path)
+    calibration_parser.add_argument("--custom-root", type=Path)
+    calibration_parser.add_argument("--full-content-context", action="store_true")
+    calibration_parser.add_argument(
+        "--download-model", action=argparse.BooleanOptionalAction, default=True
+    )
+    calibration_parser.set_defaults(handler=_calibrate)
+
     devices_parser = subparsers.add_parser(
         "auto-devices", help="list currently available native GPU devices"
     )
@@ -693,6 +737,56 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
     }:
         raise ConfigurationError(
             "MLX supports Metal on macOS and CUDA or CPU on Linux, not MPS or Vulkan"
+        )
+    if args.auto_settings and args.learning_rate is None and not args.config:
+        model_path = config.training_model if engine is Engine.MLX else config.model
+        expected = ModelFormat.MLX if engine is Engine.MLX else ModelFormat.GGUF
+        inspected = inspect_model(model_path, expected)
+        benchmark = benchmark_auto_settings(
+            inspected,
+            engine=engine,
+            accelerator=args.accelerator,
+            multi_gpu=config.multi_gpu,
+            devices=config.devices,
+            adapter=_embedded_adapter(config.model, engine),
+        )
+        if config.max_seq_length != benchmark.settings.max_seq_length:
+            benchmark = replace(
+                benchmark,
+                settings=replace(benchmark.settings, max_seq_length=config.max_seq_length),
+            )
+        calibrated = calibrate_training(
+            model_path,
+            inspected,
+            config.data,
+            benchmark,
+            engine=engine,
+            multi_gpu=config.multi_gpu,
+            optimizer=selected_optimizer,
+            scale=config.scale,
+            dropout=config.dropout,
+            seed=config.seed,
+            grad_checkpoint=config.grad_checkpoint,
+            grad_accumulation_steps=config.grad_accumulation_steps,
+            mask_prompt=config.mask_prompt,
+            split_mode=config.split_mode,
+            tensor_split=config.tensor_split,
+            main_gpu=config.main_gpu,
+            distributed_workers=config.distributed_workers,
+            require_full_context=args.full_content_context,
+        )
+        config = replace(
+            config,
+            learning_rate=calibrated.learning_rate,
+            max_seq_length=min(config.max_seq_length, calibrated.settings.max_seq_length),
+            batch_size=min(config.batch_size, calibrated.settings.batch_size),
+            gguf_batch_size=min(config.gguf_batch_size, calibrated.settings.gguf_batch_size),
+        )
+        print(
+            f"osai: calibrated learning rate={calibrated.learning_rate:.2e} "
+            f"pilot_loss={calibrated.first_loss:.4f}->{calibrated.last_loss:.4f}",
+            file=sys.stderr,
+            flush=True,
         )
     if engine is Engine.MLX:
         try:
@@ -1317,6 +1411,72 @@ def _auto_benchmark(args: argparse.Namespace) -> int:
                 target_modules=targets,
             ),
         )
+    _print_json(result.as_dict())
+    return 0
+
+
+def _calibrate(args: argparse.Namespace) -> int:
+    selection = _resolve_cli_model(args)
+    expected = ModelFormat.MLX if selection.engine is Engine.MLX else ModelFormat.GGUF
+    model_path = (
+        selection.companion_mlx or selection.model
+        if selection.engine is Engine.MLX
+        else selection.model
+    )
+    inspected = inspect_model(model_path, expected)
+    print(
+        "osai: calibration phase=hardware detail=Checking model and devices",
+        file=sys.stderr,
+        flush=True,
+    )
+    benchmark = benchmark_auto_settings(
+        inspected,
+        engine=selection.engine,
+        accelerator=args.accelerator,
+        multi_gpu=args.multi_gpu,
+        devices=tuple(args.devices or ()),
+        adapter=_embedded_adapter(selection.model, selection.engine),
+    )
+    if args.full_content_context:
+        print(
+            "osai: calibration phase=context detail=Scanning the largest record",
+            file=sys.stderr,
+            flush=True,
+        )
+        maximum = largest_training_context(
+            args.data,
+            model_path if selection.engine is Engine.MLX else model_path.parent,
+            gguf_model=model_path if selection.engine is Engine.LLAMA_CPP else None,
+        )
+        if inspected.context_length and maximum["context"] > inspected.context_length:
+            raise ConfigurationError(
+                f"Full context needs {maximum['context']} tokens, above this model's "
+                f"{inspected.context_length}-token limit; choose Windowing"
+            )
+        benchmark = replace(
+            benchmark,
+            settings=replace(benchmark.settings, max_seq_length=maximum["context"]),
+        )
+    result = calibrate_training(
+        model_path,
+        inspected,
+        args.data,
+        benchmark,
+        engine=selection.engine,
+        multi_gpu=args.multi_gpu,
+        optimizer=args.optimizer,
+        scale=args.scale,
+        dropout=args.dropout,
+        seed=args.seed,
+        grad_checkpoint=args.gradient_checkpointing,
+        grad_accumulation_steps=args.grad_accumulation_steps,
+        mask_prompt=args.mask_prompt,
+        split_mode=args.split_mode,
+        tensor_split=_parse_tensor_split(args.tensor_split),
+        main_gpu=args.main_gpu,
+        distributed_workers=args.distributed_workers,
+        require_full_context=args.full_content_context,
+    )
     _print_json(result.as_dict())
     return 0
 

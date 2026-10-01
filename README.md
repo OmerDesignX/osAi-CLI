@@ -502,7 +502,7 @@ directly to alignment.
 | `--tensor-split LIST` | Comma-separated llama.cpp device proportions, such as `3,1`. |
 | `--main-gpu N` | llama.cpp main GPU index. Default: `0`. |
 | `--distributed-workers N` | MLX Linux CUDA/NCCL worker count. `0` chooses a safe count. |
-| `--auto-settings`, `--no-auto-settings` | Benchmark the selected model on this hardware, then choose memory-bounded context, batch size, LoRA rank/layers/targets, and threads. Disabled by default; explicit tuning flags override its choices. |
+| `--auto-settings`, `--no-auto-settings` | Benchmark the selected model on this hardware, then choose memory-bounded context, batch size, LoRA rank/layers/targets, and threads. With no explicit learning rate, fine-tuning also calibrates a short local dataset sample before the full run. Disabled by default; explicit tuning flags override its choices. |
 | `--epochs N` | Complete passes over the fine-tuning dataset on MLX or llama.cpp. Default: `1`. |
 | `--iterations N` | Compatibility alias for `--epochs`. |
 | `--batch-size N` | MLX training batch size. Default: `1`. |
@@ -557,6 +557,7 @@ directly to alignment.
 | `select` | `--custom-root PATH` | Override the custom-model directory. |
 | `auto-devices` | `--accelerator auto\|metal\|cuda\|vulkan\|cpu` | List currently available native GPU devices without loading a model. |
 | `auto-benchmark` | `--tier` or `--custom`, plus model and accelerator options | Run the local inference probe and print selected training settings as JSON. `--refresh` bypasses the cache. |
+| `calibrate` | `--tier` or `--custom`, `--data`, plus model and accelerator options | Sample short excerpts across the selected files locally, test cautious learning rates from the same starting model, and print a measured rate and fitted settings as JSON. Full training uses the original records. A falling pilot loss does not guarantee a monotonic full run. |
 | `export-gguf` | `--adapter PATH` | Source MLX adapter directory. Required. |
 | `export-gguf` | `--base PATH` | Matching GGUF base model. Required. |
 | `export-gguf` | `--output PATH` | Destination GGUF adapter file. Required. |
