@@ -35,13 +35,15 @@ def run_logged(
     destination = Path(log_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
     started = time.monotonic()
+    child_env = dict(env) if env is not None else os.environ.copy()
+    child_env["PYTHONIOENCODING"] = "utf-8"
     with destination.open("a", encoding="utf-8", buffering=1) as log:
         _write_command(log, argv)
         try:
             process = subprocess.Popen(
                 argv,
                 cwd=os.fspath(cwd) if cwd is not None else None,
-                env=dict(env) if env is not None else None,
+                env=child_env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -68,10 +70,18 @@ def run_logged(
                     # Windows terminals may still use cp1252 while llama.cpp
                     # prints Unicode progress characters. Keep the complete
                     # UTF-8 log and replace only unrepresentable console glyphs.
-                    encoding = sys.stdout.encoding or "utf-8"
                     visible = output_prefix + line
-                    sys.stdout.write(visible.encode(encoding, errors="replace").decode(encoding))
-                    sys.stdout.flush()
+                    if not sys.stdout.isatty() and hasattr(sys.stdout, "buffer"):
+                        # The app reads this pipe as UTF-8. Keep the native
+                        # trainer's Unicode metrics intact on Windows too.
+                        sys.stdout.buffer.write(visible.encode("utf-8", errors="replace"))
+                        sys.stdout.buffer.flush()
+                    else:
+                        encoding = sys.stdout.encoding or "utf-8"
+                        sys.stdout.write(
+                            visible.encode(encoding, errors="replace").decode(encoding)
+                        )
+                        sys.stdout.flush()
                     continue
                 if process.poll() is not None:
                     break
