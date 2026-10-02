@@ -329,10 +329,6 @@ static ggml_opt_dataset_t assistant_dataset_init(
     }
 
     const int64_t n_ctx = llama_n_ctx(ctx);
-    ggml_opt_dataset_t dataset = ggml_opt_dataset_init(
-            GGML_TYPE_I32, GGML_TYPE_I32, n_ctx, n_ctx, examples.size(), 1);
-    auto * data   = (llama_token *) ggml_opt_dataset_data(dataset)->data;
-    auto * labels = (llama_token *) ggml_opt_dataset_labels(dataset)->data;
 
     llama_token padding = llama_vocab_pad(vocab);
     if (padding == LLAMA_TOKEN_NULL) {
@@ -349,17 +345,24 @@ static ggml_opt_dataset_t assistant_dataset_init(
     n_examples = examples.size();
     label_counts.assign(n_examples, 0);
     backward_batches.assign(n_examples, 0);
+    std::vector<std::vector<int32_t>> compact_labels(n_examples);
+    std::vector<const int32_t *> data_rows(n_examples);
+    std::vector<const int32_t *> label_rows(n_examples);
+    std::vector<int64_t> lengths(n_examples);
+    uint64_t stored_tokens = 0;
     const uint32_t n_ubatch = llama_n_ubatch(ctx);
     for (int64_t idata = 0; idata < n_examples; ++idata) {
-        std::fill(data + idata*n_ctx, data + (idata + 1)*n_ctx, padding);
-        std::fill(labels + idata*n_ctx, labels + (idata + 1)*n_ctx, -1);
-        std::copy(examples[idata].begin(), examples[idata].end(), data + idata*n_ctx);
+        compact_labels[idata].assign(examples[idata].size(), -1);
+        data_rows[idata] = examples[idata].data();
+        label_rows[idata] = compact_labels[idata].data();
+        lengths[idata] = examples[idata].size();
+        stored_tokens += examples[idata].size();
         std::vector<bool> has_labels_by_ubatch(
                 (examples[idata].size() + n_ubatch - 1)/n_ubatch, false);
         for (size_t target = 1; target < examples[idata].size(); ++target) {
             if (train_masks[idata][target]) {
                 const size_t label_index = target - 1;
-                labels[idata*n_ctx + label_index] = examples[idata][target];
+                compact_labels[idata][label_index] = examples[idata][target];
                 ++trained_labels;
                 ++label_counts[idata];
                 has_labels_by_ubatch[label_index/n_ubatch] = true;
@@ -368,6 +371,11 @@ static ggml_opt_dataset_t assistant_dataset_init(
         backward_batches[idata] = std::count(
                 has_labels_by_ubatch.begin(), has_labels_by_ubatch.end(), true);
     }
+    ggml_opt_dataset_t dataset = ggml_opt_dataset_init_ragged_i32(
+            n_ctx, n_examples, data_rows.data(), label_rows.data(), lengths.data(), padding);
+    LOG_INF("osai: adaptive record storage kept %" PRIu64 " tokens across %" PRId64
+            " examples; padding is materialized only for each active batch\n",
+            stored_tokens, n_examples);
     return dataset;
 }
 
@@ -502,6 +510,9 @@ int main(int argc, char ** argv) {
         }
         dataset = common_opt_dataset_init(ctx, tokens, llama_n_ctx(ctx) / 2);
     }
+    // The tokenized dataset owns the examples now; do not keep the raw corpus
+    // in memory for the entire training run.
+    std::string().swap(params.prompt);
 
     struct lr_opt & lr = params.lr;
     LOG_INF("-optimizer %s -lr0 %.2g -wd %.2g -lr-min %.2g -min-epochs %.2g -epochs %d -period %.2g -val %.2g\n",

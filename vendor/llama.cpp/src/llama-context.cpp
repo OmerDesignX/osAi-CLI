@@ -3647,8 +3647,6 @@ void llama_context::opt_epoch_weighted(
     GGML_ASSERT(idata_split >= 0);
     GGML_ASSERT(idata_split <= ndata);
 
-    const uint32_t ubatch_per_ctx = n_ctx / n_ubatch;
-
     struct llama_batch batch = llama_batch_init(n_batch, 0, 1);
     std::vector<llama_token>        tokens(n_ctx);
     std::vector<llama_token> labels_sparse(n_ctx);
@@ -3656,10 +3654,13 @@ void llama_context::opt_epoch_weighted(
     int64_t idata = 0;
 
     int64_t t_loop_start = ggml_time_us();
-    int64_t ndata_in_loop = idata_split*ubatch_per_ctx;
+    int64_t ndata_in_loop = 0;
+    for (int64_t i = 0; i < idata_split; ++i) {
+        ndata_in_loop += ggml_opt_dataset_active_ubatches(dataset, i, n_ubatch);
+    }
+    int64_t idata_in_loop = 0;
     for (; idata < idata_split; ++idata) {
         constexpr bool train = true;
-        const int64_t idata_in_loop = idata*ubatch_per_ctx;
 
         ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), idata);
         opt_epoch_iter(dataset, result_train, tokens, labels_sparse, batch,
@@ -3667,13 +3668,17 @@ void llama_context::opt_epoch_weighted(
             example_weights ? example_weights[idata] : 1.0f,
             label_counts ? label_counts[idata] : 0,
             idata_in_loop, ndata_in_loop, t_loop_start);
+        idata_in_loop += ggml_opt_dataset_active_ubatches(dataset, idata, n_ubatch);
     }
 
     t_loop_start = ggml_time_us();
-    ndata_in_loop = (ndata - idata_split)*ubatch_per_ctx;
+    ndata_in_loop = 0;
+    for (int64_t i = idata_split; i < ndata; ++i) {
+        ndata_in_loop += ggml_opt_dataset_active_ubatches(dataset, i, n_ubatch);
+    }
+    idata_in_loop = 0;
     for (; idata < ndata; ++idata) {
         constexpr bool train = false;
-        const int64_t idata_in_loop = (idata - idata_split)*ubatch_per_ctx;
 
         ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), idata);
         opt_epoch_iter(dataset, result_eval, tokens, labels_sparse, batch,
@@ -3681,6 +3686,7 @@ void llama_context::opt_epoch_weighted(
             example_weights ? example_weights[idata] : 1.0f,
             label_counts ? label_counts[idata] : 0,
             idata_in_loop, ndata_in_loop, t_loop_start);
+        idata_in_loop += ggml_opt_dataset_active_ubatches(dataset, idata, n_ubatch);
     }
 
     llama_batch_free(batch);

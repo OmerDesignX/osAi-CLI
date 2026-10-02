@@ -43,12 +43,26 @@ extern "C" {
             int64_t        ne_label,     // number of elements per label
             int64_t        ndata,        // total number of datapoints/labels
             int64_t        ndata_shard); // number of datapoints/labels per shard (unit at which the dataset is shuffled/copied)
+    // Store variable-length int32 records compactly. Each record is padded to
+    // ne_datapoint only when copied into a training batch. The raw dataset
+    // tensors are unavailable; read records through the get_batch functions.
+    GGML_API ggml_opt_dataset_t ggml_opt_dataset_init_ragged_i32(
+            int64_t               ne_datapoint,
+            int64_t               ndata,
+            const int32_t * const * data,
+            const int32_t * const * labels,
+            const int64_t        * lengths,
+            int32_t                padding);
     GGML_API void ggml_opt_dataset_free(ggml_opt_dataset_t dataset);
 
     // get underlying tensors that store the data
     GGML_API int64_t              ggml_opt_dataset_ndata (ggml_opt_dataset_t dataset);
     GGML_API struct ggml_tensor * ggml_opt_dataset_data  (ggml_opt_dataset_t dataset); // shape = [ne_datapoint, ndata]
     GGML_API struct ggml_tensor * ggml_opt_dataset_labels(ggml_opt_dataset_t dataset); // shape = [nd_label,     ndata]
+    // Number of microbatches that contain input through the last supervised
+    // label in one record, in the current shuffled order.
+    GGML_API int64_t ggml_opt_dataset_active_ubatches(
+            ggml_opt_dataset_t dataset, int64_t idata, int64_t n_ubatch);
 
     // shuffle idata first datapoints from dataset with RNG from opt_ctx, shuffle all datapoints if idata is negative
     GGML_API void ggml_opt_dataset_shuffle(ggml_opt_context_t opt_ctx, ggml_opt_dataset_t dataset, int64_t idata);

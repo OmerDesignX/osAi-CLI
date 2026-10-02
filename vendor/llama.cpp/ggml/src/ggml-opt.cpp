@@ -25,6 +25,12 @@ struct ggml_opt_dataset {
     size_t  nbs_labels  = -1;
 
     std::vector<int64_t> permutation;
+    bool ragged_i32 = false;
+    int32_t ragged_padding = 0;
+    std::vector<size_t> ragged_offsets;
+    std::vector<int64_t> ragged_active_lengths;
+    std::vector<int32_t> ragged_data;
+    std::vector<int32_t> ragged_labels;
 };
 
 struct ggml_opt_context {
@@ -129,9 +135,58 @@ ggml_opt_dataset_t ggml_opt_dataset_init(
     return result;
 }
 
+ggml_opt_dataset_t ggml_opt_dataset_init_ragged_i32(
+        int64_t               ne_datapoint,
+        int64_t               ndata,
+        const int32_t * const * data,
+        const int32_t * const * labels,
+        const int64_t        * lengths,
+        int32_t                padding) {
+    GGML_ASSERT(ne_datapoint > 0 && ndata > 0);
+    GGML_ASSERT(data && labels && lengths);
+    GGML_ASSERT(uint64_t(ne_datapoint) <= SIZE_MAX / sizeof(int32_t));
+    auto * result = new ggml_opt_dataset;
+    result->ndata = ndata;
+    result->ndata_shard = 1;
+    result->nbs_data = size_t(ne_datapoint) * sizeof(int32_t);
+    result->nbs_labels = result->nbs_data;
+    result->ragged_i32 = true;
+    result->ragged_padding = padding;
+    result->ragged_offsets.reserve(size_t(ndata) + 1);
+    result->ragged_active_lengths.reserve(size_t(ndata));
+    result->ragged_offsets.push_back(0);
+    result->permutation.reserve(size_t(ndata));
+    size_t stored = 0;
+    for (int64_t i = 0; i < ndata; ++i) {
+        GGML_ASSERT(lengths[i] > 0 && lengths[i] <= ne_datapoint);
+        GGML_ASSERT(size_t(lengths[i]) <= SIZE_MAX - stored);
+        stored += size_t(lengths[i]);
+    }
+    result->ragged_data.reserve(stored);
+    result->ragged_labels.reserve(stored);
+    for (int64_t i = 0; i < ndata; ++i) {
+        GGML_ASSERT(data[i] && labels[i]);
+        const size_t length = size_t(lengths[i]);
+        result->ragged_data.insert(result->ragged_data.end(), data[i], data[i] + length);
+        result->ragged_labels.insert(result->ragged_labels.end(), labels[i], labels[i] + length);
+        size_t active_length = length;
+        while (active_length > 0 && labels[i][active_length - 1] < 0) {
+            --active_length;
+        }
+        result->ragged_active_lengths.push_back(int64_t(active_length));
+        result->ragged_offsets.push_back(result->ragged_data.size());
+        result->permutation.push_back(i);
+    }
+    return result;
+}
+
 void ggml_opt_dataset_free(ggml_opt_dataset_t dataset) {
-    ggml_backend_buffer_free(dataset->buf);
-    ggml_free(dataset->ctx);
+    if (dataset->buf) {
+        ggml_backend_buffer_free(dataset->buf);
+    }
+    if (dataset->ctx) {
+        ggml_free(dataset->ctx);
+    }
     delete dataset;
 }
 
@@ -145,6 +200,17 @@ struct ggml_tensor * ggml_opt_dataset_data(ggml_opt_dataset_t dataset) {
 
 struct ggml_tensor * ggml_opt_dataset_labels(ggml_opt_dataset_t dataset) {
     return dataset->labels;
+}
+
+int64_t ggml_opt_dataset_active_ubatches(ggml_opt_dataset_t dataset, int64_t idata, int64_t n_ubatch) {
+    GGML_ASSERT(idata >= 0 && idata < dataset->ndata && n_ubatch > 0);
+    if (dataset->ragged_i32) {
+        const size_t index = size_t(dataset->permutation[idata]);
+        const int64_t active = dataset->ragged_active_lengths[index];
+        return (active + n_ubatch - 1)/n_ubatch;
+    }
+    GGML_ASSERT(dataset->data && dataset->data->ne[0] % n_ubatch == 0);
+    return dataset->data->ne[0]/n_ubatch;
 }
 
 void ggml_opt_dataset_shuffle(ggml_opt_context_t opt_ctx, ggml_opt_dataset_t dataset, int64_t idata) {
@@ -163,6 +229,28 @@ void ggml_opt_dataset_shuffle(ggml_opt_context_t opt_ctx, ggml_opt_dataset_t dat
 void ggml_opt_dataset_get_batch(ggml_opt_dataset_t dataset, struct ggml_tensor * data_batch, struct ggml_tensor * labels_batch, int64_t ibatch) {
     GGML_ASSERT(   data_batch && ggml_is_contiguous(data_batch));
     GGML_ASSERT(!labels_batch || ggml_is_contiguous(labels_batch));
+    if (dataset->ragged_i32) {
+        GGML_ASSERT(labels_batch && data_batch->type == GGML_TYPE_I32 && labels_batch->type == GGML_TYPE_I32);
+        const size_t nb_data_batch = ggml_nbytes(data_batch);
+        GGML_ASSERT(nb_data_batch % dataset->nbs_data == 0);
+        const int64_t shards_per_batch = nb_data_batch / dataset->nbs_data;
+        GGML_ASSERT(ggml_nbytes(labels_batch) == nb_data_batch);
+        GGML_ASSERT((ibatch + 1)*shards_per_batch <= int64_t(dataset->permutation.size()));
+        const size_t width = dataset->nbs_data / sizeof(int32_t);
+        std::vector<int32_t> row(width);
+        for (int64_t j = 0; j < shards_per_batch; ++j) {
+            const size_t index = size_t(dataset->permutation[ibatch*shards_per_batch + j]);
+            const size_t begin = dataset->ragged_offsets[index];
+            const size_t length = dataset->ragged_offsets[index + 1] - begin;
+            std::fill(row.begin(), row.end(), dataset->ragged_padding);
+            std::copy_n(dataset->ragged_data.begin() + begin, length, row.begin());
+            ggml_backend_tensor_set(data_batch, row.data(), size_t(j)*dataset->nbs_data, dataset->nbs_data);
+            std::fill(row.begin(), row.end(), -1);
+            std::copy_n(dataset->ragged_labels.begin() + begin, length, row.begin());
+            ggml_backend_tensor_set(labels_batch, row.data(), size_t(j)*dataset->nbs_labels, dataset->nbs_labels);
+        }
+        return;
+    }
     GGML_ASSERT((labels_batch == nullptr) == (dataset->labels == nullptr));
     GGML_ASSERT(                   data_batch->type == dataset->data->type);
     GGML_ASSERT(!labels_batch || labels_batch->type == dataset->labels->type);
@@ -194,6 +282,24 @@ void ggml_opt_dataset_get_batch(ggml_opt_dataset_t dataset, struct ggml_tensor *
 }
 
 void ggml_opt_dataset_get_batch_host(ggml_opt_dataset_t dataset, void * data_batch, size_t nb_data_batch, void * labels_batch, int64_t ibatch) {
+    if (dataset->ragged_i32) {
+        GGML_ASSERT(data_batch && labels_batch && nb_data_batch % dataset->nbs_data == 0);
+        const int64_t shards_per_batch = nb_data_batch / dataset->nbs_data;
+        GGML_ASSERT((ibatch + 1)*shards_per_batch <= int64_t(dataset->permutation.size()));
+        const size_t width = dataset->nbs_data / sizeof(int32_t);
+        auto * tokens = static_cast<int32_t *>(data_batch);
+        auto * targets = static_cast<int32_t *>(labels_batch);
+        for (int64_t j = 0; j < shards_per_batch; ++j) {
+            const size_t index = size_t(dataset->permutation[ibatch*shards_per_batch + j]);
+            const size_t begin = dataset->ragged_offsets[index];
+            const size_t length = dataset->ragged_offsets[index + 1] - begin;
+            std::fill_n(tokens + size_t(j)*width, width, dataset->ragged_padding);
+            std::fill_n(targets + size_t(j)*width, width, -1);
+            std::copy_n(dataset->ragged_data.begin() + begin, length, tokens + size_t(j)*width);
+            std::copy_n(dataset->ragged_labels.begin() + begin, length, targets + size_t(j)*width);
+        }
+        return;
+    }
     GGML_ASSERT((labels_batch == nullptr) == (dataset->labels == nullptr));
     GGML_ASSERT(nb_data_batch % dataset->nbs_data == 0);
 

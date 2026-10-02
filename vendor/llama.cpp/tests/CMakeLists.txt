@@ -296,6 +296,7 @@ target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
   llama_build_and_test(test-opt.cpp)
+  llama_build_and_test(test-osai-ragged.cpp)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
 

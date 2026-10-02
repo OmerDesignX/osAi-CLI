@@ -39,6 +39,12 @@ uses the same one-token overlap between bounded windows, covering every
 supervised answer token. A window sees only its local context; Auto can reduce
 the window size and then batch size after a device-memory failure. The trainer
 reports each attempt and the actual count of tokenized windows.
+Assistant-supervised GGUF training keeps each tokenized record at its own length
+in host memory and pads only the active training batch. Training stops computing
+after the final supervised token in each record. The selected context is still
+the maximum allowed length, and the longest record must fit the model and GPU
+memory; shorter records do not reserve a full-width dataset row for the run.
+Native progress counts the microbatches actually used by those records.
 
 ## Hardware support
 
