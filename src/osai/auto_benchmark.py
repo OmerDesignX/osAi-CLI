@@ -34,7 +34,9 @@ _PROBE_TIMEOUT_SECONDS = 180
 
 
 def _probe_timeout() -> int:
-    return 25 if os.environ.get("OSAI_CALIBRATION_QUICK") == "1" else _PROBE_TIMEOUT_SECONDS
+    # A cold model load can exceed 25 seconds even when the tiny pilot is fast.
+    # Bound a stuck inference process without rejecting healthy calibrations.
+    return _PROBE_TIMEOUT_SECONDS
 
 
 @dataclass(frozen=True, slots=True)

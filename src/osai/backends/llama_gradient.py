@@ -11,7 +11,7 @@ import sys
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -76,6 +76,7 @@ class LlamaGradientOptions:
     tensor_split: tuple[float, ...] = ()
     main_gpu: int = 0
     auto_settings: bool = False
+    calibration_pilot: bool = False
 
     def validate(self) -> None:
         integers = {
@@ -269,7 +270,7 @@ def train_gradient_gguf(
                     repeat_to_minimum=not settings.mask_prompt,
                     record_separator=(structured_separator if settings.mask_prompt else "\n\n"),
                 )
-                if test_source.is_file()
+                if test_source.is_file() and not settings.calibration_pilot
                 else None
             )
 
@@ -283,7 +284,7 @@ def train_gradient_gguf(
             evaluation_accelerator = Accelerator.CPU if parallel_devices else requested_accelerator
             initial_loss = math.nan
             perplexity_binary = None
-            if not settings.mask_prompt:
+            if not settings.mask_prompt and not settings.calibration_pilot:
                 perplexity_binary = llama_binary("llama-perplexity")
                 if perplexity_binary is None:
                     raise DependencyError("llama-perplexity is not built; run `osai build-llama`")
@@ -309,9 +310,7 @@ def train_gradient_gguf(
             training_env["OSAI_CHECKPOINT_REQUEST"] = os.environ.get(
                 "OSAI_CHECKPOINT_REQUEST", str(layout.root / "checkpoint.request")
             )
-            training_env["OSAI_CHECKPOINT_OUTPUT"] = str(
-                checkpoint_dir / "adapter" / "last.gguf"
-            )
+            training_env["OSAI_CHECKPOINT_OUTPUT"] = str(checkpoint_dir / "adapter" / "last.gguf")
             training_env["OSAI_CHECKPOINT_ACK"] = str(checkpoint_dir / "last.ack")
             training_env["OSAI_CHECKPOINT_INTERVAL_SECONDS"] = "300"
             if parallel_devices:
@@ -379,12 +378,17 @@ def train_gradient_gguf(
                         training_accelerator,
                     )
                     try:
-                        with CheckpointPublisher(
-                            kind="gguf",
-                            model=base.path,
-                            shards=base.shards,
-                            latest=checkpoint_dir / "adapter" / "last.gguf",
-                        ):
+                        publisher = (
+                            nullcontext()
+                            if settings.calibration_pilot
+                            else CheckpointPublisher(
+                                kind="gguf",
+                                model=base.path,
+                                shards=base.shards,
+                                latest=checkpoint_dir / "adapter" / "last.gguf",
+                            )
+                        )
+                        with publisher:
                             run_logged(command, log_path=log_path, env=training_env)
                         successful_offset = attempt_offset
                         break
@@ -429,7 +433,7 @@ def train_gradient_gguf(
                 best_epoch, best_supervised_loss = _parse_best_checkpoint(
                     successful_log, epoch_losses
                 )
-            if settings.mask_prompt:
+            if settings.mask_prompt or settings.calibration_pilot:
                 initial_loss = epoch_losses[0]
 
             final_digest = _adapter_tensor_digest(trained_adapter, np)
@@ -440,7 +444,13 @@ def train_gradient_gguf(
             os.replace(trained_adapter, final_adapter)
             _verify_adapter(final_adapter, base.architecture)
 
-            if settings.mask_prompt:
+            if settings.calibration_pilot:
+                # The pilot needs only native epoch losses. Evaluation loads the
+                # model again and adds no evidence to its rate selection.
+                final_loss = epoch_losses[-1]
+                test_loss = None
+                evaluation_accelerator = training_accelerator
+            elif settings.mask_prompt:
                 evaluation_settings = (
                     replace(
                         settings,
@@ -508,7 +518,7 @@ def train_gradient_gguf(
             if base.quantization != after_inspection.quantization:
                 raise VerificationError("GGUF quantization metadata changed during training")
 
-            if settings.mask_prompt:
+            if settings.mask_prompt or settings.calibration_pilot:
                 loss_reducing_steps = sum(
                     current < previous
                     for previous, current in zip(epoch_losses, epoch_losses[1:], strict=False)
@@ -706,11 +716,15 @@ def _run_parallel_gradient(
         record_counts.append((record_count + count - 1 - index) // count)
 
     with (
-        CheckpointPublisher(
-            kind="gguf",
-            model=model,
-            shards=shards,
-            latest=checkpoint_dir / "adapter" / "last.gguf",
+        (
+            nullcontext()
+            if settings.calibration_pilot
+            else CheckpointPublisher(
+                kind="gguf",
+                model=model,
+                shards=shards,
+                latest=checkpoint_dir / "adapter" / "last.gguf",
+            )
         ),
         ThreadPoolExecutor(max_workers=count) as pool,
     ):
@@ -741,9 +755,13 @@ def _run_parallel_gradient(
                 pending.write_text(token + "\n", encoding="utf-8")
                 os.replace(pending, request)
                 next_auto = time.monotonic() + 300
-            if token and token != published and all(
-                ack.is_file() and ack.read_text(encoding="utf-8").strip() == token
-                for ack in checkpoint_acks
+            if (
+                token
+                and token != published
+                and all(
+                    ack.is_file() and ack.read_text(encoding="utf-8").strip() == token
+                    for ack in checkpoint_acks
+                )
             ):
                 try:
                     weights = []
@@ -823,18 +841,17 @@ def _run_parallel_gradient(
         settings.rank,
         np,
     )
-    latest = checkpoint_dir / "adapter" / "last.gguf"
-    with CheckpointPublisher(
-        kind="gguf", model=model, shards=shards, latest=latest
-    ):
-        pending = latest.with_name("last.gguf.pending")
-        shutil.copyfile(output_adapter, pending)
-        os.replace(pending, latest)
-        print(
-            f"osai: checkpoint saved path={latest} generation=final",
-            file=sys.stderr,
-            flush=True,
-        )
+    if not settings.calibration_pilot:
+        latest = checkpoint_dir / "adapter" / "last.gguf"
+        with CheckpointPublisher(kind="gguf", model=model, shards=shards, latest=latest):
+            pending = latest.with_name("last.gguf.pending")
+            shutil.copyfile(output_adapter, pending)
+            os.replace(pending, latest)
+            print(
+                f"osai: checkpoint saved path={latest} generation=final",
+                file=sys.stderr,
+                flush=True,
+            )
     total = sum(training_weights)
     epoch_losses = tuple(
         sum(

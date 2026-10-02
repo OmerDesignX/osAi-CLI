@@ -96,6 +96,7 @@ def test_loss_trend_rejects_spikes_and_chooses_measured_decrease(monkeypatch, tm
     tried = []
 
     def pilot(_model, _sample, output, *, options, accelerator):
+        assert options.calibration_pilot
         tried.append((options.learning_rate, accelerator))
         manifest = output.parent / f"manifest-{len(tried)}.json"
         manifest.write_text(json.dumps({"options": {"context": options.context}}))

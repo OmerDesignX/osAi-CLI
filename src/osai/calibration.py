@@ -296,6 +296,7 @@ def calibrate_training(
                             tensor_split=tensor_split,
                             main_gpu=main_gpu,
                             auto_settings=not require_full_context,
+                            calibration_pilot=True,
                         ),
                         accelerator=benchmark.accelerator,
                     )
