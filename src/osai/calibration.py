@@ -30,7 +30,7 @@ from .errors import ConfigurationError, OsAiError
 from .formats import ModelInspection
 from .hardware import Engine
 
-_MAX_TRAIN_ROWS = 8
+_MAX_TRAIN_ROWS = 4
 _MAX_TEST_ROWS = 2
 _PILOT_EPOCHS = 3
 _MIN_IMPROVEMENT_PERCENT = 0.2
@@ -137,17 +137,27 @@ def _pilot_record(record: dict, context: int) -> dict:
 
 
 def sample_training_data(
-    source: Path, destination: Path, *, context: int = 1024, train_rows: int = _MAX_TRAIN_ROWS
+    source: Path,
+    destination: Path,
+    *,
+    context: int = 1024,
+    train_rows: int = _MAX_TRAIN_ROWS,
+    max_rows_per_file: int | None = None,
+    progress: Callable[[int, int, str], None] | None = None,
 ) -> tuple[int, int, int]:
-    """Reservoir sample every file and bound the pilot's labelled token work."""
+    """Sample every file and bound the pilot's labelled token work."""
     files = dataset_files(source)
     rng = random.Random(0)
     training: list[dict] = []
     holdout: list[dict] = []
     lengths: list[int] = []
     counts = {"train": 0, "valid": 0, "test": 0}
-    for split, item in files:
+    for file_index, (split, item) in enumerate(files, 1):
+        if progress is not None:
+            progress(file_index, len(files), item.name)
         for line, row in enumerate(_source_rows(item), 1):
+            if max_rows_per_file is not None and line > max_rows_per_file:
+                break
             example = normalize_sft_example(row, item, line)
             if set(example.modalities) - {"text"}:
                 raise ConfigurationError(
@@ -245,9 +255,15 @@ def calibrate_training(
             data_source,
             sample,
             context=benchmark.settings.max_seq_length,
-            train_rows=max(_MAX_TRAIN_ROWS, min(16, len(benchmark.devices) * 2)),
+            train_rows=max(_MAX_TRAIN_ROWS, min(8, len(benchmark.devices) * 2)),
+            max_rows_per_file=256 if os.environ.get("OSAI_CALIBRATION_QUICK") == "1" else None,
+            progress=lambda index, total, name: notify(
+                f"phase=sampling detail=Reading file {index} of {total}: {name}"
+            ),
         )
-        notify(f"phase=pilot detail=Testing {rows} short excerpts from {source_rows} training rows")
+        notify(
+            f"phase=pilot detail=Testing {rows} short excerpts from {source_rows} inspected rows"
+        )
         settings = benchmark.settings
         required_context = settings.max_seq_length
         trials: list[str] = []

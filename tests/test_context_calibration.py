@@ -34,7 +34,7 @@ def test_auto_train_defaults_to_full_context_and_allows_windowing(monkeypatch):
 
 
 def test_calibration_scans_and_checks_model_limit_before_hardware_pilot(
-    monkeypatch, tmp_path: Path
+    monkeypatch, tmp_path: Path, capsys
 ):
     model_path = tmp_path / "model.gguf"
     model_path.write_bytes(b"GGUF")
@@ -67,6 +67,7 @@ def test_calibration_scans_and_checks_model_limit_before_hardware_pilot(
 
     def pilot(_path, _model, _data, benchmark_result, **kwargs):
         events.append("pilot")
+        print("native pilot progress")
         assert benchmark_result.settings.max_seq_length == 3072
         assert kwargs["require_full_context"] is True
         return SimpleNamespace(as_dict=lambda: {"context": 3072})
@@ -80,6 +81,9 @@ def test_calibration_scans_and_checks_model_limit_before_hardware_pilot(
     )
     cli._calibrate(args)
     assert events == ["scan", "hardware", "pilot"]
+    output = capsys.readouterr()
+    assert "native pilot progress" in output.err
+    assert "native pilot progress" not in output.out
 
     events.clear()
     monkeypatch.setattr(

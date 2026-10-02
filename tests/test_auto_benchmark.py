@@ -173,6 +173,12 @@ def test_full_context_is_probed_on_each_gpu_with_smaller_memory_settings(
     assert result.settings.rank <= 4
     assert [device for _, device in probed] == ["CUDA0", "CUDA1"]
     assert all(settings.max_seq_length == 4096 for settings, _ in probed)
+    cached = benchmark_auto_settings(
+        model, engine=Engine.LLAMA_CPP, multi_gpu="on", required_context=4096
+    )
+    assert cached.cached is True
+    assert cached.settings == result.settings
+    assert len(probed) == 2
 
 
 def test_successful_benchmark_survives_read_only_cache(monkeypatch, tmp_path: Path):

@@ -44,13 +44,27 @@ def _data(tmp_path: Path) -> Path:
 def test_calibration_samples_all_selected_files_without_altering_them(tmp_path: Path):
     source = _data(tmp_path)
     rows, total, typical = sample_training_data(source, tmp_path / "pilot")
-    assert rows == 8
+    assert rows == 4
     assert total == 28
     assert typical > 0
     assert len((tmp_path / "pilot" / "test.jsonl").read_text().splitlines()) == 2
     sample = json.loads((tmp_path / "pilot" / "train.jsonl").read_text().splitlines()[0])
     assert sample["messages"][-1]["content"] == "Answer"
     assert len((source / "part-0.jsonl").read_text().splitlines()) == 14
+
+
+def test_quick_calibration_reads_each_file_with_a_bounded_sample(tmp_path: Path):
+    source = _data(tmp_path)
+    visited = []
+    rows, inspected, _ = sample_training_data(
+        source,
+        tmp_path / "quick-pilot",
+        max_rows_per_file=8,
+        progress=lambda index, total, name: visited.append((index, total, name)),
+    )
+    assert rows == 4
+    assert inspected == 16
+    assert visited == [(1, 2, "part-0.jsonl"), (2, 2, "part-1.jsonl")]
 
 
 def test_calibration_bounds_long_examples_without_rewriting_training_data(tmp_path: Path):

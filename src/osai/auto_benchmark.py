@@ -33,6 +33,10 @@ _CACHE_AGE_SECONDS = 12 * 60 * 60
 _PROBE_TIMEOUT_SECONDS = 180
 
 
+def _probe_timeout() -> int:
+    return 25 if os.environ.get("OSAI_CALIBRATION_QUICK") == "1" else _PROBE_TIMEOUT_SECONDS
+
+
 @dataclass(frozen=True, slots=True)
 class BenchmarkResult:
     settings: AutoTrainingSettings
@@ -138,7 +142,7 @@ def benchmark_auto_settings(
     digest = hashlib.sha256(json.dumps(key_data, sort_keys=True).encode()).hexdigest()
     cache = llama_runtime_build().parent / "auto-benchmarks" / f"{digest}.json"
     if not force:
-        cached = _read_cache(cache, model, engine)
+        cached = _read_cache(cache, model, engine, required_context)
         if cached is not None and _gpu_profile_fits(
             cached.profile, model.size_bytes, free_gpu_bytes
         ):
@@ -258,7 +262,7 @@ def _probe_llama(
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=_PROBE_TIMEOUT_SECONDS,
+        timeout=_probe_timeout(),
         check=False,
         env=offline_environment(),
     )
@@ -289,7 +293,7 @@ def _probe_mlx(model: Path, settings: AutoTrainingSettings, adapter: Path | None
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=_PROBE_TIMEOUT_SECONDS,
+        timeout=_probe_timeout(),
         check=False,
         env=offline_environment(),
     )
@@ -297,13 +301,17 @@ def _probe_mlx(model: Path, settings: AutoTrainingSettings, adapter: Path | None
         raise RuntimeError((completed.stderr + "\n" + completed.stdout)[-500:].strip())
 
 
-def _read_cache(cache: Path, model: ModelInspection, engine: Engine) -> AutoTrainingSettings | None:
+def _read_cache(
+    cache: Path, model: ModelInspection, engine: Engine, required_context: int | None
+) -> AutoTrainingSettings | None:
     try:
         payload = json.loads(cache.read_text(encoding="utf-8"))
         if time.time() - payload["created"] > _CACHE_AGE_SECONDS:
             return None
         settings = payload["settings"]
         result = select_auto_settings(model, engine=engine, profile_limit=settings["profile"])
+        if required_context is not None:
+            result = _fit_required_context(result, required_context)
         if asdict(result) != {**settings, "target_modules": tuple(settings["target_modules"])}:
             return None
         return result

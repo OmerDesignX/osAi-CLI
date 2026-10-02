@@ -7,6 +7,7 @@ import json
 import sys
 import traceback
 from collections.abc import Sequence
+from contextlib import redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -1511,26 +1512,28 @@ def _calibrate(args: argparse.Namespace) -> int:
             benchmark,
             settings=replace(benchmark.settings, max_seq_length=maximum["context"]),
         )
-    result = calibrate_training(
-        model_path,
-        inspected,
-        args.data,
-        benchmark,
-        engine=selection.engine,
-        multi_gpu=args.multi_gpu,
-        optimizer=args.optimizer,
-        scale=args.scale,
-        dropout=args.dropout,
-        seed=args.seed,
-        grad_checkpoint=args.gradient_checkpointing,
-        grad_accumulation_steps=args.grad_accumulation_steps,
-        mask_prompt=args.mask_prompt,
-        split_mode=args.split_mode,
-        tensor_split=_parse_tensor_split(args.tensor_split),
-        main_gpu=args.main_gpu,
-        distributed_workers=args.distributed_workers,
-        require_full_context=args.full_content_context,
-    )
+    # Keep stdout machine-readable: native pilot logs are progress, not JSON.
+    with redirect_stdout(sys.stderr):
+        result = calibrate_training(
+            model_path,
+            inspected,
+            args.data,
+            benchmark,
+            engine=selection.engine,
+            multi_gpu=args.multi_gpu,
+            optimizer=args.optimizer,
+            scale=args.scale,
+            dropout=args.dropout,
+            seed=args.seed,
+            grad_checkpoint=args.gradient_checkpointing,
+            grad_accumulation_steps=args.grad_accumulation_steps,
+            mask_prompt=args.mask_prompt,
+            split_mode=args.split_mode,
+            tensor_split=_parse_tensor_split(args.tensor_split),
+            main_gpu=args.main_gpu,
+            distributed_workers=args.distributed_workers,
+            require_full_context=args.full_content_context,
+        )
     _print_json(result.as_dict())
     return 0
 
