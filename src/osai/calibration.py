@@ -279,7 +279,7 @@ def calibrate_training(
                             split_mode=split_mode,
                             tensor_split=tensor_split,
                             main_gpu=main_gpu,
-                            auto_settings=True,
+                            auto_settings=not require_full_context,
                         ),
                         accelerator=benchmark.accelerator,
                     )
@@ -335,7 +335,7 @@ def calibrate_training(
                         multi_gpu=multi_gpu,
                         devices=benchmark.devices,
                         distributed_workers=distributed_workers,
-                        auto_settings=True,
+                        auto_settings=not require_full_context,
                     )
                     losses = MlxBackend(accelerator=benchmark.accelerator).train(config).losses
                     used = json.loads(
@@ -374,8 +374,12 @@ def calibrate_training(
                 if require_full_context and settings.max_seq_length < required_context:
                     raise
                 trials.append(f"{rate:.2e}: {exc}")
-        raise ConfigurationError(
-            "Calibration could not verify a decreasing pilot loss. Review the dataset "
+        guidance = (
+            "Full context calibration could not finish at the required context; "
+            "choose Windowing if the model or device cannot fit it. "
+            if require_full_context
+            and all("no reliable downward trend" not in trial for trial in trials)
+            else "Calibration could not verify a decreasing pilot loss. Review the dataset "
             "and model, or turn off hardware fitting for manual settings. "
-            + "; ".join(trials)[-700:]
         )
+        raise ConfigurationError(guidance + "; ".join(trials)[-700:])

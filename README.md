@@ -502,7 +502,7 @@ directly to alignment.
 | `--tensor-split LIST` | Comma-separated llama.cpp device proportions, such as `3,1`. |
 | `--main-gpu N` | llama.cpp main GPU index. Default: `0`. |
 | `--distributed-workers N` | MLX Linux CUDA/NCCL worker count. `0` chooses a safe count. |
-| `--auto-settings`, `--no-auto-settings` | Benchmark the selected model on this hardware, then choose memory-bounded context, batch size, LoRA rank/layers/targets, and threads. With no explicit learning rate, fine-tuning also calibrates a short local dataset sample before the full run. Disabled by default; explicit tuning flags override its choices. |
+| `--auto-settings`, `--no-auto-settings` | With Auto, scan the selected training files for the longest record first, check the model context limit, then fit the hardware and calibrate a short local sample before the full run. Auto is disabled by default. Explicit tuning flags override its choices. |
 | `--epochs N` | Complete passes over the fine-tuning dataset on MLX or llama.cpp. Default: `1`. |
 | `--iterations N` | Compatibility alias for `--epochs`. |
 | `--batch-size N` | MLX training batch size. Default: `1`. |
@@ -510,7 +510,7 @@ directly to alignment.
 | `--scale NUMBER` | LoRA scaling value. Default: `4`. |
 | `--num-layers N` | Number of final model layers to adapt. Default: `1`. |
 | `--max-seq-length N` | MLX or GGUF context tokens per training window. Longer supervised rows are windowed without dropping assistant labels; each window sees only local context. Auto selects a hardware-aware value. |
-| `--full-content-context` | Scan every training record and use a context sized for the largest one. GGUF uses the model's native tokenizer; MLX uses its `tokenizer.json`. A record beyond the model context limit is rejected. Device memory failures still trigger smaller overlapping windows when Auto is enabled. |
+| `--full-content-context`, `--no-full-content-context` | Full is the default with `--auto-settings` and for `calibrate`. Scan every training record and use a context sized for the largest one. GGUF uses the model's native tokenizer; MLX uses its `tokenizer.json` when available. A model or device memory limit is reported without silently reducing the full context. Use `--no-full-content-context` to select overlapping windows. |
 | `--image-size WIDTH HEIGHT` | Resize local images before VLM preprocessing. Omit it to use the model processor's native size. |
 | `--video-fps NUMBER` | Frames sampled per second from local videos. Default: `2`. |
 | `--video-max-frames N` | Maximum frames loaded from each local video. Default: `32`. |

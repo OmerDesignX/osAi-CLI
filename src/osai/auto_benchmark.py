@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import subprocess
 import sys
 import time
 from contextlib import suppress
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 from .auto_settings import AutoTrainingSettings, select_auto_settings
@@ -61,6 +62,7 @@ def benchmark_auto_settings(
     devices: tuple[str, ...] = (),
     adapter: Path | None = None,
     force: bool = False,
+    required_context: int | None = None,
 ) -> BenchmarkResult:
     """Find the highest memory-bounded profile that passes local inference.
 
@@ -107,11 +109,14 @@ def benchmark_auto_settings(
         raise ConfigurationError("automatic benchmark requires a resolved engine")
 
     baseline = select_auto_settings(model, engine=engine)
+    if required_context is not None and required_context < 32:
+        raise ConfigurationError("the required training context must be at least 32 tokens")
     adapter_file = (
         adapter / "adapters.safetensors" if adapter is not None and adapter.is_dir() else adapter
     )
     key_data = {
         "schema": 2,
+        "required_context": required_context,
         "model": str(model.path.resolve()),
         "shards": [
             (str(shard), shard.stat().st_size, shard.stat().st_mtime_ns) for shard in model.shards
@@ -143,6 +148,8 @@ def benchmark_auto_settings(
     failures: list[str] = []
     for profile in _PROFILES[_PROFILES.index(baseline.profile) :]:
         settings = select_auto_settings(model, engine=engine, profile_limit=profile)
+        if required_context is not None:
+            settings = _fit_required_context(settings, required_context)
         if not _gpu_profile_fits(settings.profile, model.size_bytes, free_gpu_bytes):
             failures.append(f"{profile}: insufficient free GPU memory for training reserve")
             continue
@@ -179,6 +186,21 @@ def benchmark_auto_settings(
     )
 
 
+def _fit_required_context(
+    settings: AutoTrainingSettings, required_context: int
+) -> AutoTrainingSettings:
+    """Spend the fitted memory budget on context before batch or adapter size."""
+    pressure = max(1.0, required_context / settings.max_seq_length)
+    return replace(
+        settings,
+        max_seq_length=required_context,
+        batch_size=max(1, settings.batch_size // math.ceil(pressure)),
+        rank=max(2, int(settings.rank / math.sqrt(pressure))),
+        num_layers=max(1, int(settings.num_layers / math.sqrt(pressure))),
+        gguf_batch_size=max(1, int(settings.gguf_batch_size / math.sqrt(pressure))),
+    )
+
+
 def _gpu_profile_fits(profile: str, model_bytes: int, free_bytes: int | None) -> bool:
     if free_bytes is None:
         return True
@@ -200,7 +222,7 @@ def _probe_llama(
     device: str,
     adapter: Path | None,
 ) -> None:
-    prompt = "A short local hardware benchmark. " * max(4, settings.max_seq_length // 24)
+    prompt = "A short local hardware benchmark. " * min(64, max(4, settings.max_seq_length // 24))
     command = [
         str(binary),
         "-m",
@@ -245,7 +267,7 @@ def _probe_llama(
 
 
 def _probe_mlx(model: Path, settings: AutoTrainingSettings, adapter: Path | None) -> None:
-    prompt = "A short local hardware benchmark. " * max(4, settings.max_seq_length // 24)
+    prompt = "A short local hardware benchmark. " * min(64, max(4, settings.max_seq_length // 24))
     command = [
         sys.executable,
         "-m",

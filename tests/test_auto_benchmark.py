@@ -139,6 +139,42 @@ def test_two_12_gib_gpus_select_more_context_without_pooling_memory(monkeypatch,
     assert probed == [(1024, "CUDA0"), (1024, "CUDA1")]
 
 
+def test_full_context_is_probed_on_each_gpu_with_smaller_memory_settings(
+    monkeypatch, tmp_path: Path
+):
+    model = _model(tmp_path)
+    binary = tmp_path / "llama-completion"
+    binary.write_bytes(b"binary")
+    monkeypatch.setattr("osai.auto_settings.physical_memory_bytes", lambda: 64 * 1024**3)
+    monkeypatch.setattr("osai.auto_benchmark.llama_binary", lambda _name: binary)
+    monkeypatch.setattr("osai.auto_benchmark.llama_runtime_build", lambda: tmp_path / "native")
+    monkeypatch.setattr("osai.auto_benchmark.select_llama_accelerator", lambda _: Accelerator.CUDA)
+    monkeypatch.setattr(
+        "osai.auto_benchmark.available_llama_devices",
+        lambda _binary, _accelerator, **_kwargs: ("CUDA0", "CUDA1"),
+    )
+    monkeypatch.setattr(
+        "osai.auto_benchmark.llama_device_free_bytes",
+        lambda _binary, _accelerator: {"CUDA0": 11 * 1024**3, "CUDA1": 11 * 1024**3},
+    )
+    probed = []
+    monkeypatch.setattr(
+        "osai.auto_benchmark._probe_llama",
+        lambda _binary, _model, settings, _accelerator, device, _adapter: probed.append(
+            (settings, device)
+        ),
+    )
+    result = benchmark_auto_settings(
+        model, engine=Engine.LLAMA_CPP, multi_gpu="on", required_context=4096
+    )
+    assert result.settings.max_seq_length == 4096
+    assert result.settings.batch_size == 1
+    assert result.settings.gguf_batch_size == 1
+    assert result.settings.rank <= 4
+    assert [device for _, device in probed] == ["CUDA0", "CUDA1"]
+    assert all(settings.max_seq_length == 4096 for settings, _ in probed)
+
+
 def test_successful_benchmark_survives_read_only_cache(monkeypatch, tmp_path: Path):
     model = _model(tmp_path)
     binary = tmp_path / "llama-completion"

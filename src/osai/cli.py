@@ -228,8 +228,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     train_parser.add_argument(
         "--full-content-context",
-        action="store_true",
-        help="scan the largest training record and request a context that holds it whole",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "scan the largest record before automatic fitting (default with "
+            "--auto-settings); use --no-full-content-context for Windowing"
+        ),
     )
     train_parser.add_argument("--learning-rate", type=float)
     train_parser.add_argument("--dropout", type=float)
@@ -437,7 +441,9 @@ def build_parser() -> argparse.ArgumentParser:
     calibration_parser.add_argument("--distributed-workers", type=int, default=0)
     calibration_parser.add_argument("--bundled-root", type=Path)
     calibration_parser.add_argument("--custom-root", type=Path)
-    calibration_parser.add_argument("--full-content-context", action="store_true")
+    calibration_parser.add_argument(
+        "--full-content-context", action=argparse.BooleanOptionalAction, default=True
+    )
     calibration_parser.add_argument(
         "--download-model", action=argparse.BooleanOptionalAction, default=True
     )
@@ -547,6 +553,8 @@ def _inspect(args: argparse.Namespace) -> int:
 
 
 def _train(args: argparse.Namespace) -> int:
+    if args.full_content_context is None:
+        args.full_content_context = bool(args.auto_settings)
     if args.stage == "fine-tuning":
         payload = _fine_tune(args)
     elif args.stage == "alignment":
@@ -654,12 +662,14 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
             args.session_name or f"{source_name}-{args.engine}",
         )
         config = replace(config, output=session)
-    config = _resolve_training_settings(config, args, engine)
-    config = replace(
-        config,
-        data=prepare_dataset_source(config.data, session / ".prepared-dataset"),
-    )
+    maximum = None
     if getattr(args, "full_content_context", False):
+        print(
+            "osai: calibration phase=context "
+            "detail=Scanning every training record before hardware fitting",
+            file=sys.stderr,
+            flush=True,
+        )
         tokenizer_root = config.training_model if engine is Engine.MLX else config.model.parent
         maximum = largest_training_context(
             config.data,
@@ -675,7 +685,6 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
                 f"largest training record needs about {maximum['context']} tokens, "
                 f"above this model's {model_limit}-token limit; use overlapping windows"
             )
-        config = replace(config, max_seq_length=maximum["context"])
         print(
             "osai: full content "
             f"records={maximum['records']} files={maximum['files']} "
@@ -685,6 +694,15 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
             file=sys.stderr,
             flush=True,
         )
+    config = _resolve_training_settings(
+        config, args, engine, required_context=maximum["context"] if maximum else None
+    )
+    if maximum is not None:
+        config = replace(config, max_seq_length=maximum["context"])
+    config = replace(
+        config,
+        data=prepare_dataset_source(config.data, session / ".prepared-dataset"),
+    )
     selected_optimizer = _select_optimizer(args, config, engine)
     dataset_summary = validate_dataset(config.data)
     multimodal = bool(set(dataset_summary.modalities) - {"text"})
@@ -704,7 +722,11 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
         if requested_optimizer == "auto":
             selected_optimizer = "adamw"
         result = train(
-            replace(config, optimizer=selected_optimizer),
+            replace(
+                config,
+                optimizer=selected_optimizer,
+                auto_settings=config.auto_settings and not args.full_content_context,
+            ),
             python=args.python,
             mlx_accelerator=args.accelerator,
             llama_accelerator=args.accelerator,
@@ -749,6 +771,7 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
             multi_gpu=config.multi_gpu,
             devices=config.devices,
             adapter=_embedded_adapter(config.model, engine),
+            required_context=maximum["context"] if maximum else None,
         )
         if config.max_seq_length != benchmark.settings.max_seq_length:
             benchmark = replace(
@@ -791,12 +814,16 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
     if engine is Engine.MLX:
         try:
             result = train(
-                replace(config, optimizer=selected_optimizer),
+                replace(
+                    config,
+                    optimizer=selected_optimizer,
+                    auto_settings=config.auto_settings and not args.full_content_context,
+                ),
                 python=args.python,
                 mlx_accelerator=args.accelerator,
                 llama_accelerator=args.accelerator,
             )
-        except (DependencyError, TrainingError):
+        except (DependencyError, TrainingError) as exc:
             if args.engine != Engine.AUTO.value:
                 raise
             if config.effective_format is ModelFormat.GGUF:
@@ -808,7 +835,21 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
             print("osai: MLX execution failed; retrying the local GGUF with llama.cpp")
             engine = Engine.LLAMA_CPP
             config = replace(config, model=fallback_gguf, format=ModelFormat.GGUF)
-            config = _resolve_training_settings(config, args, engine)
+            if args.full_content_context:
+                maximum = largest_training_context(
+                    config.data, config.model.parent, gguf_model=config.model
+                )
+                limit = inspect_model(config.model, ModelFormat.GGUF).context_length
+                if limit and maximum["context"] > limit:
+                    raise ConfigurationError(
+                        f"Full context needs {maximum['context']} tokens, above the "
+                        f"fallback GGUF model's {limit}-token limit; choose Windowing"
+                    ) from exc
+            config = _resolve_training_settings(
+                config, args, engine, required_context=maximum["context"] if maximum else None
+            )
+            if maximum is not None:
+                config = replace(config, max_seq_length=maximum["context"])
             selected_optimizer = _select_optimizer(args, config, engine)
         else:
             payload = {
@@ -867,7 +908,7 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
                 split_mode=config.split_mode,
                 tensor_split=config.tensor_split,
                 main_gpu=config.main_gpu,
-                auto_settings=config.auto_settings,
+                auto_settings=config.auto_settings and not args.full_content_context,
             ),
             accelerator=args.accelerator,
         )
@@ -1152,6 +1193,7 @@ def _resolve_training_settings(
     config: TrainingConfig,
     args: argparse.Namespace,
     engine: Engine,
+    required_context: int | None = None,
 ) -> TrainingConfig:
     if args.auto_settings:
         expected = ModelFormat.MLX if engine is Engine.MLX else ModelFormat.GGUF
@@ -1163,6 +1205,7 @@ def _resolve_training_settings(
             multi_gpu=config.multi_gpu,
             devices=config.devices,
             adapter=_embedded_adapter(config.model, engine),
+            required_context=required_context,
         ).settings
         config = replace(
             config,
@@ -1424,22 +1467,11 @@ def _calibrate(args: argparse.Namespace) -> int:
         else selection.model
     )
     inspected = inspect_model(model_path, expected)
-    print(
-        "osai: calibration phase=hardware detail=Checking model and devices",
-        file=sys.stderr,
-        flush=True,
-    )
-    benchmark = benchmark_auto_settings(
-        inspected,
-        engine=selection.engine,
-        accelerator=args.accelerator,
-        multi_gpu=args.multi_gpu,
-        devices=tuple(args.devices or ()),
-        adapter=_embedded_adapter(selection.model, selection.engine),
-    )
+    maximum = None
     if args.full_content_context:
         print(
-            "osai: calibration phase=context detail=Scanning the largest record",
+            "osai: calibration phase=context "
+            "detail=Scanning every training record for the largest context",
             file=sys.stderr,
             flush=True,
         )
@@ -1453,6 +1485,28 @@ def _calibrate(args: argparse.Namespace) -> int:
                 f"Full context needs {maximum['context']} tokens, above this model's "
                 f"{inspected.context_length}-token limit; choose Windowing"
             )
+        print(
+            "osai: calibration phase=context "
+            f"detail=Largest record {maximum['largest_tokens']} tokens; "
+            f"testing {maximum['context']}-token context",
+            file=sys.stderr,
+            flush=True,
+        )
+    print(
+        "osai: calibration phase=hardware detail=Fitting devices to the selected context",
+        file=sys.stderr,
+        flush=True,
+    )
+    benchmark = benchmark_auto_settings(
+        inspected,
+        engine=selection.engine,
+        accelerator=args.accelerator,
+        multi_gpu=args.multi_gpu,
+        devices=tuple(args.devices or ()),
+        adapter=_embedded_adapter(selection.model, selection.engine),
+        required_context=maximum["context"] if maximum else None,
+    )
+    if maximum is not None:
         benchmark = replace(
             benchmark,
             settings=replace(benchmark.settings, max_seq_length=maximum["context"]),
