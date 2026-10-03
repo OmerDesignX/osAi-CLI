@@ -1,9 +1,12 @@
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from osai.auto_settings import select_auto_settings
 from osai.cli import (
     _choose_combined_alignment,
+    _fit_gguf_context,
     _resolve_training_settings,
     _select_optimizer,
     build_parser,
@@ -11,6 +14,35 @@ from osai.cli import (
 from osai.config import ModelFormat, TrainingConfig
 from osai.formats import ModelInspection, QuantizationSpec
 from osai.hardware import Engine
+
+
+@pytest.mark.parametrize(
+    ("context", "model_limit", "expected_context", "expected_batch"),
+    [
+        (61588, 65536, 61632, 64),
+        (61588, 61588, 61588, 4),
+        (61632, 65536, 61632, 64),
+    ],
+)
+def test_full_content_context_fits_the_calibrated_gguf_microbatch(
+    tmp_path: Path,
+    context: int,
+    model_limit: int,
+    expected_context: int,
+    expected_batch: int,
+):
+    config = TrainingConfig(
+        model=tmp_path / "model.gguf",
+        format=ModelFormat.GGUF,
+        data=tmp_path / "train.jsonl",
+        output=tmp_path / "out",
+        max_seq_length=context,
+        gguf_batch_size=64,
+    )
+    fitted = _fit_gguf_context(config, model_limit)
+    assert fitted.max_seq_length == expected_context
+    assert fitted.gguf_batch_size == expected_batch
+    assert fitted.max_seq_length % fitted.gguf_batch_size == 0
 
 
 def test_train_auto_settings_and_manual_overrides_parse():

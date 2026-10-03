@@ -699,7 +699,9 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
         config, args, engine, required_context=maximum["context"] if maximum else None
     )
     if maximum is not None:
-        config = replace(config, max_seq_length=maximum["context"])
+        # A calibrated GGUF microbatch may require a slightly padded context.
+        # Keep that tested shape while still covering the longest record.
+        config = replace(config, max_seq_length=max(config.max_seq_length, maximum["context"]))
     config = replace(
         config,
         data=prepare_dataset_source(config.data, session / ".prepared-dataset"),
@@ -876,6 +878,7 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
         if config.effective_format is not ModelFormat.GGUF:
             raise ConfigurationError("llama.cpp quantized training requires a GGUF model")
         base_context = inspect_model(config.model, ModelFormat.GGUF).context_length
+        config = _fit_gguf_context(config, base_context)
         context = max(32, config.max_seq_length)
         if base_context is not None and context > base_context:
             raise ConfigurationError(
@@ -1188,6 +1191,32 @@ def _publish_native_session(
             )
             atomic_json(native.manifest, manifest)
             raise
+
+
+def _fit_gguf_context(config: TrainingConfig, model_limit: int | None) -> TrainingConfig:
+    """Use a compatible context and microbatch without dropping record tokens."""
+    context = config.max_seq_length
+    batch = config.gguf_batch_size
+    if context < 32 or batch < 1 or context % batch == 0:
+        return config
+    padded = ((context + batch - 1) // batch) * batch
+    if model_limit is None or padded <= model_limit:
+        print(
+            f"osai: fitting GGUF context {context} to {padded} tokens for microbatch {batch}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return replace(config, max_seq_length=padded)
+    fitted_batch = next(
+        candidate for candidate in range(min(batch, context), 0, -1) if context % candidate == 0
+    )
+    print(
+        f"osai: model context limit {model_limit} prevents padding {context} "
+        f"tokens for microbatch {batch}; using microbatch {fitted_batch}",
+        file=sys.stderr,
+        flush=True,
+    )
+    return replace(config, gguf_batch_size=fitted_batch)
 
 
 def _resolve_training_settings(
