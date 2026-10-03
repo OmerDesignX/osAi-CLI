@@ -1079,6 +1079,8 @@ void ggml_opt_epoch_callback_progress_bar(
     double accuracy;
     double accuracy_unc;
     ggml_opt_result_accuracy(result, &accuracy, &accuracy_unc);
+    int64_t measured_labels = 0;
+    ggml_opt_result_ndata(result, &measured_labels);
 
     const int64_t t_ibatch_us = ggml_time_us() - t_start_us;
     int64_t t_ibatch_s = t_ibatch_us / 1000000;
@@ -1094,9 +1096,26 @@ void ggml_opt_epoch_callback_progress_bar(
     const int64_t t_eta_m = t_eta_s / 60;
     t_eta_s -= t_eta_m * 60;
 
-    fprintf(stderr, "] data=%07" PRId64 "/%07" PRId64 " loss=%.5lf±%.5lf acc=%.2lf±%.2lf%% "
-            "t=%02" PRId64 ":%02" PRId64 ":%02" PRId64 " ETA=%02" PRId64 ":%02" PRId64 ":%02" PRId64 " \r",
-            idata, idata_max, loss, loss_unc, 100.0*accuracy, 100.0*accuracy_unc,
+    fprintf(stderr, "] data=%07" PRId64 "/%07" PRId64, idata, idata_max);
+    if (measured_labels == 0) {
+        fprintf(stderr, " loss=pending acc=pending");
+    } else {
+        fprintf(stderr, " loss=%.5lf", loss);
+        if (std::isfinite(loss_unc)) {
+            fprintf(stderr, "±%.5lf", loss_unc);
+        }
+        if (std::isfinite(accuracy)) {
+            fprintf(stderr, " acc=%.2lf", 100.0*accuracy);
+            if (std::isfinite(accuracy_unc)) {
+                fprintf(stderr, "±%.2lf", 100.0*accuracy_unc);
+            }
+            fprintf(stderr, "%%");
+        } else {
+            fprintf(stderr, " acc=unavailable");
+        }
+    }
+    fprintf(stderr, " t=%02" PRId64 ":%02" PRId64 ":%02" PRId64
+            " ETA=%02" PRId64 ":%02" PRId64 ":%02" PRId64 " \r",
             t_ibatch_h, t_ibatch_m, t_ibatch_s, t_eta_h, t_eta_m, t_eta_s);
     if (ibatch == ibatch_max) {
         fprintf(stderr, "\n");

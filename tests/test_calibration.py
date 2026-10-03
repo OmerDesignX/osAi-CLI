@@ -6,7 +6,14 @@ import pytest
 
 from osai.auto_benchmark import BenchmarkResult
 from osai.auto_settings import select_auto_settings
-from osai.calibration import calibrate_training, candidate_rates, loss_trend, sample_training_data
+from osai.calibration import (
+    _pilot_microbatch,
+    _sample_source_rows,
+    calibrate_training,
+    candidate_rates,
+    loss_trend,
+    sample_training_data,
+)
 from osai.config import ModelFormat
 from osai.errors import ConfigurationError
 from osai.formats import ModelInspection, QuantizationSpec
@@ -65,6 +72,34 @@ def test_quick_calibration_reads_each_file_with_a_bounded_sample(tmp_path: Path)
     assert rows == 4
     assert inspected == 16
     assert visited == [(1, 2, "part-0.jsonl"), (2, 2, "part-1.jsonl")]
+
+
+def test_quick_calibration_samples_late_records(tmp_path: Path):
+    source = tmp_path / "large.jsonl"
+    source.write_text(
+        "".join(
+            json.dumps({"prompt": str(index), "completion": "A"}) + "\n" for index in range(1000)
+        ),
+        encoding="utf-8",
+    )
+    indices = [int(row["prompt"]) for row in _sample_source_rows(source, 16)]
+    assert len(indices) == 16
+    assert indices[0] == 0
+    assert indices[-1] > 900
+
+
+def test_pilot_microbatch_uses_each_gpu_memory_and_keeps_safe_fallback(monkeypatch, tmp_path: Path):
+    model = _model(tmp_path)
+    settings = select_auto_settings(model, engine=Engine.LLAMA_CPP, memory_bytes=64 * 1024**3)
+    benchmark = BenchmarkResult(settings, "llama.cpp", "cuda", ("CUDA0", "CUDA1"), 0.1)
+    gib = 1024**3
+    monkeypatch.setattr(
+        "osai.calibration.llama_device_free_bytes",
+        lambda *_: {"CUDA0": 8 * gib, "CUDA1": 6 * gib},
+    )
+    assert _pilot_microbatch(settings, model, benchmark) > settings.gguf_batch_size
+    monkeypatch.setattr("osai.calibration.llama_device_free_bytes", lambda *_: {"CUDA0": 8 * gib})
+    assert _pilot_microbatch(settings, model, benchmark) == settings.gguf_batch_size
 
 
 def test_calibration_bounds_long_examples_without_rewriting_training_data(tmp_path: Path):
@@ -132,6 +167,59 @@ def test_calibration_refuses_to_claim_success_without_a_decrease(monkeypatch, tm
     monkeypatch.setattr("osai.calibration.train_gradient_gguf", rising)
     with pytest.raises(ConfigurationError, match="could not verify"):
         calibrate_training(model.path, model, _data(tmp_path), benchmark, engine=Engine.LLAMA_CPP)
+
+
+def test_calibration_rejects_overfitting_pilot(monkeypatch, tmp_path: Path):
+    model = _model(tmp_path)
+    settings = select_auto_settings(model, engine=Engine.LLAMA_CPP, memory_bytes=64 * 1024**3)
+    benchmark = BenchmarkResult(settings, "llama.cpp", "cpu", (), 0.1)
+    attempts = []
+
+    def pilot(_model, _sample, output, *, options, accelerator):
+        attempts.append(options.learning_rate)
+        manifest = output.parent / f"holdout-{len(attempts)}.json"
+        manifest.write_text(json.dumps({"options": {"context": options.context}}))
+        return SimpleNamespace(
+            losses=(0.5, 0.4, 0.3),
+            initial_test_loss=0.5,
+            test_loss=0.7 if len(attempts) == 1 else 0.4,
+            manifest=manifest,
+            accelerator="cpu",
+        )
+
+    monkeypatch.setattr("osai.calibration.train_gradient_gguf", pilot)
+    result = calibrate_training(
+        model.path, model, _data(tmp_path), benchmark, engine=Engine.LLAMA_CPP
+    )
+    assert len(attempts) == 2
+    assert result.learning_rate == attempts[1]
+
+
+def test_calibration_tests_faster_rate_after_small_verified_decline(monkeypatch, tmp_path: Path):
+    model = _model(tmp_path)
+    settings = select_auto_settings(model, engine=Engine.LLAMA_CPP, memory_bytes=64 * 1024**3)
+    benchmark = BenchmarkResult(settings, "llama.cpp", "cpu", (), 0.1)
+    attempts = []
+
+    def pilot(_model, _sample, output, *, options, accelerator):
+        attempts.append(options.learning_rate)
+        manifest = output.parent / f"faster-{len(attempts)}.json"
+        manifest.write_text(json.dumps({"options": {"context": options.context}}))
+        return SimpleNamespace(
+            losses=(0.5, 0.4999, 0.4998) if len(attempts) == 1 else (0.5, 0.499, 0.498),
+            initial_test_loss=0.5,
+            test_loss=0.499 if len(attempts) == 1 else 0.498,
+            manifest=manifest,
+            accelerator="cpu",
+        )
+
+    monkeypatch.setattr("osai.calibration.train_gradient_gguf", pilot)
+    result = calibrate_training(
+        model.path, model, _data(tmp_path), benchmark, engine=Engine.LLAMA_CPP
+    )
+    assert len(attempts) == 2
+    assert attempts[1] > attempts[0]
+    assert result.learning_rate == attempts[1]
 
 
 def test_full_context_calibration_rejects_memory_fallback(monkeypatch, tmp_path: Path):

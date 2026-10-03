@@ -8,8 +8,11 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from osai.backends.llama_gradient import LlamaGradientOptions, _run_parallel_gradient
 from osai.checkpoints import CheckpointPublisher, LatestCheckpoint
+from osai.errors import TrainingError
 from osai.hardware import Accelerator
 
 
@@ -74,7 +77,7 @@ def test_parallel_checkpoint_waits_for_both_gpu_snapshots(tmp_path: Path) -> Non
     request.write_text("save-both\n", encoding="utf-8")
     combines: list[tuple[bytes, ...]] = []
 
-    def fake_run(command, *, log_path, env, output_prefix):
+    def fake_run(command, *, log_path, env, output_prefix, **_kwargs):
         snapshot = Path(env["OSAI_CHECKPOINT_OUTPUT"])
         snapshot.write_bytes(output_prefix.encode())
         Path(log_path).write_text("epoch=1 train_loss=0.5\ndata=1/2\n", encoding="utf-8")
@@ -135,3 +138,51 @@ def test_parallel_checkpoint_waits_for_both_gpu_snapshots(tmp_path: Path) -> Non
     assert len(combines) == 2
     assert (tmp_path / "outputs" / "checkpoint" / "last.ack").read_text().strip() == "save-both"
     assert (work / "final.gguf").read_bytes() == b"[CUDA0] |[CUDA1] "
+
+
+def test_parallel_failure_stops_other_gpu_and_reports_the_failed_device(tmp_path: Path) -> None:
+    work = tmp_path / ".internal"
+    logs = tmp_path / "logs"
+    work.mkdir()
+    logs.mkdir()
+
+    def fake_run(_command, *, output_prefix, cancel_event, **_kwargs):
+        if output_prefix == "[CUDA1] ":
+            time.sleep(0.1)
+            raise TrainingError("non-finite supervised loss")
+        assert cancel_event.wait(timeout=3)
+
+    with (
+        patch(
+            "osai.backends.llama_gradient._write_corpus",
+            side_effect=lambda _, path, *_args, **_kwargs: path,
+        ),
+        patch(
+            "osai.backends.llama_gradient._gradient_command",
+            return_value=["fake"],
+        ),
+        patch("osai.backends.llama_gradient.run_logged", side_effect=fake_run),
+        pytest.raises(TrainingError, match="failed on CUDA1"),
+    ):
+        _run_parallel_gradient(
+            Path("fake"),
+            tmp_path / "base.gguf",
+            "test",
+            (tmp_path / "base.gguf",),
+            tmp_path / "train.jsonl",
+            tmp_path / "initial.gguf",
+            work / "final.gguf",
+            work,
+            logs,
+            LlamaGradientOptions(
+                epochs=1,
+                mask_prompt=False,
+                devices=("CUDA0", "CUDA1"),
+                calibration_pilot=True,
+            ),
+            Accelerator.CUDA,
+            {"OSAI_CHECKPOINT_REQUEST": str(tmp_path / "checkpoint.request")},
+            2,
+            "initial",
+            object(),
+        )

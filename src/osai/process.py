@@ -6,9 +6,10 @@ import os
 import subprocess
 import sys
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event
 from typing import TextIO
 
 from .errors import TrainingError
@@ -30,6 +31,8 @@ def run_logged(
     env: Mapping[str, str] | None = None,
     timeout: float | None = None,
     output_prefix: str = "",
+    cancel_event: Event | None = None,
+    on_start: Callable[[subprocess.Popen[str]], None] | None = None,
 ) -> ProcessResult:
     argv = tuple(os.fspath(part) for part in command)
     destination = Path(log_path)
@@ -53,10 +56,19 @@ def run_logged(
             )
         except OSError as exc:
             raise TrainingError(f"could not start {argv[0]}: {exc}") from exc
+        if on_start is not None:
+            on_start(process)
 
         assert process.stdout is not None
         try:
             while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    process.terminate()
+                    try:
+                        process.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                    raise TrainingError("parallel worker stopped after another worker failed")
                 if timeout is not None and time.monotonic() - started > timeout:
                     process.terminate()
                     try:

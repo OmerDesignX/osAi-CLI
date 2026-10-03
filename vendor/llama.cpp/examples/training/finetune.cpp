@@ -91,6 +91,18 @@ static bool osai_save_checkpoint(const std::string & generation) {
 static void osai_checkpoint_callback(
         bool train, ggml_opt_context_t opt_ctx, ggml_opt_dataset_t dataset,
         ggml_opt_result_t result, int64_t ibatch, int64_t ibatch_max, int64_t t_start_us) {
+    if (train) {
+        int64_t measured_labels = 0;
+        ggml_opt_result_ndata(result, &measured_labels);
+        if (measured_labels > 0) {
+            double loss = 0.0;
+            ggml_opt_result_loss(result, &loss, nullptr);
+            if (!std::isfinite(loss)) {
+                LOG_ERR("osai: non-finite supervised loss; stopping before another checkpoint\n");
+                std::exit(EXIT_FAILURE);
+            }
+        }
+    }
     ggml_opt_epoch_callback_progress_bar(train, opt_ctx, dataset, result, ibatch, ibatch_max, t_start_us);
     if (!train || osai_checkpoint.adapter == nullptr || osai_checkpoint.output_path.empty()) {
         return;

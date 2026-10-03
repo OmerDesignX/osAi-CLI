@@ -21,7 +21,7 @@ from pathlib import Path
 
 from .auto_benchmark import BenchmarkResult
 from .auto_settings import AutoTrainingSettings
-from .backends.llama_gradient import LlamaGradientOptions, train_gradient_gguf
+from .backends.llama_gradient import LlamaGradientOptions, _memory_failure, train_gradient_gguf
 from .backends.mlx import MlxBackend
 from .config import ModelFormat, TrainingConfig
 from .dataset import normalize_sft_example, normalized_record_text
@@ -29,11 +29,13 @@ from .dataset_source import _source_rows, dataset_files
 from .errors import ConfigurationError, OsAiError
 from .formats import ModelInspection
 from .hardware import Engine
+from .multi_gpu import llama_device_free_bytes
+from .paths import llama_binary
 
 _MAX_TRAIN_ROWS = 4
 _MAX_TEST_ROWS = 2
 _PILOT_EPOCHS = 3
-_MIN_IMPROVEMENT_PERCENT = 0.2
+_TARGET_PILOT_IMPROVEMENT_PERCENT = 0.2
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,21 +105,47 @@ def candidate_rates(
     return tuple(float(f"{anchor / divisor:.3g}") for divisor in (1, 2.5, 6))
 
 
-def _pilot_record(record: dict, context: int) -> dict:
-    """Keep one short supervised exchange for a bounded calibration trial."""
+def _pilot_microbatch(
+    settings: AutoTrainingSettings, model: ModelInspection, benchmark: BenchmarkResult
+) -> int:
+    """Estimate a candidate from available memory; the pilot verifies it."""
+    available = settings.memory_budget_bytes
+    if benchmark.devices:
+        from .hardware import Accelerator
+
+        free = llama_device_free_bytes(
+            llama_binary("llama-completion"), Accelerator(benchmark.accelerator)
+        )
+        if not all(device in free for device in benchmark.devices):
+            return settings.gguf_batch_size
+        available = min(free[device] for device in benchmark.devices)
+    headroom = max(0, available - model.size_bytes)
+    blocks = model.block_count or max(1, math.isqrt(settings.max_seq_length))
+    estimated_per_token = max(1, model.size_bytes // blocks)
+    budget_batch = max(1, headroom // estimated_per_token)
+    candidate = 1 << (min(math.isqrt(settings.max_seq_length), budget_batch).bit_length() - 1)
+    if model.context_length is not None:
+        while (
+            candidate > 1
+            and math.ceil(settings.max_seq_length / candidate) * candidate > model.context_length
+        ):
+            candidate //= 2
+    return max(settings.gguf_batch_size, candidate)
+
+
+def _pilot_record(record: dict, context: int, rng: random.Random) -> dict:
+    """Keep one varied supervised exchange for a bounded calibration trial."""
     messages = record.get("messages", [])
-    assistant_index = next(
-        (
-            index
-            for index in range(len(messages) - 1, -1, -1)
-            if messages[index].get("role") == "assistant"
-            and isinstance(messages[index].get("content"), str)
-            and messages[index]["content"].strip()
-        ),
-        None,
-    )
-    if assistant_index is None:
+    assistant_indices = [
+        index
+        for index, message in enumerate(messages)
+        if message.get("role") == "assistant"
+        and isinstance(message.get("content"), str)
+        and message["content"].strip()
+    ]
+    if not assistant_indices:
         raise ConfigurationError("Calibration needs assistant text in its sampled records")
+    assistant_index = rng.choice(assistant_indices)
     prompt = next(
         (
             message["content"]
@@ -127,13 +155,42 @@ def _pilot_record(record: dict, context: int) -> dict:
         "",
     )
     answer = messages[assistant_index]["content"]
-    prompt_chars = min(160, max(64, context // 4))
-    answer_chars = min(256, max(96, context // 2))
+    prompt_chars = min(512, max(64, context // 4))
+    answer_chars = min(64, max(32, context // 4))
     excerpt = []
     if prompt.strip():
         excerpt.append({"role": "user", "content": prompt[-prompt_chars:].strip()})
     excerpt.append({"role": "assistant", "content": answer[:answer_chars].strip()})
     return {"messages": excerpt}
+
+
+def _sample_source_rows(path: Path, limit: int | None):
+    """Read JSONL strata across a large file rather than only its first rows."""
+    if limit is None or path.suffix.casefold() not in {".jsonl", ".ndjson"}:
+        yield from _source_rows(path)
+        return
+    size = path.stat().st_size
+    if size == 0:
+        return
+    seen: set[int] = set()
+    with path.open("rb") as source:
+        for slot in range(limit):
+            offset = size * slot // limit
+            source.seek(max(0, offset - 1))
+            if offset and source.read(1) != b"\n":
+                source.readline()
+            start = source.tell()
+            if start >= size or start in seen:
+                continue
+            seen.add(start)
+            raw = source.readline()
+            try:
+                row = json.loads(raw.decode("utf-8-sig"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise ConfigurationError(f"invalid JSON near byte {start} in {path}") from exc
+            if not isinstance(row, dict):
+                raise ConfigurationError(f"expected a JSON object near byte {start} in {path}")
+            yield row
 
 
 def sample_training_data(
@@ -155,7 +212,7 @@ def sample_training_data(
     for file_index, (split, item) in enumerate(files, 1):
         if progress is not None:
             progress(file_index, len(files), item.name)
-        for line, row in enumerate(_source_rows(item), 1):
+        for line, row in enumerate(_sample_source_rows(item, max_rows_per_file), 1):
             if max_rows_per_file is not None and line > max_rows_per_file:
                 break
             example = normalize_sft_example(row, item, line)
@@ -202,7 +259,9 @@ def sample_training_data(
             for record in records:
                 output.write(
                     json.dumps(
-                        _pilot_record(record, context), ensure_ascii=False, separators=(",", ":")
+                        _pilot_record(record, context, rng),
+                        ensure_ascii=False,
+                        separators=(",", ":"),
                     )
                     + "\n"
                 )
@@ -238,9 +297,7 @@ def calibrate_training(
         raise ConfigurationError(
             "Calibration needs positive scale and accumulation, and valid dropout"
         )
-    selected_optimizer = (
-        ("adamw" if engine is Engine.MLX else "sgd") if optimizer == "auto" else optimizer
-    )
+    selected_optimizer = "adamw" if optimizer == "auto" else optimizer
     notify = progress or (
         lambda message: print(f"osai: calibration {message}", file=sys.stderr, flush=True)
     )
@@ -266,40 +323,63 @@ def calibrate_training(
         )
         settings = benchmark.settings
         required_context = settings.max_seq_length
+        if engine is Engine.LLAMA_CPP:
+            settings = replace(
+                settings,
+                gguf_batch_size=_pilot_microbatch(settings, model, benchmark),
+            )
         trials: list[str] = []
-        for index, rate in enumerate(candidate_rates(settings, typical_chars, scale), 1):
-            notify(f"phase=pilot detail=Trial {index} of 3 at learning rate {rate:.2e}")
+        rates = list(candidate_rates(settings, typical_chars, scale))
+        best: CalibrationResult | None = None
+        best_test_loss = math.inf
+        for index, rate in enumerate(rates, 1):
+            notify(f"phase=pilot detail=Trial {index} of {len(rates)} at learning rate {rate:.2e}")
             output = root / f"trial-{index}"
             try:
                 if engine is Engine.LLAMA_CPP:
-                    native = train_gradient_gguf(
-                        model_source,
-                        sample,
-                        output,
-                        options=LlamaGradientOptions(
-                            epochs=_PILOT_EPOCHS,
-                            rank=settings.rank,
-                            scale=scale,
-                            num_layers=settings.num_layers,
-                            context=settings.max_seq_length,
-                            batch_size=settings.gguf_batch_size,
-                            learning_rate=rate,
-                            optimizer=selected_optimizer,
-                            threads=settings.gguf_threads,
-                            target_modules=settings.target_modules,
-                            mask_prompt=mask_prompt,
-                            seed=seed,
-                            strict_base_hash=False,
-                            multi_gpu=multi_gpu,
-                            devices=benchmark.devices,
-                            split_mode=split_mode,
-                            tensor_split=tensor_split,
-                            main_gpu=main_gpu,
-                            auto_settings=not require_full_context,
-                            calibration_pilot=True,
-                        ),
-                        accelerator=benchmark.accelerator,
-                    )
+                    while True:
+                        batch = settings.gguf_batch_size
+                        context = math.ceil(required_context / batch) * batch
+                        try:
+                            native = train_gradient_gguf(
+                                model_source,
+                                sample,
+                                output,
+                                options=LlamaGradientOptions(
+                                    epochs=_PILOT_EPOCHS,
+                                    rank=settings.rank,
+                                    scale=scale,
+                                    num_layers=settings.num_layers,
+                                    context=context,
+                                    batch_size=batch,
+                                    learning_rate=rate,
+                                    optimizer=selected_optimizer,
+                                    threads=settings.gguf_threads,
+                                    target_modules=settings.target_modules,
+                                    mask_prompt=mask_prompt,
+                                    seed=seed,
+                                    strict_base_hash=False,
+                                    multi_gpu=multi_gpu,
+                                    devices=benchmark.devices,
+                                    split_mode=split_mode,
+                                    tensor_split=tensor_split,
+                                    main_gpu=main_gpu,
+                                    auto_settings=False,
+                                    calibration_pilot=True,
+                                ),
+                                accelerator=benchmark.accelerator,
+                            )
+                            break
+                        except OsAiError:
+                            logs = (output / "logs").glob("train*.log")
+                            if batch <= 1 or not any(_memory_failure(log) for log in logs):
+                                raise
+                            settings = replace(settings, gguf_batch_size=max(1, batch // 2))
+                            notify(
+                                "phase=pilot detail=GPU memory limit; retrying with "
+                                f"microbatch {settings.gguf_batch_size}"
+                            )
+                            output = root / f"trial-{index}-batch-{settings.gguf_batch_size}"
                     losses = native.losses
                     manifest = json.loads(native.manifest.read_text(encoding="utf-8"))
                     if (
@@ -368,10 +448,22 @@ def calibrate_training(
                         "Full context does not fit this hardware during training; choose Windowing"
                     )
                 trend = loss_trend(tuple(losses))
-                if trend is not None and trend[2] >= _MIN_IMPROVEMENT_PERCENT:
+                before_test = (
+                    getattr(native, "initial_test_loss", None)
+                    if engine is Engine.LLAMA_CPP
+                    else None
+                )
+                after_test = (
+                    getattr(native, "test_loss", None) if engine is Engine.LLAMA_CPP else None
+                )
+                heldout_improved = before_test is None or (
+                    after_test is not None
+                    and math.isfinite(after_test)
+                    and after_test < before_test
+                )
+                if trend is not None and trend[2] > 0 and heldout_improved:
                     first, last, improvement = trend
-                    notify(f"phase=complete detail=Pilot loss fell {improvement:.1f}%")
-                    return CalibrationResult(
+                    result = CalibrationResult(
                         settings,
                         rate,
                         selected_optimizer,
@@ -384,18 +476,39 @@ def calibrate_training(
                         benchmark.accelerator,
                         benchmark.devices,
                     )
-                trials.append(f"{rate:.2e}: no reliable downward trend")
+                    score = after_test if after_test is not None else last
+                    if score < best_test_loss:
+                        best, best_test_loss = result, score
+                    if index == 1 and improvement < _TARGET_PILOT_IMPROVEMENT_PERCENT:
+                        growth = min(8.0, _TARGET_PILOT_IMPROVEMENT_PERCENT / improvement)
+                        rates[1] = rate * growth
+                        notify(
+                            "phase=pilot detail=Stable decline is small; testing a "
+                            f"measured faster rate {rates[1]:.2e}"
+                        )
+                        continue
+                    break
+                trials.append(f"{rate:.2e}: training or held-out loss did not reliably decline")
+                if best is not None:
+                    break
             except ConfigurationError:
                 raise
             except OsAiError as exc:
                 if require_full_context and settings.max_seq_length < required_context:
                     raise
                 trials.append(f"{rate:.2e}: {exc}")
+                if best is not None:
+                    break
+        if best is not None:
+            notify(
+                "phase=complete detail=Pilot loss fell "
+                f"{best.improvement_percent:.2f}% with the selected rate"
+            )
+            return best
         guidance = (
             "Full context calibration could not finish at the required context; "
             "choose Windowing if the model or device cannot fit it. "
-            if require_full_context
-            and all("no reliable downward trend" not in trial for trial in trials)
+            if require_full_context and all("command exited" in trial for trial in trials)
             else "Calibration could not verify a decreasing pilot loss. Review the dataset "
             "and model, or turn off hardware fitting for manual settings. "
         )

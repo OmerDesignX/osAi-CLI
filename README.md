@@ -563,7 +563,7 @@ directly to alignment.
 | `select` | `--custom-root PATH` | Override the custom-model directory. |
 | `auto-devices` | `--accelerator auto\|metal\|cuda\|vulkan\|cpu` | List currently available native GPU devices without loading a model. |
 | `auto-benchmark` | `--tier` or `--custom`, plus model and accelerator options | Run the local inference probe and print selected training settings as JSON. `--refresh` bypasses the cache. |
-| `calibrate` | `--tier` or `--custom`, `--data`, plus model and accelerator options | Sample short excerpts across the selected files locally, test cautious learning rates from the same starting model, and print a measured rate and fitted settings as JSON. Pilot progress and native logs go to stderr so stdout stays machine-readable. Full training uses the original records. A falling pilot loss does not guarantee a monotonic full run. |
+| `calibrate` | `--tier` or `--custom`, `--data`, plus model and accelerator options | Sample short excerpts across the selected files locally, probe a GGUF microbatch on every selected GPU with memory backoff, compare training and held-out loss, and test a faster learning rate when the measured decline is small. Print the measured rate and fitted settings as JSON. Pilot progress and native logs go to stderr so stdout stays machine-readable. Full training uses the original records. A falling pilot loss does not guarantee a monotonic full run. |
 | `export-gguf` | `--adapter PATH` | Source MLX adapter directory. Required. |
 | `export-gguf` | `--base PATH` | Matching GGUF base model. Required. |
 | `export-gguf` | `--output PATH` | Destination GGUF adapter file. Required. |

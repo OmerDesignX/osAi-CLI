@@ -7,6 +7,7 @@ import math
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 import uuid
@@ -14,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext, suppress
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from threading import Event, Lock
 from typing import Any
 
 from ..checkpoints import CheckpointPublisher
@@ -116,6 +118,7 @@ class LlamaGradientResult:
     accelerator: str
     optimizer_steps: int
     loss_reducing_steps: int
+    initial_test_loss: float | None = None
 
 
 def train_gradient_gguf(
@@ -270,7 +273,7 @@ def train_gradient_gguf(
                     repeat_to_minimum=not settings.mask_prompt,
                     record_separator=(structured_separator if settings.mask_prompt else "\n\n"),
                 )
-                if test_source.is_file() and not settings.calibration_pilot
+                if test_source.is_file()
                 else None
             )
 
@@ -283,6 +286,7 @@ def train_gradient_gguf(
             )
             evaluation_accelerator = Accelerator.CPU if parallel_devices else requested_accelerator
             initial_loss = math.nan
+            initial_test_loss = None
             perplexity_binary = None
             if not settings.mask_prompt and not settings.calibration_pilot:
                 perplexity_binary = llama_binary("llama-perplexity")
@@ -298,6 +302,29 @@ def train_gradient_gguf(
                     layout.logs / "evaluate-before.log",
                     settings,
                 )
+            if settings.calibration_pilot and test_corpus is not None:
+                evaluation_settings = (
+                    replace(
+                        settings,
+                        multi_gpu="off",
+                        devices=(settings.devices[0],),
+                        tensor_split=(),
+                        main_gpu=0,
+                    )
+                    if settings.devices and training_accelerator is not Accelerator.CPU
+                    else settings
+                )
+                initial_test_loss, evaluation_accelerator = _run_supervised_evaluation(
+                    binary,
+                    base.path,
+                    initial_adapter,
+                    test_corpus,
+                    evaluation_settings,
+                    layout.logs / "evaluate-pilot-before.log",
+                    training_accelerator,
+                )
+                if evaluation_accelerator is not training_accelerator:
+                    raise TrainingError("GPU pilot evaluation fell back to CPU")
 
             log_path = layout.logs / "train.log"
             log_path.unlink(missing_ok=True)
@@ -347,7 +374,11 @@ def train_gradient_gguf(
                             atomic_json(manifest_path, manifest)
                             continue
                         failed_gpu = any(_retryable_accelerator_failure(log) for log in worker_logs)
-                        if settings.multi_gpu == "on" or not failed_gpu:
+                        if (
+                            settings.calibration_pilot
+                            or settings.multi_gpu == "on"
+                            or not failed_gpu
+                        ):
                             raise
                         fallback_from = training_accelerator.value
                         fallback_reason = "parallel accelerator rejected the backward graph"
@@ -406,6 +437,8 @@ def train_gradient_gguf(
                             continue
                         if training_accelerator is Accelerator.CPU:
                             raise
+                        if settings.calibration_pilot:
+                            raise
                         if settings.multi_gpu == "on":
                             raise TrainingError(
                                 "required multi-GPU training failed; see the native training log "
@@ -445,10 +478,21 @@ def train_gradient_gguf(
             _verify_adapter(final_adapter, base.architecture)
 
             if settings.calibration_pilot:
-                # The pilot needs only native epoch losses. Evaluation loads the
-                # model again and adds no evidence to its rate selection.
                 final_loss = epoch_losses[-1]
-                test_loss = None
+                if test_corpus is not None:
+                    test_loss, evaluation_accelerator = _run_supervised_evaluation(
+                        binary,
+                        base.path,
+                        final_adapter,
+                        test_corpus,
+                        evaluation_settings,
+                        layout.logs / "evaluate-pilot-after.log",
+                        training_accelerator,
+                    )
+                    if evaluation_accelerator is not training_accelerator:
+                        raise TrainingError("GPU pilot evaluation fell back to CPU")
+                else:
+                    test_loss = None
                 evaluation_accelerator = training_accelerator
             elif settings.mask_prompt:
                 evaluation_settings = (
@@ -540,6 +584,7 @@ def train_gradient_gguf(
                         "initial_train_loss": initial_loss,
                         "final_train_loss": final_loss,
                         "test_loss": test_loss,
+                        "initial_test_loss": initial_test_loss,
                         "optimizer_steps": optimizer_steps,
                         "loss_reducing_steps": loss_reducing_steps,
                     },
@@ -575,6 +620,7 @@ def train_gradient_gguf(
                 training_accelerator.value,
                 optimizer_steps,
                 loss_reducing_steps,
+                initial_test_loss,
             )
         except BaseException as exc:
             manifest.update(
@@ -715,6 +761,14 @@ def _run_parallel_gradient(
         worker_logs.append(worker_log)
         record_counts.append((record_count + count - 1 - index) // count)
 
+    cancel_workers = Event()
+    active_processes: list[subprocess.Popen[str]] = []
+    process_lock = Lock()
+
+    def register_process(process: subprocess.Popen[str]) -> None:
+        with process_lock:
+            active_processes.append(process)
+
     with (
         (
             nullcontext()
@@ -735,6 +789,8 @@ def _run_parallel_gradient(
                 log_path=log,
                 env=worker_environment,
                 output_prefix=f"[{device}] ",
+                cancel_event=cancel_workers,
+                on_start=register_process,
             )
             for device, command, log, worker_environment in zip(
                 devices, commands, worker_logs, worker_environments, strict=True
@@ -742,6 +798,7 @@ def _run_parallel_gradient(
         ]
         published = ""
         next_auto = time.monotonic() + 300
+        failed_worker: int | None = None
         while not all(future.done() for future in futures):
             try:
                 token = request.read_text(encoding="utf-8").strip() if request.is_file() else ""
@@ -793,9 +850,40 @@ def _run_parallel_gradient(
                 except Exception as exc:
                     print(f"osai: checkpoint failed reason={exc}", file=sys.stderr, flush=True)
                 published = token
-            if any(future.done() and future.exception() for future in futures):
+            failed_worker = next(
+                (
+                    index
+                    for index, future in enumerate(futures)
+                    if future.done() and future.exception()
+                ),
+                None,
+            )
+            if failed_worker is not None:
+                cancel_workers.set()
+                with process_lock:
+                    for process in active_processes:
+                        if process.poll() is None:
+                            with suppress(OSError):
+                                process.terminate()
                 break
             time.sleep(0.5)
+        if failed_worker is None:
+            failed_worker = next(
+                (
+                    index
+                    for index, future in enumerate(futures)
+                    if future.done() and future.exception()
+                ),
+                None,
+            )
+        if failed_worker is not None:
+            try:
+                futures[failed_worker].result()
+            except TrainingError as exc:
+                raise TrainingError(
+                    f"parallel training failed on {devices[failed_worker]}; "
+                    f"see native log: {worker_logs[failed_worker]}"
+                ) from exc
         for device, log, future in zip(devices, worker_logs, futures, strict=True):
             try:
                 future.result()
