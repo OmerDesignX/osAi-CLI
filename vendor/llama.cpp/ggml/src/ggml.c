@@ -6855,6 +6855,15 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc0, tmp);
             }
             if (src1_needs_grads) {
+                struct ggml_tensor * backward_weight = src0;
+                const char * gpu_tied_embeddings = getenv("OSAI_GPU_TIED_EMBEDDINGS");
+                if (gpu_tied_embeddings && strcmp(gpu_tied_embeddings, "1") == 0 &&
+                    strcmp(src0->name, "token_embd.weight") == 0 && ggml_is_quantized(src0->type) &&
+                    src0->buffer != NULL && !ggml_backend_buffer_is_host(src0->buffer)) {
+                    // The quantized output embedding cannot be used directly by GPU OUT_PROD.
+                    // Dequantize it on the selected GPU for this backward pass.
+                    backward_weight = ggml_cast(ctx, src0, GGML_TYPE_F32);
+                }
                 ggml_add_or_set(ctx, cgraph, isrc1,
                         // ggml_mul_mat(ctx,                   // [n,p,qq,rr]
                         //     ggml_cont(ctx,                  // [m,n,q1,r1]
@@ -6865,7 +6874,7 @@ static void ggml_compute_backward(
                         // avoid transpose of src0, rather transpose smaller tensor->grad
                         // and then use ggml_out_prod
                         ggml_out_prod(ctx,      // [n,p,qq,rr]
-                            src0,               // [n,m,q1,r1]
+                            backward_weight,    // [n,m,q1,r1]
                             ggml_transpose(ctx, // [p,m,qq,rr]
                                 grad)));        // [m,p,qq,rr]
             }

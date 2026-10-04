@@ -343,6 +343,8 @@ def train_gradient_gguf(
             log_path.unlink(missing_ok=True)
             successful_offset = 0
             training_env = offline_environment()
+            if training_accelerator is Accelerator.CUDA:
+                training_env["OSAI_GPU_TIED_EMBEDDINGS"] = "1"
             training_env["OSAI_MASK_PROMPT"] = "1" if settings.mask_prompt else "0"
             training_env["OSAI_MAX_SEQ_LENGTH"] = str(settings.context)
             checkpoint_dir = layout.root / "outputs" / "checkpoint"

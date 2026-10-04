@@ -5263,6 +5263,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 if (src0_type == GGML_TYPE_Q4_1 && src1_type == GGML_TYPE_F32) {
                     return true;
                 }
+                if (ggml_is_quantized(src0_type) && src1_type == GGML_TYPE_F32 &&
+                    ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
+                    ggml_get_to_fp32_cuda(src0_type) != nullptr) {
+                    return true;
+                }
                 if (src0_type == GGML_TYPE_F32 && src1_type == GGML_TYPE_Q5_0) {
                     return true;
                 }

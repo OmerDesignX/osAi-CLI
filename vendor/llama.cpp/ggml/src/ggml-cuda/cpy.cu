@@ -1,4 +1,5 @@
 #include "cpy.cuh"
+#include "convert.cuh"
 #include "dequantize.cuh"
 #include "cpy-utils.cuh"
 #if defined(GGML_USE_MUSA) && defined(GGML_MUSA_MUDNN_COPY)
@@ -476,6 +477,10 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     } else if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch)) {
         CUDA_CHECK(cudaMemcpy2DAsync(src1_ddc, mc_dpitch, src0_ddc, mc_spitch,
                                      mc_width, mc_height, cudaMemcpyDeviceToDevice, main_stream));
+    } else if (ggml_is_quantized(src0->type) && src1->type == GGML_TYPE_F32 && contiguous_srcs) {
+        const auto to_fp32 = ggml_get_to_fp32_cuda(src0->type);
+        GGML_ASSERT(to_fp32);
+        to_fp32(src0_ddc, (float *) src1_ddc, ne, main_stream);
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
         if (can_be_transposed) {
             ggml_cpy_scalar_cuda<float, float, true>

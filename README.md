@@ -66,7 +66,8 @@ Tools are absent it downloads a verified portable C++ toolchain for CPU and
 Vulkan builds. CUDA compilation requires Microsoft C++ Build Tools and a CUDA
 Toolkit. Linux can also use distribution Vulkan
 development packages and `glslc` without defining `VULKAN_SDK`. A failed GPU
-build falls back to another available backend, then CPU.
+build tries another available GPU backend and reports an error
+if none can be built. CPU-only setup must be selected explicitly.
 
 osCode V1 and V2 GGUF small models use the Qwen3.5 hybrid architecture. Since
 llama.cpp cannot backpropagate through its recurrent delta-net operation, the
@@ -85,8 +86,9 @@ path performs no model dequantization or requantization.
 Supported Python versions are **3.10, 3.11, 3.12, and 3.13**. Python 3.9 and
 older and Python 3.14+ are rejected. The setup script installs CMake and Ninja;
 macOS and Linux still need their native C/C++ compiler. CUDA and Vulkan builds
-require their SDK/toolkit. A failed GPU build falls back to another available
-backend and then CPU.
+require their SDK/toolkit. A failed GPU build tries another available GPU
+backend and reports an error if none can be built. CPU-only setup must be
+selected explicitly.
 
 ### Recommended: one-command setup
 

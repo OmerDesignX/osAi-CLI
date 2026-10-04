@@ -29,6 +29,7 @@
 #include <cassert>
 #include <cfloat>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <cmath>
 #include <functional>
@@ -1488,9 +1489,18 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };
 
-    // assign the input layer
-    // there is very little benefit to offloading the input layer, so always keep it on the CPU
-    pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    // Tied output embeddings participate in LoRA backpropagation. Keeping them
+    // on the CPU makes the large output gradient run there on every step.
+    const char * gpu_tied_embeddings = std::getenv("OSAI_GPU_TIED_EMBEDDINGS");
+    const bool offload_tied_embeddings = gpu_tied_embeddings &&
+        std::strcmp(gpu_tied_embeddings, "1") == 0 && !devices.empty() &&
+        ml.get_weight("output.weight") == nullptr;
+    if (offload_tied_embeddings) {
+        pimpl->dev_input = get_layer_buft_list(0);
+        LLAMA_LOG_INFO("%s: training tied embeddings on %s\n", __func__, ggml_backend_dev_name(pimpl->dev_input.dev));
+    } else {
+        pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
+    }
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);
