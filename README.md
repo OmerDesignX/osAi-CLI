@@ -517,6 +517,7 @@ directly to alignment.
 | `--num-layers N` | Number of final model layers to adapt. Default: `1`. |
 | `--max-seq-length N` | MLX or GGUF context tokens per training window. Longer supervised rows are windowed without dropping assistant labels; each window sees only local context. Auto selects a hardware-aware value. |
 | `--full-content-context`, `--no-full-content-context` | Full is the default with `--auto-settings` and for `calibrate`. Scan every training record and use a context sized for the largest one. GGUF uses the model's native tokenizer; MLX uses its `tokenizer.json` when available. A model or device memory limit is reported without silently reducing the full context. Use `--no-full-content-context` to select overlapping windows. |
+| `--calibrated-context N` | Reuse the required context returned by a completed Full calibration without repeating the token scan at training startup. Use only after verifying that the dataset and model have not changed; `--max-seq-length` must cover `N`. The osAi App performs that verification before passing this option. |
 | `--image-size WIDTH HEIGHT` | Resize local images before VLM preprocessing. Omit it to use the model processor's native size. |
 | `--video-fps NUMBER` | Frames sampled per second from local videos. Default: `2`. |
 | `--video-max-frames N` | Maximum frames loaded from each local video. Default: `32`. |

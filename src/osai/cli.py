@@ -236,6 +236,14 @@ def build_parser() -> argparse.ArgumentParser:
             "--auto-settings); use --no-full-content-context for Windowing"
         ),
     )
+    train_parser.add_argument(
+        "--calibrated-context",
+        type=int,
+        help=(
+            "reuse the exact required context from a completed calibration; "
+            "the caller must verify that the model and dataset are unchanged"
+        ),
+    )
     train_parser.add_argument("--learning-rate", type=float)
     train_parser.add_argument("--dropout", type=float)
     train_parser.add_argument(
@@ -664,19 +672,37 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
         )
         config = replace(config, output=session)
     maximum = None
+    calibrated_context = getattr(args, "calibrated_context", None)
+    if calibrated_context is not None:
+        if not args.full_content_context or calibrated_context < 32:
+            raise ConfigurationError(
+                "--calibrated-context requires Full context and at least 32 tokens"
+            )
+        if args.max_seq_length is None or args.max_seq_length < calibrated_context:
+            raise ConfigurationError(
+                "the calibrated training context must cover the verified longest record"
+            )
     if getattr(args, "full_content_context", False):
-        print(
-            "osai: calibration phase=context "
-            "detail=Scanning every training record before hardware fitting",
-            file=sys.stderr,
-            flush=True,
-        )
-        tokenizer_root = config.training_model if engine is Engine.MLX else config.model.parent
-        maximum = largest_training_context(
-            config.data,
-            tokenizer_root,
-            gguf_model=config.model if engine is Engine.LLAMA_CPP else None,
-        )
+        if calibrated_context is None:
+            print(
+                "osai: calibration phase=context "
+                "detail=Scanning every training record before hardware fitting",
+                file=sys.stderr,
+                flush=True,
+            )
+            tokenizer_root = config.training_model if engine is Engine.MLX else config.model.parent
+            maximum = largest_training_context(
+                config.data,
+                tokenizer_root,
+                gguf_model=config.model if engine is Engine.LLAMA_CPP else None,
+            )
+        else:
+            maximum = {"context": calibrated_context}
+            print(
+                f"osai: reusing verified calibration context={calibrated_context}",
+                file=sys.stderr,
+                flush=True,
+            )
         model_limit = inspect_model(
             config.training_model if engine is Engine.MLX else config.model,
             ModelFormat.MLX if engine is Engine.MLX else ModelFormat.GGUF,
@@ -686,15 +712,16 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
                 f"largest training record needs about {maximum['context']} tokens, "
                 f"above this model's {model_limit}-token limit; use overlapping windows"
             )
-        print(
-            "osai: full content "
-            f"records={maximum['records']} files={maximum['files']} "
-            f"largest_tokens={maximum['largest_tokens']} "
-            f"context={maximum['context']} exact={str(maximum['exact']).lower()} "
-            f"source={maximum['largest_file']}",
-            file=sys.stderr,
-            flush=True,
-        )
+        if calibrated_context is None:
+            print(
+                "osai: full content "
+                f"records={maximum['records']} files={maximum['files']} "
+                f"largest_tokens={maximum['largest_tokens']} "
+                f"context={maximum['context']} exact={str(maximum['exact']).lower()} "
+                f"source={maximum['largest_file']}",
+                file=sys.stderr,
+                flush=True,
+            )
     config = _resolve_training_settings(
         config, args, engine, required_context=maximum["context"] if maximum else None
     )
@@ -1563,7 +1590,9 @@ def _calibrate(args: argparse.Namespace) -> int:
             distributed_workers=args.distributed_workers,
             require_full_context=args.full_content_context,
         )
-    _print_json(result.as_dict())
+    payload = result.as_dict()
+    payload["required_context"] = maximum["context"] if maximum else None
+    _print_json(payload)
     return 0
 
 
