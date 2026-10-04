@@ -303,7 +303,7 @@ def calibrate_training(
     require_full_context: bool = False,
     progress: Callable[[str], None] | None = None,
 ) -> CalibrationResult:
-    """Select the fastest cautious rate with a measured short-run loss decrease."""
+    """Select a measured rate, starting in the middle of the adaptive range."""
     if optimizer not in {"auto", "sgd", "adamw"}:
         raise ConfigurationError("Calibration optimizer must be auto, sgd, or adamw")
     if scale <= 0 or not 0 <= dropout < 1 or grad_accumulation_steps < 1:
@@ -342,10 +342,16 @@ def calibrate_training(
                 gguf_batch_size=_pilot_microbatch(settings, model, benchmark),
             )
         trials: list[str] = []
-        rates = list(candidate_rates(settings, typical_chars, scale))
+        candidates = sorted(set(candidate_rates(settings, typical_chars, scale)))
+        middle = len(candidates) // 2
+        rates = [candidates[middle], *reversed(candidates[:middle]), *candidates[middle + 1 :]]
+        starting_rate = rates[0]
+        allow_higher = True
         best: CalibrationResult | None = None
         best_test_loss = math.inf
         for index, rate in enumerate(rates, 1):
+            if rate > starting_rate and not allow_higher:
+                break
             notify(f"phase=pilot detail=Trial {index} of {len(rates)} at learning rate {rate:.2e}")
             output = root / f"trial-{index}"
             try:
@@ -474,6 +480,19 @@ def calibrate_training(
                     and math.isfinite(after_test)
                     and after_test < before_test
                 )
+                if (
+                    trend is None
+                    or trend[2] < 0
+                    or (
+                        before_test is not None
+                        and (
+                            after_test is None
+                            or not math.isfinite(after_test)
+                            or after_test > before_test
+                        )
+                    )
+                ):
+                    allow_higher = False
                 if trend is not None and trend[2] > 0 and heldout_improved:
                     first, last, improvement = trend
                     result = CalibrationResult(
@@ -501,6 +520,7 @@ def calibrate_training(
             except ConfigurationError:
                 raise
             except OsAiError as exc:
+                allow_higher = False
                 if require_full_context and settings.max_seq_length < required_context:
                     raise
                 trials.append(f"{rate:.2e}: {exc}")

@@ -150,7 +150,7 @@ def test_loss_trend_rejects_spikes_and_chooses_measured_decrease(monkeypatch, tm
     model = _model(tmp_path)
     settings = select_auto_settings(model, engine=Engine.LLAMA_CPP, memory_bytes=64 * 1024**3)
     benchmark = BenchmarkResult(settings, "llama.cpp", "cpu", (), 0.1)
-    rates = candidate_rates(settings, 100)
+    rates = sorted(candidate_rates(settings, 100))
     tried = []
 
     def pilot(_model, _sample, output, *, options, accelerator):
@@ -171,7 +171,8 @@ def test_loss_trend_rejects_spikes_and_chooses_measured_decrease(monkeypatch, tm
     result = calibrate_training(
         model.path, model, _data(tmp_path), benchmark, engine=Engine.LLAMA_CPP
     )
-    assert result.learning_rate == rates[1]
+    assert [rate for rate, _ in tried] == [rates[1], rates[0]]
+    assert result.learning_rate == rates[0]
     assert result.improvement_percent == pytest.approx(40)
     assert len(tried) == 2
     assert list(parent.iterdir()) == []
@@ -181,8 +182,10 @@ def test_calibration_refuses_to_claim_success_without_a_decrease(monkeypatch, tm
     model = _model(tmp_path)
     settings = select_auto_settings(model, engine=Engine.LLAMA_CPP, memory_bytes=64 * 1024**3)
     benchmark = BenchmarkResult(settings, "llama.cpp", "cpu", (), 0.1)
+    attempted = []
 
     def rising(_model, _sample, output, *, options, accelerator):
+        attempted.append(options.learning_rate)
         manifest = output.parent / "rising-manifest.json"
         manifest.write_text(json.dumps({"options": {"context": options.context}}))
         return SimpleNamespace(losses=(0.5, 0.6, 0.7), manifest=manifest, accelerator="cpu")
@@ -190,6 +193,8 @@ def test_calibration_refuses_to_claim_success_without_a_decrease(monkeypatch, tm
     monkeypatch.setattr("osai.calibration.train_gradient_gguf", rising)
     with pytest.raises(ConfigurationError, match="could not verify"):
         calibrate_training(model.path, model, _data(tmp_path), benchmark, engine=Engine.LLAMA_CPP)
+    assert len(attempted) == 2
+    assert attempted[0] > attempted[1]
 
 
 def test_calibration_rejects_overfitting_pilot(monkeypatch, tmp_path: Path):
@@ -241,7 +246,36 @@ def test_calibration_keeps_cautious_rate_after_small_verified_decline(monkeypatc
         model.path, model, _data(tmp_path), benchmark, engine=Engine.LLAMA_CPP
     )
     assert len(attempts) == 1
+    assert attempts[0] == sorted(candidate_rates(settings, 100))[1]
     assert result.learning_rate == attempts[0]
+
+
+def test_calibration_tries_faster_rate_only_after_flat_safe_pilots(monkeypatch, tmp_path: Path):
+    model = _model(tmp_path)
+    settings = select_auto_settings(model, engine=Engine.LLAMA_CPP, memory_bytes=64 * 1024**3)
+    benchmark = BenchmarkResult(settings, "llama.cpp", "cpu", (), 0.1)
+    attempted = []
+
+    def pilot(_model, _sample, output, *, options, accelerator):
+        attempted.append(options.learning_rate)
+        manifest = output.parent / f"flat-{len(attempted)}.json"
+        manifest.write_text(json.dumps({"options": {"context": options.context}}))
+        improved = len(attempted) == 3
+        return SimpleNamespace(
+            losses=(0.5, 0.45, 0.4) if improved else (0.5, 0.5, 0.5),
+            initial_test_loss=0.5,
+            test_loss=0.4 if improved else 0.5,
+            manifest=manifest,
+            accelerator="cpu",
+        )
+
+    monkeypatch.setattr("osai.calibration.train_gradient_gguf", pilot)
+    result = calibrate_training(
+        model.path, model, _data(tmp_path), benchmark, engine=Engine.LLAMA_CPP
+    )
+    low, middle, high = sorted(candidate_rates(settings, 100))
+    assert attempted == [middle, low, high]
+    assert result.learning_rate == high
 
 
 def test_full_context_calibration_rejects_memory_fallback(monkeypatch, tmp_path: Path):
