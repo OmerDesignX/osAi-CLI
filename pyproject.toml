@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "osai"
-version = "0.1.16"
+version = "0.1.17"
 description = "osAi quantization-preserving training for MLX and GGUF language models"
 readme = "README.md"
 requires-python = ">=3.10,<3.14"

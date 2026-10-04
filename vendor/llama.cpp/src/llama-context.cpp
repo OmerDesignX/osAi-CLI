@@ -3483,7 +3483,8 @@ void llama_context::opt_epoch_iter(
         int64_t                          ndata_in_loop,
         int64_t                          t_loop_start) {
     GGML_ASSERT(opt_ctx);
-    const uint32_t n_ctx    = llama_model_n_ctx_train(&model);
+    // Dataset rows are padded to the runtime context, which can be smaller than the model maximum.
+    const uint32_t n_ctx    = this->n_ctx();
     const uint32_t n_batch  = std::min(this->n_batch(),  n_ctx);
     const uint32_t n_ubatch = std::min(this->n_ubatch(), n_batch);
     uint32_t n_ctx_active = n_ctx;
