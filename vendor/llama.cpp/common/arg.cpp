@@ -1161,7 +1161,16 @@ void common_print_available_devices() {
     for (auto * dev : devices) {
         size_t free, total;
         ggml_backend_dev_memory(dev, &free, &total);
-        printf("  %s: %s (%zu MiB, %zu MiB free)\n", ggml_backend_dev_name(dev), ggml_backend_dev_description(dev), total / MiB, free / MiB);
+        const auto type = ggml_backend_dev_type(dev);
+        const char * kind = "other";
+        if (type == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            kind = "dedicated";
+        } else if (type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            kind = "integrated";
+        }
+        printf("  %s: %s (%zu MiB, %zu MiB free) [type=%s]\n",
+                ggml_backend_dev_name(dev), ggml_backend_dev_description(dev),
+                total / MiB, free / MiB, kind);
     }
 }
 

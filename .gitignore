@@ -10,5 +10,7 @@ osCode-Models/*
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.pytest-run-local/
 .ruff_cache/
+vendor/llama.cpp/auto-benchmarks/
 .DS_Store

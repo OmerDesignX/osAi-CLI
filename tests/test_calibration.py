@@ -88,6 +88,15 @@ def test_quick_calibration_samples_late_records(tmp_path: Path):
     assert indices[-1] > 900
 
 
+@pytest.mark.parametrize("count", [100, 256])
+def test_quick_calibration_reads_every_row_within_sample_limit(tmp_path: Path, count: int):
+    source = tmp_path / "train.jsonl"
+    lines = [json.dumps({"prompt": str(index), "completion": "A"}) + "\n" for index in range(count)]
+    source.write_text("".join(lines), encoding="utf-8")
+    indices = [int(row["prompt"]) for row in _sample_source_rows(source, 256)]
+    assert indices == list(range(count))
+
+
 def test_pilot_microbatch_uses_each_gpu_memory_and_keeps_safe_fallback(monkeypatch, tmp_path: Path):
     model = _model(tmp_path)
     settings = select_auto_settings(model, engine=Engine.LLAMA_CPP, memory_bytes=64 * 1024**3)
@@ -100,6 +109,20 @@ def test_pilot_microbatch_uses_each_gpu_memory_and_keeps_safe_fallback(monkeypat
     assert _pilot_microbatch(settings, model, benchmark) > settings.gguf_batch_size
     monkeypatch.setattr("osai.calibration.llama_device_free_bytes", lambda *_: {"CUDA0": 8 * gib})
     assert _pilot_microbatch(settings, model, benchmark) == settings.gguf_batch_size
+
+
+def test_pilot_microbatch_uses_full_context_headroom_without_model_byte_proxy(monkeypatch):
+    gib = 1024**3
+    settings = SimpleNamespace(
+        memory_budget_bytes=64 * gib, max_seq_length=61588, gguf_batch_size=1
+    )
+    model = SimpleNamespace(size_bytes=int(2.5 * gib), context_length=262144)
+    benchmark = SimpleNamespace(devices=("CUDA0", "CUDA1"), accelerator="cuda")
+    monkeypatch.setattr(
+        "osai.calibration.llama_device_free_bytes",
+        lambda *_: {"CUDA0": 12 * gib, "CUDA1": 12 * gib},
+    )
+    assert _pilot_microbatch(settings, model, benchmark) == 128
 
 
 def test_calibration_bounds_long_examples_without_rewriting_training_data(tmp_path: Path):
@@ -117,8 +140,8 @@ def test_calibration_bounds_long_examples_without_rewriting_training_data(tmp_pa
     sample = json.loads((tmp_path / "pilot" / "train.jsonl").read_text().splitlines()[0])
     assert (rows, total) == (4, 6)
     assert typical > 40_000
-    assert len(sample["messages"][0]["content"]) <= 64
-    assert len(sample["messages"][1]["content"]) <= 128
+    assert len(sample["messages"][0]["content"]) <= 128
+    assert 64 < len(sample["messages"][1]["content"]) <= 384
     assert len(source.read_text().splitlines()[0]) > 40_000
 
 
@@ -195,7 +218,7 @@ def test_calibration_rejects_overfitting_pilot(monkeypatch, tmp_path: Path):
     assert result.learning_rate == attempts[1]
 
 
-def test_calibration_tests_faster_rate_after_small_verified_decline(monkeypatch, tmp_path: Path):
+def test_calibration_keeps_cautious_rate_after_small_verified_decline(monkeypatch, tmp_path: Path):
     model = _model(tmp_path)
     settings = select_auto_settings(model, engine=Engine.LLAMA_CPP, memory_bytes=64 * 1024**3)
     benchmark = BenchmarkResult(settings, "llama.cpp", "cpu", (), 0.1)
@@ -217,9 +240,8 @@ def test_calibration_tests_faster_rate_after_small_verified_decline(monkeypatch,
     result = calibrate_training(
         model.path, model, _data(tmp_path), benchmark, engine=Engine.LLAMA_CPP
     )
-    assert len(attempts) == 2
-    assert attempts[1] > attempts[0]
-    assert result.learning_rate == attempts[1]
+    assert len(attempts) == 1
+    assert result.learning_rate == attempts[0]
 
 
 def test_full_context_calibration_rejects_memory_fallback(monkeypatch, tmp_path: Path):

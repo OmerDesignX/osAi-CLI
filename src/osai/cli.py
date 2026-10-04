@@ -183,6 +183,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="llama.cpp device name; repeat to set an ordered multi-GPU device list",
     )
     train_parser.add_argument(
+        "--device-speed",
+        action="append",
+        type=float,
+        dest="device_speeds",
+        help="measured relative GGUF worker speed; repeat in --device order",
+    )
+    train_parser.add_argument(
         "--split-mode",
         choices=["none", "layer", "row", "tensor"],
         default=None,
@@ -296,7 +303,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--optimizer",
         choices=["auto", "sgd", "adamw"],
         default="auto",
-        help="training and alignment optimizer; auto uses AdamW for MLX and SGD for llama.cpp",
+        help="training and alignment optimizer; auto uses AdamW",
     )
     optimizer.add_argument(
         "--gguf-optimizer",
@@ -658,6 +665,7 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
             gguf_threads=2 if args.gguf_threads is None else args.gguf_threads,
             multi_gpu=args.multi_gpu or "auto",
             devices=tuple(args.devices or ()),
+            device_speeds=tuple(args.device_speeds or ()),
             split_mode=args.split_mode or "layer",
             tensor_split=_parse_tensor_split(args.tensor_split),
             main_gpu=0 if args.main_gpu is None else args.main_gpu,
@@ -678,7 +686,7 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
             raise ConfigurationError(
                 "--calibrated-context requires Full context and at least 32 tokens"
             )
-        if args.max_seq_length is None or args.max_seq_length < calibrated_context:
+        if args.max_seq_length is not None and args.max_seq_length < calibrated_context:
             raise ConfigurationError(
                 "the calibrated training context must cover the verified longest record"
             )
@@ -831,9 +839,15 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
         config = replace(
             config,
             learning_rate=calibrated.learning_rate,
+            devices=calibrated.devices or config.devices,
+            device_speeds=config.device_speeds or calibrated.device_speeds,
             max_seq_length=min(config.max_seq_length, calibrated.settings.max_seq_length),
             batch_size=min(config.batch_size, calibrated.settings.batch_size),
-            gguf_batch_size=min(config.gguf_batch_size, calibrated.settings.gguf_batch_size),
+            gguf_batch_size=_calibrated_gguf_batch_size(
+                config.gguf_batch_size,
+                calibrated.settings.gguf_batch_size,
+                explicitly_selected=args.gguf_batch_size is not None,
+            ),
         )
         print(
             f"osai: calibrated learning rate={calibrated.learning_rate:.2e} "
@@ -911,11 +925,6 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
             raise ConfigurationError(
                 f"max sequence length {context} exceeds the model context {base_context}"
             )
-        gradient_learning_rate = (
-            args.learning_rate
-            if args.learning_rate is not None
-            else (config.learning_rate if args.config else 1e-5)
-        )
         native = train_gradient_gguf(
             config.model,
             config.data,
@@ -927,7 +936,7 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
                 num_layers=config.num_layers,
                 context=context,
                 batch_size=config.gguf_batch_size,
-                learning_rate=gradient_learning_rate,
+                learning_rate=config.learning_rate,
                 optimizer=selected_optimizer,
                 threads=config.gguf_threads,
                 seed=config.seed,
@@ -936,6 +945,7 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
                 strict_base_hash=config.strict_base_hash,
                 multi_gpu=config.multi_gpu,
                 devices=config.devices,
+                device_speeds=config.device_speeds,
                 split_mode=config.split_mode,
                 tensor_split=config.tensor_split,
                 main_gpu=config.main_gpu,
@@ -1331,6 +1341,8 @@ def _resolve_training_settings(
         overrides["multi_gpu"] = args.multi_gpu
     if args.devices is not None:
         overrides["devices"] = tuple(args.devices)
+    if getattr(args, "device_speeds", None) is not None:
+        overrides["device_speeds"] = tuple(args.device_speeds)
     if args.split_mode is not None:
         overrides["split_mode"] = args.split_mode
     if args.tensor_split is not None:
@@ -1379,7 +1391,12 @@ def _select_optimizer(
         if engine is Engine.LLAMA_CPP and config.optimizer not in {"sgd", "adamw"}:
             raise ConfigurationError("llama.cpp optimizer from config must be sgd or adamw")
         return config.optimizer
-    return "adamw" if engine is Engine.MLX else "sgd"
+    return "adamw"
+
+
+def _calibrated_gguf_batch_size(current: int, measured: int, *, explicitly_selected: bool) -> int:
+    """Apply the tested batch unless the user requested a smaller limit."""
+    return min(current, measured) if explicitly_selected else measured
 
 
 def _choose_combined_alignment(args: argparse.Namespace) -> None:

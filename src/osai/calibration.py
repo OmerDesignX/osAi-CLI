@@ -35,7 +35,7 @@ from .paths import llama_binary
 _MAX_TRAIN_ROWS = 4
 _MAX_TEST_ROWS = 2
 _PILOT_EPOCHS = 3
-_TARGET_PILOT_IMPROVEMENT_PERCENT = 0.2
+_MAX_INSPECTED_ROWS_PER_FILE = 256
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +51,7 @@ class CalibrationResult:
     engine: str
     accelerator: str
     devices: tuple[str, ...]
+    device_speeds: tuple[float, ...] = ()
 
     def as_dict(self) -> dict:
         return {
@@ -65,6 +66,7 @@ class CalibrationResult:
             "engine": self.engine,
             "accelerator": self.accelerator,
             "devices": list(self.devices),
+            "device_speeds": list(self.device_speeds),
         }
 
 
@@ -120,10 +122,12 @@ def _pilot_microbatch(
             return settings.gguf_batch_size
         available = min(free[device] for device in benchmark.devices)
     headroom = max(0, available - model.size_bytes)
-    blocks = model.block_count or max(1, math.isqrt(settings.max_seq_length))
-    estimated_per_token = max(1, model.size_bytes // blocks)
-    budget_batch = max(1, headroom // estimated_per_token)
-    candidate = 1 << (min(math.isqrt(settings.max_seq_length), budget_batch).bit_length() - 1)
+    context_bound = max(1, math.isqrt(settings.max_seq_length))
+    # Packed model bytes per block are not a measure of activation bytes per token.
+    # The native pilot verifies this memory-bounded candidate and halves it on OOM.
+    memory_fraction = min(1.0, headroom / max(model.size_bytes, 1))
+    budget_batch = max(1, int(context_bound * memory_fraction))
+    candidate = 1 << (budget_batch.bit_length() - 1)
     if model.context_length is not None:
         while (
             candidate > 1
@@ -133,8 +137,8 @@ def _pilot_microbatch(
     return max(settings.gguf_batch_size, candidate)
 
 
-def _pilot_record(record: dict, context: int, rng: random.Random) -> dict:
-    """Keep one varied supervised exchange for a bounded calibration trial."""
+def _pilot_record(record: dict, context: int, excerpt_chars: int, rng: random.Random) -> dict:
+    """Keep a varied exchange with a budget derived from source record lengths."""
     messages = record.get("messages", [])
     assistant_indices = [
         index
@@ -155,12 +159,15 @@ def _pilot_record(record: dict, context: int, rng: random.Random) -> dict:
         "",
     )
     answer = messages[assistant_index]["content"]
-    prompt_chars = min(512, max(64, context // 4))
-    answer_chars = min(64, max(32, context // 4))
+    prompt_chars = min(excerpt_chars // 4, context // 4)
+    answer_chars = min(excerpt_chars - prompt_chars, context // 2)
+    answer_start = rng.randrange(max(1, len(answer) - answer_chars + 1))
     excerpt = []
     if prompt.strip():
         excerpt.append({"role": "user", "content": prompt[-prompt_chars:].strip()})
-    excerpt.append({"role": "assistant", "content": answer[:answer_chars].strip()})
+    excerpt.append(
+        {"role": "assistant", "content": answer[answer_start : answer_start + answer_chars].strip()}
+    )
     return {"messages": excerpt}
 
 
@@ -172,6 +179,10 @@ def _sample_source_rows(path: Path, limit: int | None):
     size = path.stat().st_size
     if size == 0:
         return
+    with path.open("rb") as source:
+        if sum(1 for _ in zip(source, range(limit + 1), strict=False)) <= limit:
+            yield from _source_rows(path)
+            return
     seen: set[int] = set()
     with path.open("rb") as source:
         for slot in range(limit):
@@ -251,6 +262,8 @@ def sample_training_data(
         training = training[: -len(holdout)]
     if holdout and len(training) > train_rows:
         training = training[:train_rows]
+    typical_chars = int(statistics.median(lengths)) if lengths else 0
+    excerpt_chars = min(max(128, math.isqrt(max(typical_chars, 1)) * 4), max(128, context * 2))
     destination.mkdir(parents=True, exist_ok=False)
     for name, records in (("train", training), ("test", holdout)):
         if not records:
@@ -259,13 +272,13 @@ def sample_training_data(
             for record in records:
                 output.write(
                     json.dumps(
-                        _pilot_record(record, context, rng),
+                        _pilot_record(record, context, excerpt_chars, rng),
                         ensure_ascii=False,
                         separators=(",", ":"),
                     )
                     + "\n"
                 )
-    return len(training), counts["train"], int(statistics.median(lengths)) if lengths else 0
+    return len(training), counts["train"], typical_chars
 
 
 def calibrate_training(
@@ -313,7 +326,7 @@ def calibrate_training(
             sample,
             context=benchmark.settings.max_seq_length,
             train_rows=max(_MAX_TRAIN_ROWS, min(8, len(benchmark.devices) * 2)),
-            max_rows_per_file=256 if os.environ.get("OSAI_CALIBRATION_QUICK") == "1" else None,
+            max_rows_per_file=_MAX_INSPECTED_ROWS_PER_FILE,
             progress=lambda index, total, name: notify(
                 f"phase=sampling detail=Reading file {index} of {total}: {name}"
             ),
@@ -475,18 +488,12 @@ def calibrate_training(
                         engine.value,
                         benchmark.accelerator,
                         benchmark.devices,
+                        # Short pilot rows do not measure sustained device throughput.
+                        (),
                     )
                     score = after_test if after_test is not None else last
                     if score < best_test_loss:
                         best, best_test_loss = result, score
-                    if index == 1 and improvement < _TARGET_PILOT_IMPROVEMENT_PERCENT:
-                        growth = min(8.0, _TARGET_PILOT_IMPROVEMENT_PERCENT / improvement)
-                        rates[1] = rate * growth
-                        notify(
-                            "phase=pilot detail=Stable decline is small; testing a "
-                            f"measured faster rate {rates[1]:.2e}"
-                        )
-                        continue
                     break
                 trials.append(f"{rate:.2e}: training or held-out loss did not reliably decline")
                 if best is not None:

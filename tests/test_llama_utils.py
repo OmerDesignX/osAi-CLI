@@ -37,6 +37,35 @@ def test_structured_llama_corpus_preserves_record_boundaries_without_repeating(
     assert destination.read_text() == "user: q\nassistant: a\n"
 
 
+def test_selected_gpu_rows_keep_each_complete_record_in_source_order(tmp_path: Path):
+    source = tmp_path / "train.jsonl"
+    source.write_text(
+        "\n".join(
+            f'{{"prompt":"question {index}","completion":"answer {index}"}}' for index in range(4)
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    first = _write_corpus(
+        source,
+        tmp_path / "first.txt",
+        64,
+        repeat_to_minimum=False,
+        selected_rows=frozenset({0, 3}),
+    ).read_text(encoding="utf-8")
+    second = _write_corpus(
+        source,
+        tmp_path / "second.txt",
+        64,
+        repeat_to_minimum=False,
+        selected_rows=frozenset({1, 2}),
+    ).read_text(encoding="utf-8")
+    assert first.index("question 0") < first.index("question 3")
+    assert second.index("question 1") < second.index("question 2")
+    for index in range(4):
+        assert sum(f"answer {index}" in corpus for corpus in (first, second)) == 1
+
+
 def test_llama_loss_parser_uses_precise_output_row(tmp_path: Path):
     output = "       0  1.1485  0.138449  0.066124\nFinal estimate: PPL = 1.1485"
     assert _parse_loss(output, tmp_path / "train.log") == 0.138449

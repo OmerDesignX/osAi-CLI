@@ -6,7 +6,7 @@ import pytest
 import osai.hardware as hardware
 from osai.backends import llama_cpp
 from osai.backends.mlx import MlxBackend
-from osai.errors import ConfigurationError, DependencyError
+from osai.errors import ConfigurationError, DependencyError, TrainingError
 from osai.hardware import (
     Accelerator,
     Engine,
@@ -53,6 +53,27 @@ def test_cpu_build_does_not_claim_gpu_training():
     assert select_llama_accelerator("cuda", detected, for_build=True) is Accelerator.CUDA
 
 
+def test_auto_runtime_does_not_silently_train_on_cpu_with_nvidia_gpu(monkeypatch):
+    detected = report(accelerator="cuda")
+    detected = detected.__class__(**{**detected.as_dict(), "compiled_llama_accelerator": "cpu"})
+    monkeypatch.setattr(llama_cpp, "detect_hardware", lambda: detected)
+    monkeypatch.setattr(llama_cpp.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(llama_cpp, "_vulkan_build_available", lambda: False)
+    monkeypatch.delenv("CUDA_PATH", raising=False)
+    with pytest.raises(DependencyError, match="GPU was detected"):
+        llama_cpp.ensure_runtime_accelerator("auto")
+
+
+def test_auto_runtime_needs_cmake_when_only_cpu_build_is_packaged(monkeypatch):
+    detected = report(accelerator="cuda")
+    detected = detected.__class__(**{**detected.as_dict(), "compiled_llama_accelerator": "cpu"})
+    monkeypatch.setattr(llama_cpp, "detect_hardware", lambda: detected)
+    monkeypatch.setattr(llama_cpp.shutil, "which", lambda name: "nvcc" if name == "nvcc" else None)
+    monkeypatch.setattr(llama_cpp, "_cmake_executable", lambda: None)
+    with pytest.raises(DependencyError, match="CMake is required"):
+        llama_cpp.ensure_runtime_accelerator("auto")
+
+
 def test_cuda_build_targets_every_installed_gpu_architecture(monkeypatch):
     monkeypatch.setattr(
         llama_cpp.shutil, "which", lambda name: "nvidia-smi" if name == "nvidia-smi" else None
@@ -63,6 +84,30 @@ def test_cuda_build_targets_every_installed_gpu_architecture(monkeypatch):
         lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="8.6\n8.9\n8.6\n"),
     )
     assert llama_cpp._cuda_architectures() == ("86", "89")
+
+
+def test_explicit_cuda_build_failure_never_switches_backend(monkeypatch, tmp_path):
+    monkeypatch.setattr(llama_cpp, "llama_cpp_root", lambda: tmp_path)
+    monkeypatch.setattr(llama_cpp, "_cmake_executable", lambda: "cmake")
+    monkeypatch.setattr(
+        llama_cpp, "select_llama_accelerator", lambda *_args, **_kwargs: Accelerator.CUDA
+    )
+    monkeypatch.setattr(llama_cpp, "_vulkan_build_available", lambda: True)
+    attempts = []
+
+    def fail_configure(_cmake, _root, _build, _log, accelerator, also_vulkan=False):
+        attempts.append((accelerator, also_vulkan))
+        raise TrainingError("CUDA build failed")
+
+    monkeypatch.setattr(llama_cpp, "_configure", fail_configure)
+    with pytest.raises(TrainingError, match="CUDA build failed"):
+        llama_cpp.build_llama_cpp(
+            log_path=tmp_path / "build.log",
+            build_dir=tmp_path / "build",
+            accelerator=Accelerator.CUDA,
+            cpu_fallback=True,
+        )
+    assert attempts == [(Accelerator.CUDA, False)]
 
 
 def test_combined_cuda_vulkan_build_accepts_both_backends():

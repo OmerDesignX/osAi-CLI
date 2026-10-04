@@ -10,10 +10,60 @@ from unittest.mock import patch
 
 import pytest
 
-from osai.backends.llama_gradient import LlamaGradientOptions, _run_parallel_gradient
+from osai.backends.llama_gradient import (
+    LlamaGradientOptions,
+    _gradient_worker_log_summary,
+    _run_parallel_gradient,
+    _weighted_record_shards,
+)
 from osai.checkpoints import CheckpointPublisher, LatestCheckpoint
 from osai.errors import TrainingError
 from osai.hardware import Accelerator
+
+
+def test_weighted_gpu_shards_keep_all_records_and_follow_measured_speeds(tmp_path: Path):
+    source = tmp_path / "train.jsonl"
+    lengths = [100 + index * 17 for index in range(30)]
+    source.write_bytes(b"".join(b"x" * length + b"\n" for length in lengths))
+    shards = _weighted_record_shards(source, (2.0, 1.0), len(lengths))
+    assert shards[0].isdisjoint(shards[1])
+    assert shards[0] | shards[1] == set(range(len(lengths)))
+    workloads = [sum(lengths[index] + 1 for index in shard) for shard in shards]
+    assert 1.5 < workloads[0] / workloads[1] < 2.5
+    two_rows = tmp_path / "two.jsonl"
+    two_rows.write_bytes(b"x" * 200 + b"\n" + b"y" * 20 + b"\n")
+    assert _weighted_record_shards(two_rows, (100.0, 1.0), 2) == (
+        frozenset({0}),
+        frozenset({1}),
+    )
+
+
+def test_worker_summary_streams_native_metrics_and_skips_failed_attempt(tmp_path: Path):
+    log = tmp_path / "worker.log"
+    with log.open("w", encoding="utf-8") as handle:
+        handle.write("assistant-only loss enabled for 120 labels in 2 examples\n")
+        for index in range(10000):
+            handle.write(f"train: data={index + 1:05d}/10000 t=00:00:20\n")
+        handle.write("supervised optimizer step labels=64\n")
+        handle.write("supervised optimizer step labels=56\n")
+        handle.write("epoch=1 train_loss=0.5\n")
+    assert _gradient_worker_log_summary(log, 1, True, 25.0) == (
+        (0.5,),
+        2,
+        120,
+        400.0,
+        None,
+    )
+    with log.open("a", encoding="utf-8") as handle:
+        previous = handle.tell()
+        handle.write("epoch=1 train_loss=0.25\ncheckpoint epoch=1 best_train_loss=0.25\n")
+    assert _gradient_worker_log_summary(log, 1, False, 1.0, start_offset=previous) == (
+        (0.25,),
+        1,
+        None,
+        1.0,
+        (1, 0.25),
+    )
 
 
 def test_latest_checkpoint_replaces_adapter_and_ack(tmp_path: Path) -> None:
@@ -73,6 +123,7 @@ def test_parallel_checkpoint_waits_for_both_gpu_snapshots(tmp_path: Path) -> Non
     logs = tmp_path / "logs"
     work.mkdir()
     logs.mkdir()
+    (tmp_path / "train.jsonl").write_bytes(b'{"text":"a"}\n{"text":"b"}\n')
     request = tmp_path / "checkpoint.request"
     request.write_text("save-both\n", encoding="utf-8")
     combines: list[tuple[bytes, ...]] = []
@@ -90,9 +141,13 @@ def test_parallel_checkpoint_waits_for_both_gpu_snapshots(tmp_path: Path) -> Non
         combines.append(values)
         destination.write_bytes(b"|".join(values))
 
-    settings = LlamaGradientOptions(epochs=1, mask_prompt=False, devices=("CUDA0", "CUDA1"))
+    settings = LlamaGradientOptions(
+        epochs=1, mask_prompt=False, devices=("CUDA0", "CUDA1"), threads=12
+    )
+    worker_threads: list[int] = []
 
-    def fake_command(_binary, _model, _adapter, _corpus, output, *_rest):
+    def fake_command(_binary, _model, _adapter, _corpus, output, worker, *_rest):
+        worker_threads.append(worker.threads)
         return ["fake", str(output)]
 
     with (
@@ -115,8 +170,9 @@ def test_parallel_checkpoint_waits_for_both_gpu_snapshots(tmp_path: Path) -> Non
             return_value="trained",
         ),
         patch("osai.backends.llama_gradient.CheckpointPublisher"),
+        patch("osai.backends.llama_gradient.os.cpu_count", return_value=12),
     ):
-        losses, steps = _run_parallel_gradient(
+        losses, steps, speeds = _run_parallel_gradient(
             Path("fake"),
             tmp_path / "base.gguf",
             "test",
@@ -135,7 +191,9 @@ def test_parallel_checkpoint_waits_for_both_gpu_snapshots(tmp_path: Path) -> Non
         )
     assert losses == (0.5,)
     assert steps == 4
+    assert speeds == (2.0, 2.0)
     assert len(combines) == 2
+    assert worker_threads == [6, 6]
     assert (tmp_path / "outputs" / "checkpoint" / "last.ack").read_text().strip() == "save-both"
     assert (work / "final.gguf").read_bytes() == b"[CUDA0] |[CUDA1] "
 
@@ -145,6 +203,7 @@ def test_parallel_failure_stops_other_gpu_and_reports_the_failed_device(tmp_path
     logs = tmp_path / "logs"
     work.mkdir()
     logs.mkdir()
+    (tmp_path / "train.jsonl").write_bytes(b'{"text":"a"}\n{"text":"b"}\n')
 
     def fake_run(_command, *, output_prefix, cancel_event, **_kwargs):
         if output_prefix == "[CUDA1] ":

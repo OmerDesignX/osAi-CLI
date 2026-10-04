@@ -1,7 +1,10 @@
 from pathlib import Path
 
+import pytest
+
 from osai.auto_benchmark import benchmark_auto_settings
 from osai.config import ModelFormat
+from osai.errors import ConfigurationError
 from osai.formats import ModelInspection, QuantizationSpec
 from osai.hardware import Accelerator, Engine
 
@@ -71,6 +74,31 @@ def test_benchmark_probes_each_cuda_gpu_for_data_parallel_training(monkeypatch, 
 
     assert selected.devices == ("CUDA0", "CUDA1")
     assert probed == ["CUDA0", "CUDA1"]
+
+
+def test_benchmark_rejects_integrated_vulkan_device_when_discrete_exists(
+    monkeypatch, tmp_path: Path
+):
+    model = _model(tmp_path)
+    binary = tmp_path / "llama-completion"
+    binary.write_bytes(b"binary")
+    monkeypatch.setattr("osai.auto_benchmark.llama_binary", lambda _name: binary)
+    monkeypatch.setattr(
+        "osai.auto_benchmark.select_llama_accelerator", lambda _: Accelerator.VULKAN
+    )
+    monkeypatch.setattr(
+        "osai.auto_benchmark.available_llama_devices",
+        lambda _binary, _accelerator: ("Vulkan1", "Vulkan2"),
+    )
+
+    with pytest.raises(ConfigurationError, match="unavailable"):
+        benchmark_auto_settings(
+            model,
+            engine=Engine.LLAMA_CPP,
+            accelerator="vulkan",
+            multi_gpu="on",
+            devices=("Vulkan0", "Vulkan1"),
+        )
 
 
 def test_benchmark_reserves_gpu_memory_for_backward_pass(monkeypatch, tmp_path: Path):

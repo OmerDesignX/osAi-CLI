@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -81,6 +82,7 @@ class TrainingConfig:
     memory_budget_bytes: int | None = None
     multi_gpu: str = "auto"
     devices: tuple[str, ...] = ()
+    device_speeds: tuple[float, ...] = ()
     split_mode: str = "layer"
     tensor_split: tuple[float, ...] = ()
     main_gpu: int = 0
@@ -100,6 +102,8 @@ class TrainingConfig:
             object.__setattr__(self, "target_modules", tuple(self.target_modules))
         if not isinstance(self.devices, tuple):
             object.__setattr__(self, "devices", tuple(self.devices))
+        if not isinstance(self.device_speeds, tuple):
+            object.__setattr__(self, "device_speeds", tuple(self.device_speeds))
         if not isinstance(self.tensor_split, tuple):
             object.__setattr__(self, "tensor_split", tuple(self.tensor_split))
         self.validate()
@@ -142,9 +146,7 @@ class TrainingConfig:
         if self.scale <= 0:
             raise ConfigurationError("scale must be positive")
         if self.optimizer not in {"auto", "adam", "adamw", "sgd", "adafactor"}:
-            raise ConfigurationError(
-                "optimizer must be auto, adam, adamw, sgd, or adafactor"
-            )
+            raise ConfigurationError("optimizer must be auto, adam, adamw, sgd, or adafactor")
         for name in ("strict_base_hash", "merge_model", "materialize_base", "auto_settings"):
             if not isinstance(getattr(self, name), bool):
                 raise ConfigurationError(f"{name} must be true or false")
@@ -160,6 +162,10 @@ class TrainingConfig:
             raise ConfigurationError("main_gpu and distributed_workers cannot be negative")
         if any(not value.strip() or "," in value for value in self.devices):
             raise ConfigurationError("device names must be non-empty and cannot contain commas")
+        if self.device_speeds and len(self.device_speeds) != len(self.devices):
+            raise ConfigurationError("device speeds must match the ordered device list")
+        if any(not math.isfinite(value) or value <= 0 for value in self.device_speeds):
+            raise ConfigurationError("device speeds must be finite and positive")
         if any(value <= 0 for value in self.tensor_split):
             raise ConfigurationError("tensor_split values must be positive")
         if not self.target_modules:
@@ -202,6 +208,7 @@ class TrainingConfig:
         result["format"] = self.effective_format.value
         result["target_modules"] = list(self.target_modules)
         result["devices"] = list(self.devices)
+        result["device_speeds"] = list(self.device_speeds)
         result["tensor_split"] = list(self.tensor_split)
         return result
 
@@ -235,9 +242,7 @@ class TrainingConfig:
             if values.get(key) is not None:
                 candidate = Path(values[key]).expanduser()
                 values[key] = (
-                    candidate.resolve()
-                    if candidate.is_absolute()
-                    else (root / candidate).resolve()
+                    candidate.resolve() if candidate.is_absolute() else (root / candidate).resolve()
                 )
         return cls(**values)
 

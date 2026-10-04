@@ -51,6 +51,21 @@ def test_invalid_training_values_are_rejected(tmp_path: Path, field: str, value)
         TrainingConfig(**values)
 
 
+def test_device_speeds_match_selected_gpus(tmp_path: Path):
+    values = {
+        "model": tmp_path / "model",
+        "data": tmp_path / "data",
+        "output": tmp_path / "out",
+        "format": ModelFormat.MLX,
+    }
+    with pytest.raises(ConfigurationError, match="match the ordered device list"):
+        TrainingConfig(**values, devices=("CUDA0", "CUDA1"), device_speeds=(2.0,))
+    with pytest.raises(ConfigurationError, match="finite and positive"):
+        TrainingConfig(**values, devices=("CUDA0",), device_speeds=(float("nan"),))
+    config = TrainingConfig(**values, devices=("CUDA0", "CUDA1"), device_speeds=(2.0, 1.0))
+    assert config.as_dict()["device_speeds"] == [2.0, 1.0]
+
+
 def test_gguf_requires_mlx_companion(tmp_path: Path):
     config = TrainingConfig(
         model=tmp_path / "model.gguf",

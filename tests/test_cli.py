@@ -5,6 +5,7 @@ import pytest
 
 from osai.auto_settings import select_auto_settings
 from osai.cli import (
+    _calibrated_gguf_batch_size,
     _choose_combined_alignment,
     _fit_gguf_context,
     _resolve_training_settings,
@@ -43,6 +44,12 @@ def test_full_content_context_fits_the_calibrated_gguf_microbatch(
     assert fitted.max_seq_length == expected_context
     assert fitted.gguf_batch_size == expected_batch
     assert fitted.max_seq_length % fitted.gguf_batch_size == 0
+
+
+def test_auto_training_uses_the_microbatch_verified_by_calibration():
+    assert _calibrated_gguf_batch_size(1, 32, explicitly_selected=False) == 32
+    assert _calibrated_gguf_batch_size(64, 32, explicitly_selected=True) == 32
+    assert _calibrated_gguf_batch_size(4, 32, explicitly_selected=True) == 4
 
 
 def test_train_auto_settings_and_manual_overrides_parse():
@@ -103,6 +110,28 @@ def test_manual_training_defaults_are_resolved_after_parsing():
     assert args.rollouts_per_prompt == 2
 
 
+def test_measured_gpu_speeds_parse_in_device_order():
+    args = build_parser().parse_args(
+        [
+            "train",
+            "--tier",
+            "small",
+            "--data",
+            "data",
+            "--device",
+            "CUDA0",
+            "--device-speed",
+            "2.1",
+            "--device",
+            "CUDA1",
+            "--device-speed",
+            "1",
+        ]
+    )
+    assert args.devices == ["CUDA0", "CUDA1"]
+    assert args.device_speeds == [2.1, 1.0]
+
+
 def test_fine_tune_epochs_and_legacy_iterations_share_one_value():
     parser = build_parser()
     epochs = parser.parse_args(["train", "--tier", "small", "--data", "data", "--epochs", "3"])
@@ -133,7 +162,7 @@ def test_auto_optimizer_is_backend_aware(tmp_path: Path):
         output=tmp_path / "out",
     )
     assert _select_optimizer(args, config, Engine.MLX) == "adamw"
-    assert _select_optimizer(args, config, Engine.LLAMA_CPP) == "sgd"
+    assert _select_optimizer(args, config, Engine.LLAMA_CPP) == "adamw"
 
 
 def test_manual_optimizer_overrides_backend_default(tmp_path: Path):

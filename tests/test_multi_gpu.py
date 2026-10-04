@@ -65,9 +65,9 @@ def test_vulkan_auto_prefers_nvidia_cards_over_integrated_adapter(monkeypatch, t
         returncode = 0
         stdout = (
             "Available devices:\n"
-            "  Vulkan0: AMD Radeon(TM) Graphics (32700 MiB)\n"
-            "  Vulkan1: NVIDIA GeForce RTX 3060 (12324 MiB)\n"
-            "  Vulkan2: NVIDIA GeForce RTX 3060 (12329 MiB)\n"
+            "  Vulkan0: AMD Radeon(TM) Graphics (32700 MiB) [type=integrated]\n"
+            "  Vulkan1: NVIDIA GeForce RTX 3060 (12324 MiB) [type=dedicated]\n"
+            "  Vulkan2: NVIDIA GeForce RTX 3060 (12329 MiB) [type=dedicated]\n"
         )
 
     monkeypatch.setattr("osai.multi_gpu.subprocess.run", lambda *_args, **_kwargs: Completed())
@@ -82,10 +82,10 @@ def test_vulkan_auto_keeps_discrete_cards_from_multiple_vendors(monkeypatch, tmp
         returncode = 0
         stdout = (
             "Available devices:\n"
-            "  Vulkan0: AMD Radeon(TM) Graphics (32700 MiB)\n"
-            "  Vulkan1: AMD Radeon RX 7900 XTX (24576 MiB)\n"
-            "  Vulkan2: NVIDIA GeForce RTX 3060 (12000 MiB)\n"
-            "  Vulkan3: Intel Arc A770 Graphics (16384 MiB)\n"
+            "  Vulkan0: AMD Radeon(TM) Graphics (32700 MiB) [type=integrated]\n"
+            "  Vulkan1: AMD Radeon RX 7900 XTX (24576 MiB) [type=dedicated]\n"
+            "  Vulkan2: NVIDIA GeForce RTX 3060 (12000 MiB) [type=dedicated]\n"
+            "  Vulkan3: Intel Arc A770 Graphics (16384 MiB) [type=dedicated]\n"
         )
 
     monkeypatch.setattr("osai.multi_gpu.subprocess.run", lambda *_args, **_kwargs: Completed())
@@ -125,7 +125,43 @@ def test_metal_prefers_external_gpu_over_integrated_card(monkeypatch, tmp_path):
     assert available_llama_devices(tmp_path / "llama-completion", Accelerator.METAL) == ("MTL1",)
     assert available_llama_devices(
         tmp_path / "llama-completion", Accelerator.METAL, include_integrated=True
-    ) == ("MTL1", "MTL0")
+    ) == ("MTL1",)
+
+
+def test_vulkan_required_multi_gpu_never_adds_integrated_card(monkeypatch, tmp_path):
+    class Completed:
+        returncode = 0
+        stdout = (
+            "Available devices:\n"
+            "  Vulkan0: AMD Radeon(TM) Graphics (32700 MiB) [type=integrated]\n"
+            "  Vulkan1: NVIDIA GeForce RTX 3060 (12000 MiB) [type=dedicated]\n"
+        )
+
+    monkeypatch.setattr("osai.multi_gpu.subprocess.run", lambda *_args, **_kwargs: Completed())
+    assert available_llama_devices(
+        tmp_path / "llama-completion", Accelerator.VULKAN, include_integrated=True
+    ) == ("Vulkan1",)
+
+
+def test_vulkan_rejects_integrated_only_inventory(monkeypatch, tmp_path):
+    class Completed:
+        returncode = 0
+        stdout = (
+            "Available devices:\n  Vulkan0: AMD Radeon(TM) Graphics (32700 MiB) [type=integrated]\n"
+        )
+
+    monkeypatch.setattr("osai.multi_gpu.subprocess.run", lambda *_args, **_kwargs: Completed())
+    assert available_llama_devices(tmp_path / "llama-completion", Accelerator.VULKAN) == ()
+
+
+def test_vulkan_requires_authoritative_device_type(monkeypatch, tmp_path):
+    class Completed:
+        returncode = 0
+        stdout = "Available devices:\n  Vulkan0: AMD Radeon 780M Graphics (32700 MiB)\n"
+
+    monkeypatch.setattr("osai.multi_gpu.subprocess.run", lambda *_args, **_kwargs: Completed())
+    with pytest.raises(ConfigurationError, match="cannot identify dedicated GPUs"):
+        available_llama_devices(tmp_path / "llama-completion", Accelerator.VULKAN)
 
 
 def test_native_device_inventory_reports_free_gpu_memory(monkeypatch, tmp_path):
@@ -136,6 +172,20 @@ def test_native_device_inventory_reports_free_gpu_memory(monkeypatch, tmp_path):
     monkeypatch.setattr("osai.multi_gpu.subprocess.run", lambda *_args, **_kwargs: Completed())
     assert llama_device_free_bytes(tmp_path / "llama-completion", Accelerator.METAL) == {
         "MTL1": 6144 * 1024**2
+    }
+
+
+def test_typed_vulkan_inventory_retains_free_memory(monkeypatch, tmp_path):
+    class Completed:
+        returncode = 0
+        stdout = (
+            "Available devices:\n"
+            "  Vulkan0: NVIDIA GeForce RTX 3060 (12287 MiB, 8192 MiB free) [type=dedicated]\n"
+        )
+
+    monkeypatch.setattr("osai.multi_gpu.subprocess.run", lambda *_args, **_kwargs: Completed())
+    assert llama_device_free_bytes(tmp_path / "llama-completion", Accelerator.VULKAN) == {
+        "Vulkan0": 8192 * 1024**2
     }
 
 

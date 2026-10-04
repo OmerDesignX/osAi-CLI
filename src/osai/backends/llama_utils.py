@@ -336,6 +336,7 @@ def _write_corpus(
     record_separator: str = "\n\n",
     shard_index: int = 0,
     shard_count: int = 1,
+    selected_rows: frozenset[int] | None = None,
 ) -> Path:
     # A multi-gigabyte JSONL corpus must not be collected and joined in RAM.
     # The native trainer still tokenizes its input, but this preparation step
@@ -349,7 +350,10 @@ def _write_corpus(
             destination.open("w", encoding="utf-8", newline="\n") as output,
         ):
             for line_number, line in enumerate(handle, 1):
-                if (line_number - 1) % shard_count != shard_index:
+                if selected_rows is not None:
+                    if line_number - 1 not in selected_rows:
+                        continue
+                elif (line_number - 1) % shard_count != shard_index:
                     continue
                 try:
                     record = json.loads(line)

@@ -3647,6 +3647,11 @@ void llama_context::opt_epoch_weighted(
     GGML_ASSERT(idata_split >= 0);
     GGML_ASSERT(idata_split <= ndata);
 
+    if (idata_split > 1 && example_weights == nullptr) {
+        ggml_opt_dataset_shuffle(opt_ctx, dataset, idata_split);
+        LLAMA_LOG_INFO("%s: shuffled %" PRId64 " training records\n", __func__, idata_split);
+    }
+
     struct llama_batch batch = llama_batch_init(n_batch, 0, 1);
     std::vector<llama_token>        tokens(n_ctx);
     std::vector<llama_token> labels_sparse(n_ctx);

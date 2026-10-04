@@ -23,7 +23,7 @@ class DeviceSettings(Protocol):
 def available_llama_devices(
     binary: Path | None, accelerator: Accelerator, *, include_integrated: bool = False
 ) -> tuple[str, ...]:
-    """Resolve native IDs, preferring external cards and optionally including integrated GPUs."""
+    """Resolve native IDs, excluding integrated Vulkan adapters for training."""
 
     if binary is None or accelerator is Accelerator.CPU:
         return ()
@@ -51,6 +51,21 @@ def available_llama_devices(
         result.stdout + "\n" + (getattr(result, "stderr", "") or ""),
         re.M | re.I,
     )
+    if accelerator is Accelerator.VULKAN:
+        typed = [
+            (device, re.search(r"\[type=(dedicated|integrated|other)\]\s*$", label, re.I))
+            for device, label in devices
+        ]
+        if any(kind is None for _device, kind in typed):
+            raise ConfigurationError(
+                "the Vulkan trainer cannot identify dedicated GPUs; rebuild llama.cpp "
+                "with `osai build-llama` before training"
+            )
+        return tuple(
+            device
+            for device, kind in typed
+            if kind is not None and kind.group(1).casefold() == "dedicated"
+        )
     if accelerator in {Accelerator.VULKAN, Accelerator.METAL}:
         integrated = re.compile(
             r"Radeon\(TM\) Graphics|Intel.*(?:UHD|Iris|HD).*Graphics|Integrated Graphics",
@@ -60,12 +75,7 @@ def available_llama_devices(
         if discrete:
             external = re.compile(r"\b(?:eGPU|external|removable)\b", re.I)
             discrete.sort(key=lambda item: not bool(external.search(item[1])))
-            preferred = discrete + (
-                [(device, label) for device, label in devices if integrated.search(label)]
-                if include_integrated
-                else []
-            )
-            return tuple(device for device, _label in preferred)
+            return tuple(device for device, _label in discrete)
     return tuple(device for device, _label in devices)
 
 

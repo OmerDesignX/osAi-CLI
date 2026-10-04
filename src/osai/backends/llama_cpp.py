@@ -71,12 +71,13 @@ def build_llama_cpp(
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.unlink(missing_ok=True)
     requested = select_llama_accelerator(accelerator, for_build=True)
+    automatic = Accelerator(accelerator) is Accelerator.AUTO
     candidates = [(requested, also_vulkan and requested is Accelerator.CUDA)]
     if candidates[0][1]:
         candidates.append((Accelerator.CUDA, False))
-    if requested is Accelerator.CUDA and _vulkan_build_available():
+    if automatic and requested is Accelerator.CUDA and _vulkan_build_available():
         candidates.append((Accelerator.VULKAN, False))
-    if cpu_fallback and requested is not Accelerator.CPU:
+    if automatic and cpu_fallback and requested is not Accelerator.CPU:
         candidates.append((Accelerator.CPU, False))
 
     build_command = [
@@ -175,10 +176,10 @@ def ensure_runtime_accelerator(requested: str | Accelerator) -> None:
                 for backend in ("metal", "cuda", "vulkan")
             ):
                 return
-            if report.cuda:
-                print(
-                    "osai: NVIDIA GPU found, but CUDA Toolkit and Vulkan SDK are not "
-                    "available for a local llama.cpp build; using the CPU trainer"
+            if report.metal or report.cuda or report.vulkan:
+                raise DependencyError(
+                    "a GPU was detected, but no supported GPU llama.cpp backend can be built; "
+                    "install the platform build tools or explicitly select --accelerator cpu"
                 )
             return
     if candidate.value in (report.compiled_llama_accelerator or "").split("+"):
@@ -199,9 +200,13 @@ def ensure_runtime_accelerator(requested: str | Accelerator) -> None:
         )
     if _cmake_executable() is None:
         if choice is Accelerator.AUTO:
-            packaged = report.compiled_llama_accelerator or "available"
-            print(f"osai: CMake is unavailable; using the packaged {packaged} trainer")
-            return
+            packaged = (report.compiled_llama_accelerator or "").split("+")
+            if any(backend in packaged for backend in ("metal", "cuda", "vulkan")):
+                print(
+                    "osai: CMake is unavailable; using the packaged GPU trainer",
+                    flush=True,
+                )
+                return
         raise DependencyError("CMake is required to build a GPU llama.cpp backend")
     print(f"osai: building llama.cpp {candidate.value} backend for this host")
     try:
@@ -215,9 +220,14 @@ def ensure_runtime_accelerator(requested: str | Accelerator) -> None:
                 candidate is Accelerator.CUDA and report.vulkan and _vulkan_build_available()
             ),
         )
-    except (TrainingError, DependencyError, OSError):
+    except (TrainingError, DependencyError, OSError) as exc:
         if choice is not Accelerator.AUTO:
             raise
+        available = (detect_hardware().compiled_llama_accelerator or "").split("+")
+        if not any(backend in available for backend in ("metal", "cuda", "vulkan")):
+            raise DependencyError(
+                "the GPU llama.cpp build failed and no GPU trainer is available"
+            ) from exc
         print(f"osai: {candidate.value} build failed; continuing with the available backend")
 
 
@@ -258,9 +268,7 @@ def _repair_stale_ninja_cache(build: Path) -> None:
             return
         ninja = shutil.which("ninja")
         if not ninja:
-            sibling = Path(sys.executable).parent / (
-                "ninja.exe" if os.name == "nt" else "ninja"
-            )
+            sibling = Path(sys.executable).parent / ("ninja.exe" if os.name == "nt" else "ninja")
             ninja = str(sibling) if sibling.is_file() else None
         if ninja:
             pending = cache.with_name("CMakeCache.txt.pending")

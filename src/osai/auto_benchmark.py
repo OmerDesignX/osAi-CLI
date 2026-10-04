@@ -83,9 +83,7 @@ def benchmark_auto_settings(
         binary = llama_binary("llama-completion")
         if binary is None:
             raise DependencyError("llama-completion is missing; run `osai build-llama`")
-        discovered = available_llama_devices(
-            binary, selected, include_integrated=multi_gpu == "on" or bool(devices)
-        )
+        discovered = available_llama_devices(binary, selected)
         chosen = devices or discovered
         if selected is Accelerator.CPU:
             chosen = ()
