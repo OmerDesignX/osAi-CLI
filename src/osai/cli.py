@@ -439,7 +439,7 @@ def build_parser() -> argparse.ArgumentParser:
     calibration_parser.add_argument("--multi-gpu", choices=["auto", "on", "off"], default="auto")
     calibration_parser.add_argument("--device", action="append", dest="devices")
     calibration_parser.add_argument("--optimizer", choices=["auto", "sgd", "adamw"], default="auto")
-    calibration_parser.add_argument("--scale", type=float, default=4.0)
+    calibration_parser.add_argument("--scale", type=float)
     calibration_parser.add_argument("--dropout", type=float, default=0.0)
     calibration_parser.add_argument("--seed", type=int, default=0)
     calibration_parser.add_argument("--grad-accumulation-steps", type=int, default=1)
@@ -460,6 +460,7 @@ def build_parser() -> argparse.ArgumentParser:
     calibration_parser.add_argument(
         "--full-content-context", action=argparse.BooleanOptionalAction, default=True
     )
+    calibration_parser.add_argument("--calibrated-context", type=int)
     calibration_parser.add_argument(
         "--download-model", action=argparse.BooleanOptionalAction, default=True
     )
@@ -698,11 +699,18 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
                 file=sys.stderr,
                 flush=True,
             )
-            tokenizer_root = config.training_model if engine is Engine.MLX else config.model.parent
+            resolved_gguf_model = (
+                inspect_model(config.model, ModelFormat.GGUF).path
+                if engine is Engine.LLAMA_CPP
+                else config.model
+            )
+            tokenizer_root = (
+                config.training_model if engine is Engine.MLX else resolved_gguf_model.parent
+            )
             maximum = largest_training_context(
                 config.data,
                 tokenizer_root,
-                gguf_model=config.model if engine is Engine.LLAMA_CPP else None,
+                gguf_model=resolved_gguf_model if engine is Engine.LLAMA_CPP else None,
             )
         else:
             maximum = {"context": calibrated_context}
@@ -1537,6 +1545,20 @@ def _auto_benchmark(args: argparse.Namespace) -> int:
 def _calibrate(args: argparse.Namespace) -> int:
     selection = _resolve_cli_model(args)
     expected = ModelFormat.MLX if selection.engine is Engine.MLX else ModelFormat.GGUF
+    fused = selection.model if selection.model.is_dir() else None
+    fused_shape = (
+        _fused_lora_shape(fused, selection.engine)
+        if fused is not None and (fused / "osai_fusion.json").is_file()
+        else None
+    )
+    scale = 4.0 if args.scale is None else args.scale
+    if fused_shape is not None:
+        fused_scale = fused_shape[3]
+        if args.scale is not None and args.scale != fused_scale:
+            raise ConfigurationError(
+                "calibration scale must match the merged custom model's embedded adapter"
+            )
+        scale = fused_scale
     model_path = (
         selection.companion_mlx or selection.model
         if selection.engine is Engine.MLX
@@ -1544,30 +1566,50 @@ def _calibrate(args: argparse.Namespace) -> int:
     )
     inspected = inspect_model(model_path, expected)
     maximum = None
+    calibrated_context = args.calibrated_context
+    if calibrated_context is not None and (
+        not args.full_content_context or calibrated_context < 32
+    ):
+        raise ConfigurationError(
+            "--calibrated-context requires Full context and at least 32 tokens"
+        )
     if args.full_content_context:
-        print(
-            "osai: calibration phase=context "
-            "detail=Scanning every training record for the largest context",
-            file=sys.stderr,
-            flush=True,
-        )
-        maximum = largest_training_context(
-            args.data,
-            model_path if selection.engine is Engine.MLX else model_path.parent,
-            gguf_model=model_path if selection.engine is Engine.LLAMA_CPP else None,
-        )
+        if calibrated_context is None:
+            print(
+                "osai: calibration phase=context "
+                "detail=Scanning every training record for the largest context",
+                file=sys.stderr,
+                flush=True,
+            )
+            maximum = largest_training_context(
+                args.data,
+                model_path if selection.engine is Engine.MLX else inspected.path.parent,
+                gguf_model=inspected.path if selection.engine is Engine.LLAMA_CPP else None,
+            )
+        else:
+            maximum = {
+                "context": calibrated_context,
+                "records": validate_dataset(args.data).train_examples,
+            }
+            print(
+                "osai: calibration phase=context "
+                f"detail=Reusing verified {calibrated_context}-token context",
+                file=sys.stderr,
+                flush=True,
+            )
         if inspected.context_length and maximum["context"] > inspected.context_length:
             raise ConfigurationError(
                 f"Full context needs {maximum['context']} tokens, above this model's "
                 f"{inspected.context_length}-token limit; choose Windowing"
             )
-        print(
-            "osai: calibration phase=context "
-            f"detail=Largest record {maximum['largest_tokens']} tokens; "
-            f"testing {maximum['context']}-token context",
-            file=sys.stderr,
-            flush=True,
-        )
+        if calibrated_context is None:
+            print(
+                "osai: calibration phase=context "
+                f"detail=Largest record {maximum['largest_tokens']} tokens; "
+                f"testing {maximum['context']}-token context",
+                file=sys.stderr,
+                flush=True,
+            )
     print(
         "osai: calibration phase=hardware detail=Fitting devices to the selected context",
         file=sys.stderr,
@@ -1582,6 +1624,17 @@ def _calibrate(args: argparse.Namespace) -> int:
         adapter=_embedded_adapter(selection.model, selection.engine),
         required_context=maximum["context"] if maximum else None,
     )
+    if fused_shape is not None:
+        rank, layers, targets, _scale = fused_shape
+        benchmark = replace(
+            benchmark,
+            settings=replace(
+                benchmark.settings,
+                rank=rank,
+                num_layers=layers,
+                target_modules=targets,
+            ),
+        )
     if maximum is not None:
         benchmark = replace(
             benchmark,
@@ -1597,7 +1650,7 @@ def _calibrate(args: argparse.Namespace) -> int:
             engine=selection.engine,
             multi_gpu=args.multi_gpu,
             optimizer=args.optimizer,
-            scale=args.scale,
+            scale=scale,
             dropout=args.dropout,
             seed=args.seed,
             grad_checkpoint=args.gradient_checkpointing,

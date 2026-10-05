@@ -38,6 +38,9 @@ def test_calibration_scans_and_checks_model_limit_before_hardware_pilot(
 ):
     model_path = tmp_path / "model.gguf"
     model_path.write_bytes(b"GGUF")
+    fusion_path = tmp_path / "fused"
+    fusion_path.mkdir()
+    (fusion_path / "osai_fusion.json").write_text("{}", encoding="utf-8")
     model = ModelInspection(
         format=ModelFormat.GGUF,
         path=model_path,
@@ -50,14 +53,19 @@ def test_calibration_scans_and_checks_model_limit_before_hardware_pilot(
     )
     settings = select_auto_settings(model, engine=Engine.LLAMA_CPP, memory_bytes=64 * 1024**3)
     events = []
+    full_run_rows = []
     monkeypatch.setattr(
         cli,
         "_resolve_cli_model",
-        lambda _: SimpleNamespace(engine=Engine.LLAMA_CPP, model=model_path, companion_mlx=None),
+        lambda _: SimpleNamespace(engine=Engine.LLAMA_CPP, model=fusion_path, companion_mlx=None),
     )
     monkeypatch.setattr(cli, "inspect_model", lambda *_: model)
+    monkeypatch.setattr(cli, "_embedded_adapter", lambda *_: None)
+    monkeypatch.setattr(cli, "_fused_lora_shape", lambda *_: (8, 1, ("mlp.down_proj",), 1.0))
 
-    def scan(*_, **__):
+    def scan(_source, tokenizer_root, *, gguf_model=None):
+        assert tokenizer_root == model_path.parent
+        assert gguf_model == model_path
         events.append("scan")
         return {"context": 3072, "largest_tokens": 3008}
 
@@ -69,7 +77,11 @@ def test_calibration_scans_and_checks_model_limit_before_hardware_pilot(
         events.append("pilot")
         print("native pilot progress")
         assert benchmark_result.settings.max_seq_length == 3072
+        assert benchmark_result.settings.rank == 8
+        assert benchmark_result.settings.target_modules == ("mlp.down_proj",)
         assert kwargs["require_full_context"] is True
+        assert kwargs["scale"] == 1.0
+        full_run_rows.append(kwargs["total_training_rows"])
         return SimpleNamespace(as_dict=lambda: {"context": 3072})
 
     monkeypatch.setattr(cli, "largest_training_context", scan)
@@ -96,6 +108,108 @@ def test_calibration_scans_and_checks_model_limit_before_hardware_pilot(
     with pytest.raises(ConfigurationError, match="choose Windowing"):
         cli._calibrate(args)
     assert events == []
+
+    explicit_scale = cli.build_parser().parse_args(
+        [
+            "calibrate",
+            "--custom",
+            "fused",
+            "--data",
+            str(tmp_path / "data.jsonl"),
+            "--scale",
+            "4",
+        ]
+    )
+    with pytest.raises(ConfigurationError, match="must match.*embedded adapter"):
+        cli._calibrate(explicit_scale)
+
+    events.clear()
+    monkeypatch.setattr(
+        cli,
+        "largest_training_context",
+        lambda *_, **__: pytest.fail("the verified context was rescanned"),
+    )
+    monkeypatch.setattr(cli, "validate_dataset", lambda *_: SimpleNamespace(train_examples=31580))
+    reused = cli.build_parser().parse_args(
+        [
+            "calibrate",
+            "--custom",
+            "fused",
+            "--data",
+            str(tmp_path / "data.jsonl"),
+            "--calibrated-context",
+            "3072",
+        ]
+    )
+    cli._calibrate(reused)
+    assert events == ["hardware", "pilot"]
+    assert full_run_rows[-1] == 31580
+
+
+def test_direct_training_scans_the_gguf_inside_a_fusion_folder(monkeypatch, tmp_path: Path):
+    model_path = tmp_path / "model.gguf"
+    model_path.write_bytes(b"GGUF")
+    fusion_path = tmp_path / "fused"
+    fusion_path.mkdir()
+    data_path = tmp_path / "train.jsonl"
+    data_path.write_text('{"text":"example"}\n', encoding="utf-8")
+    model = ModelInspection(
+        format=ModelFormat.GGUF,
+        path=model_path,
+        architecture="qwen35",
+        quantization=QuantizationSpec("Q4_K_M"),
+        size_bytes=2 * 1024**3,
+        shards=(model_path,),
+        block_count=32,
+        context_length=4096,
+    )
+    selection = SimpleNamespace(
+        engine=Engine.LLAMA_CPP,
+        model=fusion_path,
+        companion_mlx=None,
+        entry=SimpleNamespace(gguf=fusion_path),
+    )
+    monkeypatch.setattr(cli, "_resolve_cli_model", lambda _: selection)
+    monkeypatch.setattr(cli, "inspect_model", lambda *_: model)
+    scanned = []
+
+    def scan(_source, tokenizer_root, *, gguf_model=None):
+        scanned.append((tokenizer_root, gguf_model))
+        return {
+            "context": 3072,
+            "largest_tokens": 3008,
+            "records": 1,
+            "files": 1,
+            "exact": True,
+            "largest_file": str(data_path),
+        }
+
+    monkeypatch.setattr(cli, "largest_training_context", scan)
+    monkeypatch.setattr(cli, "_resolve_training_settings", lambda config, *_args, **_kwargs: config)
+    monkeypatch.setattr(cli, "prepare_dataset_source", lambda source, _destination: source)
+
+    class ReachedTrainingData(Exception):
+        pass
+
+    monkeypatch.setattr(
+        cli, "validate_dataset", lambda _source: (_ for _ in ()).throw(ReachedTrainingData)
+    )
+    args = cli.build_parser().parse_args(
+        [
+            "train",
+            "--custom",
+            "fused",
+            "--data",
+            str(data_path),
+            "--sessions-root",
+            str(tmp_path / "sessions"),
+            "--full-content-context",
+            "--no-auto-settings",
+        ]
+    )
+    with pytest.raises(ReachedTrainingData):
+        cli._fine_tune(args)
+    assert scanned == [(model_path.parent, model_path)]
 
 
 def test_training_reuses_verified_full_context_without_a_second_token_scan(
