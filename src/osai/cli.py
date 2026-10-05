@@ -25,7 +25,7 @@ from .catalog import ModelTier, bundled_root, list_catalog, resolve_model
 from .config import ModelFormat, TrainingConfig
 from .dataset import validate_dataset
 from .dataset_source import largest_training_context, prepare_dataset_source
-from .errors import ConfigurationError, DependencyError, OsAiError, TrainingError
+from .errors import ConfigurationError, DependencyError, OsAiError, TrainingError, TrainingStopped
 from .formats import inspect_model
 from .fusion import resolve_gguf_fusion_bundle, resolve_mlx_fusion_adapter
 from .gguf_adapter import convert_mlx_adapter
@@ -162,6 +162,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     train_parser.add_argument("--sessions-root", type=Path, default=project_root() / "sessions")
     train_parser.add_argument("--session-name")
+    session_path = train_parser.add_mutually_exclusive_group()
+    session_path.add_argument(
+        "--session-directory",
+        type=Path,
+        help="write this run into an existing app session directory",
+    )
+    session_path.add_argument(
+        "--resume-session",
+        type=Path,
+        help="continue a stopped GGUF fine-tuning session from its exact native checkpoint",
+    )
     train_parser.add_argument("--bundled-root", type=Path)
     train_parser.add_argument("--custom-root", type=Path)
     train_parser.add_argument(
@@ -545,6 +556,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return int(args.handler(args) or 0)
+    except TrainingStopped as exc:
+        _print_json({"status": "stopped", "resume_checkpoint": exc.checkpoint})
+        return 0
     except OsAiError as exc:
         print(f"osai: {exc}", file=sys.stderr)
         return 2
@@ -570,6 +584,8 @@ def _inspect(args: argparse.Namespace) -> int:
 
 
 def _train(args: argparse.Namespace) -> int:
+    if args.resume_session is not None and args.stage != "fine-tuning":
+        raise ConfigurationError("exact resume currently requires --stage fine-tuning")
     if args.full_content_context is None:
         args.full_content_context = bool(args.auto_settings)
     if args.stage == "fine-tuning":
@@ -633,7 +649,11 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
                 engine = Engine.MLX
             elif config.companion_mlx is None:
                 engine = Engine.LLAMA_CPP
-        session = getattr(args, "_session_override", None) or timestamped_session_path(
+        session = (
+            getattr(args, "_session_override", None)
+            or args.resume_session
+            or args.session_directory
+        ) or timestamped_session_path(
             args.sessions_root,
             args.session_name or args.config.stem,
         )
@@ -675,7 +695,11 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
             ),
             target_modules=target_modules,
         )
-        session = getattr(args, "_session_override", None) or timestamped_session_path(
+        session = (
+            getattr(args, "_session_override", None)
+            or args.resume_session
+            or args.session_directory
+        ) or timestamped_session_path(
             args.sessions_root,
             args.session_name or f"{source_name}-{args.engine}",
         )
@@ -962,6 +986,7 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
                 auto_settings=config.auto_settings and not args.full_content_context,
             ),
             accelerator=args.accelerator,
+            resume=args.resume_session is not None,
         )
         base_bundle, merged = _publish_native_session(config, native, args.accelerator)
         payload = {

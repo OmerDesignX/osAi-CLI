@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 import re
@@ -15,15 +16,22 @@ from typing import Any
 from ..checkpoints import CheckpointPublisher
 from ..config import DEFAULT_TARGETS, ModelFormat
 from ..dataset import require_text_training, validate_dataset
-from ..errors import ConfigurationError, DependencyError, TrainingError, VerificationError
+from ..errors import (
+    ConfigurationError,
+    DependencyError,
+    TrainingError,
+    TrainingStopped,
+    VerificationError,
+)
 from ..formats import inspect_model
 from ..fusion import resolve_gguf_fusion_bundle
 from ..hardware import Accelerator, select_llama_accelerator
-from ..io import OutputLock, atomic_json, fingerprint
+from ..io import OutputLock, atomic_json, fingerprint, sha256_file
 from ..multi_gpu import available_llama_devices, llama_device_arguments
 from ..offline import offline_environment
 from ..paths import llama_binary
 from ..process import run_logged
+from ..resume_state import extract_adapter
 from ..session import SessionLayout, record_dataset
 from ..system import doctor, physical_memory_bytes
 from .llama_cpp import ensure_runtime_accelerator
@@ -128,6 +136,7 @@ def train_gradient_gguf(
     *,
     options: LlamaGradientOptions | None = None,
     accelerator: str | Accelerator = Accelerator.AUTO,
+    resume: bool = False,
 ) -> LlamaGradientResult:
     """Train only F32 LoRA tensors with exact backprop through a packed GGUF base."""
 
@@ -143,6 +152,18 @@ def train_gradient_gguf(
     _validate_output(destination, base.path, dataset.path)
     layout = SessionLayout.at(destination)
     layout.create()
+    resume_snapshot = layout.root / "outputs" / "checkpoint" / "adapter" / "last.gguf.resume"
+    resume_input = layout.work / "resume-input.json"
+    previous_resume: dict[str, Any] | None = None
+    if resume:
+        if not resume_snapshot.is_file() or not resume_input.is_file():
+            raise ConfigurationError(
+                "this session has no exact resume checkpoint; an older adapter alone cannot resume"
+            )
+        try:
+            previous_resume = json.loads(resume_input.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise VerificationError("the saved resume settings are unreadable") from exc
     record_dataset(layout, dataset)
     manifest_path = layout.run_manifest
 
@@ -171,6 +192,27 @@ def train_gradient_gguf(
         )
     if settings.multi_gpu != "off" and len(settings.devices) > 1 and settings.split_mode != "layer":
         raise ConfigurationError("model-sharded GGUF training currently requires layer splitting")
+    requested_options = json.loads(json.dumps(asdict(settings)))
+    if resume:
+        assert previous_resume is not None
+        if previous_resume.get("requested_options") != requested_options:
+            raise VerificationError(
+                "the requested training settings differ from the stopped session"
+            )
+        saved_options = previous_resume.get("options")
+        if not isinstance(saved_options, dict):
+            raise VerificationError("the saved resume settings are incomplete")
+        # An automatic memory retry can lower these two values after launch.
+        # Restore the measured effective values without accepting any other change.
+        try:
+            settings = replace(
+                settings,
+                context=int(saved_options["context"]),
+                batch_size=int(saved_options["batch_size"]),
+            )
+            settings.validate()
+        except (KeyError, TypeError, ValueError) as exc:
+            raise VerificationError("the saved effective context is invalid") from exc
     training_accelerator = requested_accelerator
     fallback_from: str | None = None
     fallback_reason: str | None = None
@@ -242,7 +284,9 @@ def train_gradient_gguf(
             trained_adapter.unlink(missing_ok=True)
             final_adapter = layout.adapters / "gguf" / "adapter.gguf"
             final_adapter.parent.mkdir(parents=True, exist_ok=True)
-            if fused is not None:
+            if resume:
+                extract_adapter(resume_snapshot, initial_adapter)
+            elif fused is not None:
                 shutil.copy2(fused.adapter, initial_adapter)
             else:
                 _write_adapter(
@@ -253,19 +297,29 @@ def train_gradient_gguf(
                     np,
                 )
             initial_digest = _adapter_tensor_digest(initial_adapter, np)
+            if resume and previous_resume is not None:
+                saved_digest = previous_resume.get("initial_digest")
+                if not isinstance(saved_digest, str) or not saved_digest:
+                    raise VerificationError("the saved initial adapter digest is missing")
+                initial_digest = saved_digest
 
             # Hybrid llama.cpp models round small contexts up to 256 tokens. A
             # slightly larger corpus prevents the upstream dataset constructor
             # from receiving zero examples without inflating per-step memory.
             corpus_context = max(settings.context, 128)
             structured_separator = "\n<|osai_record_end|>\n"
-            train_corpus = _write_corpus(
-                dataset.path / "train.jsonl",
-                internal / "train.txt",
-                corpus_context,
-                repeat_to_minimum=not settings.mask_prompt,
-                record_separator=structured_separator if settings.mask_prompt else "\n\n",
-            )
+            train_corpus = internal / "train.txt"
+            if resume:
+                if not train_corpus.is_file():
+                    raise VerificationError("the original prepared training corpus is missing")
+            else:
+                train_corpus = _write_corpus(
+                    dataset.path / "train.jsonl",
+                    train_corpus,
+                    corpus_context,
+                    repeat_to_minimum=not settings.mask_prompt,
+                    record_separator=structured_separator if settings.mask_prompt else "\n\n",
+                )
             test_source = dataset.path / "test.jsonl"
             test_corpus = (
                 _write_corpus(
@@ -275,9 +329,28 @@ def train_gradient_gguf(
                     repeat_to_minimum=not settings.mask_prompt,
                     record_separator=(structured_separator if settings.mask_prompt else "\n\n"),
                 )
-                if test_source.is_file()
+                if test_source.is_file() and not resume
                 else None
             )
+
+            resume_signature = {
+                "schema_version": 1,
+                "model": [asdict(item) for item in before],
+                "dataset": str(dataset.path),
+                "corpus_sha256": sha256_file(train_corpus),
+                "options": asdict(settings),
+                "requested_options": requested_options,
+                "accelerator": training_accelerator.value,
+                "initial_digest": initial_digest,
+            }
+            if resume:
+                assert previous_resume is not None
+                if previous_resume != json.loads(json.dumps(resume_signature)):
+                    raise VerificationError(
+                        "model, data, or training settings differ from the exact resume checkpoint"
+                    )
+            else:
+                atomic_json(resume_input, resume_signature)
 
             sharded_devices = (
                 settings.devices
@@ -329,7 +402,8 @@ def train_gradient_gguf(
                     raise TrainingError("GPU pilot evaluation fell back to CPU")
 
             log_path = layout.logs / "train.log"
-            log_path.unlink(missing_ok=True)
+            if not resume:
+                log_path.unlink(missing_ok=True)
             successful_offset = 0
             training_env = offline_environment()
             if training_accelerator is Accelerator.CUDA:
@@ -344,6 +418,12 @@ def train_gradient_gguf(
             training_env["OSAI_CHECKPOINT_OUTPUT"] = str(checkpoint_dir / "adapter" / "last.gguf")
             training_env["OSAI_CHECKPOINT_ACK"] = str(checkpoint_dir / "last.ack")
             training_env["OSAI_CHECKPOINT_INTERVAL_SECONDS"] = "300"
+            training_env["OSAI_STOP_REQUEST"] = os.environ.get(
+                "OSAI_STOP_REQUEST", str(layout.root / "stop.request")
+            )
+            if resume:
+                training_env["OSAI_RESUME_STATE"] = str(resume_snapshot)
+                Path(training_env["OSAI_STOP_REQUEST"]).unlink(missing_ok=True)
             if sharded_devices:
                 manifest["model_sharded_training"] = {
                     "method": "one optimizer step over layer shards",
@@ -384,12 +464,21 @@ def train_gradient_gguf(
                     break
                 except TrainingError as exc:
                     if (
+                        "status 75" in str(exc)
+                        and Path(training_env["OSAI_STOP_REQUEST"]).is_file()
+                        and resume_snapshot.is_file()
+                    ):
+                        raise TrainingStopped(str(resume_snapshot)) from exc
+                    if (
                         settings.auto_settings
+                        and not resume
                         and training_accelerator is not Accelerator.CPU
                         and settings.context > 256
                         and _memory_failure(log_path, attempt_offset)
                     ):
                         settings = _lower_auto_context(settings, training_env, manifest)
+                        resume_signature["options"] = asdict(settings)
+                        atomic_json(resume_input, resume_signature)
                         atomic_json(manifest_path, manifest)
                         trained_adapter.unlink(missing_ok=True)
                         successful_offset = log_path.stat().st_size
@@ -575,9 +664,17 @@ def train_gradient_gguf(
         except BaseException as exc:
             manifest.update(
                 {
-                    "status": "failed",
+                    "status": "stopped" if isinstance(exc, TrainingStopped) else "failed",
                     "completed_at": _now(),
-                    "error": {"type": type(exc).__name__, "message": str(exc)},
+                    "resume_checkpoint": (
+                        str(resume_snapshot) if isinstance(exc, TrainingStopped) else None
+                    ),
+                    "error": None
+                    if isinstance(exc, TrainingStopped)
+                    else {
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                    },
                 }
             )
             atomic_json(manifest_path, manifest)

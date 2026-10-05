@@ -3638,6 +3638,16 @@ void llama_context::opt_epoch(
             nullptr, nullptr, callback_train, callback_eval);
 }
 
+bool llama_context::opt_state_save(ggml_opt_dataset_t dataset, const char * path,
+        const char * adapter_path, int64_t epoch, int64_t next_record) {
+    return ggml_opt_state_save(opt_ctx, dataset, path, adapter_path, epoch, next_record);
+}
+
+bool llama_context::opt_state_load(ggml_opt_dataset_t dataset, const char * path,
+        const char * adapter_path, int64_t * epoch, int64_t * next_record) {
+    return ggml_opt_state_load(opt_ctx, dataset, path, adapter_path, epoch, next_record);
+}
+
 void llama_context::opt_epoch_weighted(
         ggml_opt_dataset_t        dataset,
         ggml_opt_result_t         result_train,
@@ -3646,7 +3656,9 @@ void llama_context::opt_epoch_weighted(
         const float             * example_weights,
         const int64_t           * label_counts,
         ggml_opt_epoch_callback   callback_train,
-        ggml_opt_epoch_callback   callback_eval) {
+        ggml_opt_epoch_callback   callback_eval,
+        int64_t                   start_record,
+        llama_opt_record_callback callback_record) {
     const uint32_t n_ctx    = this->n_ctx();
     const uint32_t n_batch  = std::min(cparams.n_batch,  n_ctx);
     const uint32_t n_ubatch = std::min(cparams.n_ubatch, n_batch);
@@ -3654,8 +3666,9 @@ void llama_context::opt_epoch_weighted(
 
     GGML_ASSERT(idata_split >= 0);
     GGML_ASSERT(idata_split <= ndata);
+    GGML_ASSERT(start_record >= 0 && start_record <= idata_split);
 
-    if (idata_split > 1 && example_weights == nullptr) {
+    if (start_record == 0 && idata_split > 1 && example_weights == nullptr) {
         ggml_opt_dataset_shuffle(opt_ctx, dataset, idata_split);
         LLAMA_LOG_INFO("%s: shuffled %" PRId64 " training records\n", __func__, idata_split);
     }
@@ -3672,6 +3685,10 @@ void llama_context::opt_epoch_weighted(
         ndata_in_loop += ggml_opt_dataset_active_ubatches(dataset, i, n_ubatch);
     }
     int64_t idata_in_loop = 0;
+    for (int64_t i = 0; i < start_record; ++i) {
+        idata_in_loop += ggml_opt_dataset_active_ubatches(dataset, i, n_ubatch);
+    }
+    idata = start_record;
     for (; idata < idata_split; ++idata) {
         constexpr bool train = true;
 
@@ -3682,6 +3699,10 @@ void llama_context::opt_epoch_weighted(
             label_counts ? label_counts[idata] : 0,
             idata_in_loop, ndata_in_loop, t_loop_start);
         idata_in_loop += ggml_opt_dataset_active_ubatches(dataset, idata, n_ubatch);
+        if (callback_record && callback_record(opt_ctx, dataset, idata + 1)) {
+            llama_batch_free(batch);
+            return;
+        }
     }
 
     t_loop_start = ggml_time_us();
@@ -4432,6 +4453,32 @@ void llama_opt_epoch_weighted(
         label_counts,
         callback_train,
         callback_eval);
+}
+
+void llama_opt_epoch_resumable(
+        struct llama_context    * ctx,
+        ggml_opt_dataset_t        dataset,
+        ggml_opt_result_t         result_train,
+        ggml_opt_result_t         result_eval,
+        int64_t                   idata_split,
+        const float             * example_weights,
+        const int64_t           * label_counts,
+        ggml_opt_epoch_callback   callback_train,
+        ggml_opt_epoch_callback   callback_eval,
+        int64_t                   start_record,
+        llama_opt_record_callback callback_record) {
+    ctx->opt_epoch_weighted(dataset, result_train, result_eval, idata_split,
+            example_weights, label_counts, callback_train, callback_eval, start_record, callback_record);
+}
+
+bool llama_opt_state_save(struct llama_context * ctx, ggml_opt_dataset_t dataset,
+        const char * path, const char * adapter_path, int64_t epoch, int64_t next_record) {
+    return ctx->opt_state_save(dataset, path, adapter_path, epoch, next_record);
+}
+
+bool llama_opt_state_load(struct llama_context * ctx, ggml_opt_dataset_t dataset,
+        const char * path, const char * adapter_path, int64_t * epoch, int64_t * next_record) {
+    return ctx->opt_state_load(dataset, path, adapter_path, epoch, next_record);
 }
 
 //

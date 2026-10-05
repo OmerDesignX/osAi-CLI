@@ -212,7 +212,14 @@ struct llama_context {
             const float           * example_weights,
             const int64_t         * label_counts,
             ggml_opt_epoch_callback callback_train,
-            ggml_opt_epoch_callback callback_eval);
+            ggml_opt_epoch_callback callback_eval,
+            int64_t                 start_record = 0,
+            llama_opt_record_callback callback_record = nullptr);
+
+    bool opt_state_save(ggml_opt_dataset_t dataset, const char * path,
+            const char * adapter_path, int64_t epoch, int64_t next_record);
+    bool opt_state_load(ggml_opt_dataset_t dataset, const char * path,
+            const char * adapter_path, int64_t * epoch, int64_t * next_record);
 
     void opt_epoch_iter(
             ggml_opt_dataset_t               dataset,

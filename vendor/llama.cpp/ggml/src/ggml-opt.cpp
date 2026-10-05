@@ -9,8 +9,13 @@
 #include <cmath>
 #include <cstdint>
 #include <cinttypes>
+#include <array>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <random>
+#include <sstream>
+#include <string>
 #include <vector>
 
 struct ggml_opt_dataset {
@@ -76,6 +81,22 @@ struct ggml_opt_context {
     struct ggml_tensor *          opt_step_params = nullptr; // Stores output of get_opt_pars.
 
     enum ggml_opt_optimizer_type optimizer = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
+
+    struct saved_parameter {
+        std::string name;
+        std::array<int64_t, GGML_MAX_DIMS> shape;
+        std::vector<uint8_t> accumulator;
+        std::vector<uint8_t> first_moment;
+        std::vector<uint8_t> second_moment;
+    };
+    std::vector<saved_parameter> resume_parameters;
+    bool resume_pending = false;
+    struct parameter_info {
+        int index;
+        std::string name;
+        std::array<int64_t, GGML_MAX_DIMS> shape;
+    };
+    std::vector<parameter_info> parameters;
 };
 
 struct ggml_opt_result {
@@ -462,6 +483,47 @@ static void ggml_opt_alloc_param_buffers(ggml_opt_context_t opt_ctx) {
     }
 }
 
+static void ggml_opt_apply_resume_parameters(ggml_opt_context_t opt_ctx) {
+    if (!opt_ctx->resume_pending) {
+        return;
+    }
+    size_t restored = 0;
+    for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
+        ggml_tensor * parameter = opt_ctx->gf->nodes[i];
+        if (!(parameter->flags & GGML_TENSOR_FLAG_PARAM)) {
+            continue;
+        }
+        const auto found = std::find_if(opt_ctx->resume_parameters.begin(), opt_ctx->resume_parameters.end(),
+                [parameter](const ggml_opt_context::saved_parameter & saved) { return saved.name == parameter->name; });
+        if (found == opt_ctx->resume_parameters.end()) {
+            GGML_ABORT("resume checkpoint is missing a trainable parameter: %s", parameter->name);
+        }
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (parameter->ne[d] != found->shape[d]) {
+                GGML_ABORT("resume checkpoint parameter shape changed: %s", parameter->name);
+            }
+        }
+        const auto restore = [parameter](ggml_tensor * tensor, const std::vector<uint8_t> & bytes) {
+            if ((tensor == nullptr) != bytes.empty() ||
+                    (tensor != nullptr && ggml_nbytes(tensor) != bytes.size())) {
+                GGML_ABORT("resume checkpoint optimizer tensor changed: %s", parameter->name);
+            }
+            if (tensor != nullptr) {
+                ggml_backend_tensor_set(tensor, bytes.data(), 0, bytes.size());
+            }
+        };
+        restore(opt_ctx->grad_accs[i], found->accumulator);
+        restore(opt_ctx->grad_m.empty() ? nullptr : opt_ctx->grad_m[i], found->first_moment);
+        restore(opt_ctx->grad_v.empty() ? nullptr : opt_ctx->grad_v[i], found->second_moment);
+        ++restored;
+    }
+    if (restored != opt_ctx->resume_parameters.size()) {
+        GGML_ABORT("resume checkpoint has unexpected trainable parameters");
+    }
+    opt_ctx->resume_parameters.clear();
+    opt_ctx->resume_pending = false;
+}
+
 static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     GGML_ASSERT(opt_ctx->ctx_compute && "no compute context set, either use static graphs or set one with ggml_opt_prepare_alloc");
     GGML_ASSERT((!opt_ctx->static_graphs || opt_ctx->inputs->data) && "when using static graphs the inputs must be allocated statically");
@@ -605,6 +667,13 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         opt_ctx->grad_accs.resize(n_nodes);
         for (int i = 0; i < n_nodes; ++i) {
             ggml_tensor * node = opt_ctx->gf->nodes[i];
+            if (node->flags & GGML_TENSOR_FLAG_PARAM) {
+                ggml_opt_context::parameter_info info;
+                info.index = i;
+                info.name = node->name;
+                std::copy_n(node->ne, GGML_MAX_DIMS, info.shape.begin());
+                opt_ctx->parameters.push_back(std::move(info));
+            }
             if ((accumulate && (node->flags & GGML_TENSOR_FLAG_PARAM)) || (node->flags & GGML_TENSOR_FLAG_LOSS)) {
                 opt_ctx->grad_accs[i] = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
             } else {
@@ -685,6 +754,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         opt_ctx->buf_static = ggml_backend_alloc_ctx_tensors(
             opt_ctx->ctx_static, ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0));
         ggml_graph_reset(opt_ctx->gb_opt);
+        ggml_opt_apply_resume_parameters(opt_ctx);
     }
 
     opt_ctx->buf_cpu = ggml_backend_alloc_ctx_tensors_from_buft(opt_ctx->ctx_cpu, ggml_backend_cpu_buffer_type());
@@ -747,6 +817,266 @@ void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer) {
     } else {
         ggml_graph_reset(opt_ctx->gb_grad);
     }
+}
+
+namespace {
+constexpr char osai_resume_magic[8] = {'O', 'S', 'A', 'I', 'R', 'S', 'M', '1'};
+constexpr uint64_t osai_fnv_offset = 14695981039346656037ULL;
+constexpr uint64_t osai_fnv_prime  = 1099511628211ULL;
+
+template <typename T> bool osai_write(std::ostream & stream, const T & value) {
+    stream.write(reinterpret_cast<const char *>(&value), sizeof(value));
+    return stream.good();
+}
+
+template <typename T> bool osai_read(std::istream & stream, T & value) {
+    stream.read(reinterpret_cast<char *>(&value), sizeof(value));
+    return stream.good();
+}
+
+bool osai_write_tensor(std::ostream & stream, ggml_tensor * tensor) {
+    const uint64_t size = tensor ? ggml_nbytes(tensor) : 0;
+    if (!osai_write(stream, size)) {
+        return false;
+    }
+    std::array<uint8_t, 1 << 16> chunk;
+    for (uint64_t offset = 0; offset < size; offset += chunk.size()) {
+        const size_t count = size_t(std::min<uint64_t>(chunk.size(), size - offset));
+        ggml_backend_tensor_get(tensor, chunk.data(), offset, count);
+        stream.write(reinterpret_cast<const char *>(chunk.data()), count);
+        if (!stream.good()) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool osai_read_tensor(std::istream & stream, std::vector<uint8_t> & value) {
+    uint64_t size = 0;
+    if (!osai_read(stream, size) || size > (1ULL << 30)) {
+        return false;
+    }
+    value.resize(size_t(size));
+    if (size) {
+        stream.read(reinterpret_cast<char *>(value.data()), size);
+    }
+    return stream.good();
+}
+
+uint64_t osai_hash_file(const char * path) {
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) {
+        return 0;
+    }
+    uint64_t hash = osai_fnv_offset;
+    std::array<char, 1 << 16> chunk;
+    while (stream.read(chunk.data(), chunk.size()) || stream.gcount() > 0) {
+        for (std::streamsize i = 0; i < stream.gcount(); ++i) {
+            hash = (hash ^ uint8_t(chunk[size_t(i)])) * osai_fnv_prime;
+        }
+    }
+    return stream.eof() ? hash : 0;
+}
+} // namespace
+
+bool ggml_opt_state_save(ggml_opt_context_t opt_ctx, ggml_opt_dataset_t dataset,
+        const char * path, const char * adapter_path, int64_t epoch, int64_t next_record) {
+    if (!opt_ctx || !dataset || opt_ctx->grad_accs.empty() || opt_ctx->parameters.empty() ||
+            epoch < 0 || next_record < 0 || next_record > dataset->ndata) {
+        return false;
+    }
+    std::error_code error;
+    const uint64_t adapter_size = std::filesystem::file_size(adapter_path, error);
+    if (error || adapter_size == 0 || adapter_size > (1ULL << 34)) {
+        return false;
+    }
+    std::ifstream adapter(adapter_path, std::ios::binary);
+    std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+    if (!adapter || !stream) {
+        return false;
+    }
+    stream.write(osai_resume_magic, sizeof(osai_resume_magic));
+    if (!osai_write(stream, adapter_size)) {
+        return false;
+    }
+    uint64_t hash = osai_fnv_offset;
+    std::array<char, 1 << 16> chunk;
+    for (uint64_t copied = 0; copied < adapter_size;) {
+        const size_t count = size_t(std::min<uint64_t>(chunk.size(), adapter_size - copied));
+        adapter.read(chunk.data(), count);
+        if (!adapter) {
+            return false;
+        }
+        stream.write(chunk.data(), count);
+        for (size_t i = 0; i < count; ++i) {
+            hash = (hash ^ uint8_t(chunk[i])) * osai_fnv_prime;
+        }
+        copied += count;
+    }
+    if (!osai_write(stream, hash) ||
+            !osai_write(stream, dataset->ndata) ||
+            !osai_write(stream, epoch) || !osai_write(stream, next_record)) {
+        return false;
+    }
+    const int32_t optimizer = opt_ctx->optimizer;
+    if (!osai_write(stream, optimizer) || !osai_write(stream, opt_ctx->opt_period) ||
+            !osai_write(stream, opt_ctx->opt_i) || !osai_write(stream, opt_ctx->iter)) {
+        return false;
+    }
+    std::ostringstream rng;
+    rng << opt_ctx->rng;
+    const std::string rng_state = rng.str();
+    const uint32_t rng_size = uint32_t(rng_state.size());
+    if (!osai_write(stream, rng_size)) {
+        return false;
+    }
+    stream.write(rng_state.data(), rng_size);
+    const uint64_t npermutation = dataset->permutation.size();
+    if (!osai_write(stream, npermutation)) {
+        return false;
+    }
+    for (const int64_t index : dataset->permutation) {
+        if (!osai_write(stream, index)) {
+            return false;
+        }
+    }
+    const uint32_t nparameters = uint32_t(opt_ctx->parameters.size());
+    if (!osai_write(stream, nparameters)) {
+        return false;
+    }
+    for (const auto & parameter : opt_ctx->parameters) {
+        const int i = parameter.index;
+        const size_t name_size = parameter.name.size();
+        if (name_size == 0 || name_size > UINT16_MAX) {
+            return false;
+        }
+        const uint16_t length = uint16_t(name_size);
+        if (!osai_write(stream, length)) {
+            return false;
+        }
+        stream.write(parameter.name.data(), length);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (!osai_write(stream, parameter.shape[d])) {
+                return false;
+            }
+        }
+        if (!osai_write_tensor(stream, opt_ctx->grad_accs[i]) ||
+                !osai_write_tensor(stream, opt_ctx->grad_m.empty() ? nullptr : opt_ctx->grad_m[i]) ||
+                !osai_write_tensor(stream, opt_ctx->grad_v.empty() ? nullptr : opt_ctx->grad_v[i])) {
+            return false;
+        }
+    }
+    stream.flush();
+    return stream.good();
+}
+
+bool ggml_opt_state_load(ggml_opt_context_t opt_ctx, ggml_opt_dataset_t dataset,
+        const char * path, const char * adapter_path, int64_t * epoch, int64_t * next_record) {
+    if (!opt_ctx || !dataset || !epoch || !next_record || opt_ctx->iter != 1) {
+        return false;
+    }
+    std::ifstream stream(path, std::ios::binary);
+    char magic[sizeof(osai_resume_magic)];
+    uint64_t adapter_size = 0;
+    if (!stream.read(magic, sizeof(magic)) ||
+            std::memcmp(magic, osai_resume_magic, sizeof(magic)) != 0 ||
+            !osai_read(stream, adapter_size) || adapter_size == 0 || adapter_size > (1ULL << 34)) {
+        return false;
+    }
+    uint64_t embedded_hash = osai_fnv_offset;
+    std::array<char, 1 << 16> chunk;
+    for (uint64_t copied = 0; copied < adapter_size;) {
+        const size_t count = size_t(std::min<uint64_t>(chunk.size(), adapter_size - copied));
+        stream.read(chunk.data(), count);
+        if (!stream) {
+            return false;
+        }
+        for (size_t i = 0; i < count; ++i) {
+            embedded_hash = (embedded_hash ^ uint8_t(chunk[i])) * osai_fnv_prime;
+        }
+        copied += count;
+    }
+    uint64_t saved_hash = 0;
+    int64_t ndata = 0, saved_epoch = 0, cursor = 0, iter = 0;
+    int32_t optimizer = 0, period = 0, opt_i = 0;
+    std::error_code error;
+    if (!osai_read(stream, saved_hash) || embedded_hash != saved_hash ||
+            std::filesystem::file_size(adapter_path, error) != adapter_size || error ||
+            osai_hash_file(adapter_path) != saved_hash ||
+            !osai_read(stream, ndata) || ndata != dataset->ndata ||
+            !osai_read(stream, saved_epoch) || saved_epoch < 0 ||
+            !osai_read(stream, cursor) || cursor < 0 || cursor > ndata ||
+            !osai_read(stream, optimizer) || optimizer != opt_ctx->optimizer ||
+            !osai_read(stream, period) || period != opt_ctx->opt_period ||
+            !osai_read(stream, opt_i) || opt_i < 0 || opt_i >= period ||
+            !osai_read(stream, iter) || iter < 1) {
+        return false;
+    }
+    uint32_t rng_size = 0;
+    if (!osai_read(stream, rng_size) || rng_size > 20'000) {
+        return false;
+    }
+    std::string rng_state(rng_size, '\0');
+    if (!stream.read(rng_state.data(), rng_size)) {
+        return false;
+    }
+    std::mt19937 rng;
+    std::istringstream rng_stream(rng_state);
+    if (!(rng_stream >> rng)) {
+        return false;
+    }
+    uint64_t npermutation = 0;
+    if (!osai_read(stream, npermutation) || npermutation != dataset->permutation.size()) {
+        return false;
+    }
+    std::vector<int64_t> permutation(size_t(npermutation), 0);
+    std::vector<bool> seen(size_t(npermutation), false);
+    for (int64_t & index : permutation) {
+        if (!osai_read(stream, index) || index < 0 || uint64_t(index) >= npermutation || seen[size_t(index)]) {
+            return false;
+        }
+        seen[size_t(index)] = true;
+    }
+    uint32_t nparameters = 0;
+    if (!osai_read(stream, nparameters) || nparameters == 0 || nparameters > 100'000) {
+        return false;
+    }
+    std::vector<ggml_opt_context::saved_parameter> parameters;
+    parameters.reserve(nparameters);
+    for (uint32_t i = 0; i < nparameters; ++i) {
+        uint16_t length = 0;
+        if (!osai_read(stream, length) || length == 0) {
+            return false;
+        }
+        ggml_opt_context::saved_parameter parameter;
+        parameter.name.resize(length);
+        if (!stream.read(parameter.name.data(), length)) {
+            return false;
+        }
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            if (!osai_read(stream, parameter.shape[d]) || parameter.shape[d] <= 0) {
+                return false;
+            }
+        }
+        if (!osai_read_tensor(stream, parameter.accumulator) ||
+                !osai_read_tensor(stream, parameter.first_moment) ||
+                !osai_read_tensor(stream, parameter.second_moment)) {
+            return false;
+        }
+        parameters.push_back(std::move(parameter));
+    }
+    if (stream.peek() != std::char_traits<char>::eof()) {
+        return false;
+    }
+    opt_ctx->rng = rng;
+    opt_ctx->iter = iter;
+    opt_ctx->opt_i = opt_i;
+    dataset->permutation = std::move(permutation);
+    opt_ctx->resume_parameters = std::move(parameters);
+    opt_ctx->resume_pending = true;
+    *epoch = saved_epoch;
+    *next_record = cursor;
+    return true;
 }
 
 bool ggml_opt_static_graphs(ggml_opt_context_t opt_ctx) {

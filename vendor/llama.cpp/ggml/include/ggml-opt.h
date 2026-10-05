@@ -155,6 +155,14 @@ extern "C" {
     // set gradients to zero, initialize loss, and optionally reset the optimizer
     GGML_API void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer);
 
+    // osAi resumable checkpoints. The snapshot includes the adapter bytes,
+    // optimizer moments/accumulators, RNG, and dataset permutation. A load is
+    // applied to the first allocated training graph before its first update.
+    GGML_API bool ggml_opt_state_save(ggml_opt_context_t opt_ctx, ggml_opt_dataset_t dataset,
+            const char * path, const char * adapter_path, int64_t epoch, int64_t next_record);
+    GGML_API bool ggml_opt_state_load(ggml_opt_context_t opt_ctx, ggml_opt_dataset_t dataset,
+            const char * path, const char * adapter_path, int64_t * epoch, int64_t * next_record);
+
     GGML_API bool ggml_opt_static_graphs(ggml_opt_context_t opt_ctx); // whether the graphs are allocated_statically
 
     // get underlying tensors that store data

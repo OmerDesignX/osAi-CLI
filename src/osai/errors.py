@@ -21,6 +21,14 @@ class TrainingError(OsAiError):
     """A training process failed."""
 
 
+class TrainingStopped(OsAiError):
+    """Training stopped on request after preserving its latest checkpoint."""
+
+    def __init__(self, checkpoint: str) -> None:
+        self.checkpoint = checkpoint
+        super().__init__(f"training stopped; exact resume checkpoint: {checkpoint}")
+
+
 class VerificationError(OsAiError):
     """An output failed an integrity or runtime check."""
 

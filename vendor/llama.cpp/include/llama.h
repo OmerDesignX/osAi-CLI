@@ -1653,6 +1653,27 @@ extern "C" {
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
 
+    // Save only at a record boundary so the cursor points to the next
+    // untouched example. The first resumed epoch retains the saved shuffle.
+    typedef bool (*llama_opt_record_callback)(ggml_opt_context_t opt_ctx,
+            ggml_opt_dataset_t dataset, int64_t next_record);
+    LLAMA_API void llama_opt_epoch_resumable(
+            struct llama_context    * lctx,
+            ggml_opt_dataset_t        dataset,
+            ggml_opt_result_t         result_train,
+            ggml_opt_result_t         result_eval,
+            int64_t                   idata_split,
+            const float             * example_weights,
+            const int64_t           * label_counts,
+            ggml_opt_epoch_callback   callback_train,
+            ggml_opt_epoch_callback   callback_eval,
+            int64_t                   start_record,
+            llama_opt_record_callback callback_record);
+    LLAMA_API bool llama_opt_state_save(struct llama_context * lctx, ggml_opt_dataset_t dataset,
+            const char * path, const char * adapter_path, int64_t epoch, int64_t next_record);
+    LLAMA_API bool llama_opt_state_load(struct llama_context * lctx, ggml_opt_dataset_t dataset,
+            const char * path, const char * adapter_path, int64_t * epoch, int64_t * next_record);
+
 #ifdef __cplusplus
 }
 #endif
