@@ -45,6 +45,11 @@ after the final supervised token in each record. The selected context is still
 the maximum allowed length, and the longest record must fit the model and GPU
 memory; shorter records do not reserve a full-width dataset row for the run.
 Native progress counts the microbatches actually used by those records.
+For full-dataset GGUF Auto training, calibration measures a short pilot and
+scales its learning rate by the square root of pilot record-passes relative
+to planned record-passes. Context and batch remain hardware choices; only
+the update pace changes with the amount of data. A short pilot cannot
+guarantee later heldout loss will decline, so monitor saved checkpoints.
 
 ## Hardware support
 

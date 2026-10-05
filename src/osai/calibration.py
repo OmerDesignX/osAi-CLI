@@ -301,6 +301,8 @@ def calibrate_training(
     main_gpu: int = 0,
     distributed_workers: int = 0,
     require_full_context: bool = False,
+    total_training_rows: int | None = None,
+    training_epochs: int = 1,
     progress: Callable[[str], None] | None = None,
 ) -> CalibrationResult:
     """Select a measured rate, starting in the middle of the adaptive range."""
@@ -527,9 +529,24 @@ def calibrate_training(
                 if best is not None:
                     break
         if best is not None:
+            if engine is Engine.LLAMA_CPP and total_training_rows is not None:
+                if total_training_rows < rows or training_epochs < 1:
+                    raise ConfigurationError("invalid full-run exposure for calibration")
+                pilot_exposure = rows * _PILOT_EPOCHS
+                planned_exposure = total_training_rows * training_epochs
+                rate_factor = min(1.0, math.sqrt(pilot_exposure / planned_exposure))
+                if rate_factor < 1.0:
+                    probe_rate = best.learning_rate
+                    best = replace(best, learning_rate=probe_rate * rate_factor)
+                    notify(
+                        "phase=complete detail=Scaling short-pilot rate "
+                        f"{probe_rate:.2e} to sustained rate {best.learning_rate:.2e} "
+                        f"for {total_training_rows} training records"
+                    )
             notify(
                 "phase=complete detail=Pilot loss fell "
-                f"{best.improvement_percent:.2f}% with the selected rate"
+                f"{best.improvement_percent:.2f}%; full-run learning rate "
+                f"{best.learning_rate:.2e}"
             )
             return best
         guidance = (

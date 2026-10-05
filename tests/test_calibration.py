@@ -97,6 +97,44 @@ def test_quick_calibration_reads_every_row_within_sample_limit(tmp_path: Path, c
     assert indices == list(range(count))
 
 
+def test_full_dataset_calibration_reduces_short_pilot_rate(monkeypatch, tmp_path: Path):
+    model = _model(tmp_path)
+    settings = select_auto_settings(model, engine=Engine.LLAMA_CPP, memory_bytes=64 * 1024**3)
+    benchmark = BenchmarkResult(settings, "llama.cpp", "cuda", ("CUDA0", "CUDA1"), 0.1)
+    source = _data(tmp_path)
+    tried = []
+    progress = []
+
+    def pilot(_model, _sample, output, *, options, accelerator):
+        tried.append(options.learning_rate)
+        manifest = output.parent / "manifest.json"
+        manifest.write_text(json.dumps({"options": {"context": options.context}}))
+        return SimpleNamespace(
+            losses=(0.5, 0.4, 0.3),
+            manifest=manifest,
+            accelerator="cuda",
+            initial_test_loss=0.5,
+            test_loss=0.3,
+        )
+
+    monkeypatch.setattr("osai.calibration.train_gradient_gguf", pilot)
+    result = calibrate_training(
+        model.path,
+        model,
+        source,
+        benchmark,
+        engine=Engine.LLAMA_CPP,
+        multi_gpu="off",
+        total_training_rows=31_580,
+        training_epochs=1,
+        progress=progress.append,
+    )
+    assert result.learning_rate < tried[0] / 10
+    assert result.learning_rate > 0
+    assert result.improvement_percent == pytest.approx(40)
+    assert any("Scaling short-pilot rate" in message for message in progress)
+
+
 def test_pilot_microbatch_uses_each_gpu_memory_and_keeps_safe_fallback(monkeypatch, tmp_path: Path):
     model = _model(tmp_path)
     settings = select_auto_settings(model, engine=Engine.LLAMA_CPP, memory_bytes=64 * 1024**3)

@@ -835,6 +835,8 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
             main_gpu=config.main_gpu,
             distributed_workers=config.distributed_workers,
             require_full_context=args.full_content_context,
+            total_training_rows=dataset_summary.train_examples,
+            training_epochs=config.iterations,
         )
         config = replace(
             config,
@@ -1606,6 +1608,7 @@ def _calibrate(args: argparse.Namespace) -> int:
             main_gpu=args.main_gpu,
             distributed_workers=args.distributed_workers,
             require_full_context=args.full_content_context,
+            total_training_rows=maximum.get("records") if maximum else None,
         )
     payload = result.as_dict()
     payload["required_context"] = maximum["context"] if maximum else None
