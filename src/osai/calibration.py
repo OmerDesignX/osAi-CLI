@@ -121,7 +121,8 @@ def _pilot_microbatch(
         if not all(device in free for device in benchmark.devices):
             return settings.gguf_batch_size
         available = min(free[device] for device in benchmark.devices)
-    headroom = max(0, available - model.size_bytes)
+    model_share = model.size_bytes / max(1, len(benchmark.devices))
+    headroom = max(0, available - model_share)
     context_bound = max(1, math.isqrt(settings.max_seq_length))
     # Packed model bytes per block are not a measure of activation bytes per token.
     # The native pilot verifies this memory-bounded candidate and halves it on OOM.
@@ -412,7 +413,7 @@ def calibrate_training(
                             "training, or explicitly select CPU"
                         )
                     if len(benchmark.devices) > 1 and multi_gpu != "off":
-                        used_devices = manifest.get("parallel_training", {}).get("devices", [])
+                        used_devices = manifest.get("model_sharded_training", {}).get("devices", [])
                         if len(used_devices) != len(benchmark.devices):
                             raise ConfigurationError(
                                 "Calibration did not use every selected GPU; check the "

@@ -68,7 +68,7 @@ def test_benchmark_rebuilds_stale_trainer_before_probing(monkeypatch, tmp_path: 
     assert rebuilt == ["cpu"]
 
 
-def test_benchmark_probes_each_cuda_gpu_for_data_parallel_training(monkeypatch, tmp_path: Path):
+def test_benchmark_probes_cuda_model_shards_together(monkeypatch, tmp_path: Path):
     model = _model(tmp_path)
     binary = tmp_path / "llama-completion"
     binary.write_bytes(b"binary")
@@ -91,7 +91,7 @@ def test_benchmark_probes_each_cuda_gpu_for_data_parallel_training(monkeypatch, 
     )
 
     assert selected.devices == ("CUDA0", "CUDA1")
-    assert probed == ["CUDA0", "CUDA1"]
+    assert probed == ["CUDA0,CUDA1"]
 
 
 def test_benchmark_rejects_integrated_vulkan_device_when_discrete_exists(
@@ -150,7 +150,7 @@ def test_benchmark_reserves_gpu_memory_for_backward_pass(monkeypatch, tmp_path: 
     assert probed == ["balanced"]
 
 
-def test_two_12_gib_gpus_select_more_context_without_pooling_memory(monkeypatch, tmp_path):
+def test_two_12_gib_gpus_select_more_context_with_model_sharding(monkeypatch, tmp_path):
     model = _model(tmp_path)
     binary = tmp_path / "llama-completion"
     binary.write_bytes(b"binary")
@@ -179,13 +179,54 @@ def test_two_12_gib_gpus_select_more_context_without_pooling_memory(monkeypatch,
 
     selected = benchmark_auto_settings(model, engine=Engine.LLAMA_CPP, multi_gpu="on")
 
-    assert selected.settings.profile == "performance"
-    assert selected.settings.max_seq_length == 1024
-    assert selected.settings.gguf_batch_size == 2
-    assert probed == [(1024, "CUDA0"), (1024, "CUDA1")]
+    assert selected.settings.profile == "maximum"
+    assert selected.settings.max_seq_length == 2048
+    assert selected.settings.gguf_batch_size == 1
+    assert probed == [(2048, "CUDA0,CUDA1")]
 
 
-def test_full_context_is_probed_on_each_gpu_with_smaller_memory_settings(
+def test_two_3_gib_gpus_can_fit_a_sharded_compact_model(monkeypatch, tmp_path):
+    model = _model(tmp_path)
+    model = ModelInspection(
+        format=model.format,
+        path=model.path,
+        architecture=model.architecture,
+        quantization=model.quantization,
+        size_bytes=int(2.5 * 1024**3),
+        shards=model.shards,
+        block_count=model.block_count,
+        context_length=model.context_length,
+    )
+    binary = tmp_path / "llama-completion"
+    binary.write_bytes(b"binary")
+    monkeypatch.setattr("osai.auto_settings.physical_memory_bytes", lambda: 64 * 1024**3)
+    monkeypatch.setattr("osai.auto_benchmark.llama_binary", lambda _name: binary)
+    monkeypatch.setattr("osai.auto_benchmark.llama_runtime_build", lambda: tmp_path / "native")
+    monkeypatch.setattr("osai.auto_benchmark.select_llama_accelerator", lambda _: Accelerator.CUDA)
+    monkeypatch.setattr(
+        "osai.auto_benchmark.available_llama_devices",
+        lambda _binary, _accelerator, **_kwargs: ("CUDA0", "CUDA1"),
+    )
+    monkeypatch.setattr(
+        "osai.auto_benchmark.llama_device_free_bytes",
+        lambda _binary, _accelerator: {
+            "CUDA0": 3 * 1024**3,
+            "CUDA1": 3 * 1024**3,
+        },
+    )
+    probed = []
+    monkeypatch.setattr(
+        "osai.auto_benchmark._probe_llama",
+        lambda _binary, _model, _settings, _accelerator, device, _adapter: probed.append(device),
+    )
+
+    selected = benchmark_auto_settings(model, engine=Engine.LLAMA_CPP, multi_gpu="on")
+
+    assert selected.settings.profile == "compact"
+    assert probed == ["CUDA0,CUDA1"]
+
+
+def test_full_context_is_probed_across_gpu_shards_with_smaller_memory_settings(
     monkeypatch, tmp_path: Path
 ):
     model = _model(tmp_path)
@@ -214,17 +255,17 @@ def test_full_context_is_probed_on_each_gpu_with_smaller_memory_settings(
         model, engine=Engine.LLAMA_CPP, multi_gpu="on", required_context=4096
     )
     assert result.settings.max_seq_length == 4096
-    assert result.settings.batch_size == 1
+    assert result.settings.batch_size == 2
     assert result.settings.gguf_batch_size == 1
-    assert result.settings.rank <= 4
-    assert [device for _, device in probed] == ["CUDA0", "CUDA1"]
+    assert result.settings.rank <= 8
+    assert [device for _, device in probed] == ["CUDA0,CUDA1"]
     assert all(settings.max_seq_length == 4096 for settings, _ in probed)
     cached = benchmark_auto_settings(
         model, engine=Engine.LLAMA_CPP, multi_gpu="on", required_context=4096
     )
     assert cached.cached is True
     assert cached.settings == result.settings
-    assert len(probed) == 2
+    assert len(probed) == 1
 
 
 def test_successful_benchmark_survives_read_only_cache(monkeypatch, tmp_path: Path):

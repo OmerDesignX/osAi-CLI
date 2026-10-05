@@ -24,6 +24,7 @@ from ..errors import ConfigurationError, DependencyError, TrainingError, Verific
 from ..formats import inspect_model
 from ..hardware import Accelerator, select_llama_accelerator
 from ..io import atomic_json, fingerprint, sha256_file
+from ..multi_gpu import available_llama_devices
 from ..offline import offline_environment
 from ..paths import llama_binary
 from ..process import run_logged
@@ -146,14 +147,27 @@ def align_mlx(
     before = tuple(fingerprint(path, full_hash=True) for path in base.shards)
     workers = _resolve_distributed_workers(config, report)
     command = [
-        str(backend.python), "-m", "osai._offline_runner", "align-mlx",
+        str(backend.python),
+        "-m",
+        "osai._offline_runner",
+        "align-mlx",
         str(layout.work / "mlx_alignment.json"),
     ]
     if workers > 1:
         command = [
-            str(backend.python), "-m", "mlx._distributed_utils.launch",
-            "-n", str(workers), "--backend", "nccl", "--hosts", "127.0.0.1",
-            "--python", str(backend.python), "--", *command[1:],
+            str(backend.python),
+            "-m",
+            "mlx._distributed_utils.launch",
+            "-n",
+            str(workers),
+            "--backend",
+            "nccl",
+            "--hosts",
+            "127.0.0.1",
+            "--python",
+            str(backend.python),
+            "--",
+            *command[1:],
         ]
     checkpoint_dir = layout.root / "outputs" / "checkpoint"
     (checkpoint_dir / "adapter").mkdir(parents=True, exist_ok=True)
@@ -198,8 +212,12 @@ def align_mlx(
         )
         atomic_json(layout.run_manifest, manifest)
         return AlignmentResult(
-            destination, adapter_dir, layout.run_manifest, losses,
-            dataset.alignment_type.value, options.optimizer,
+            destination,
+            adapter_dir,
+            layout.run_manifest,
+            losses,
+            dataset.alignment_type.value,
+            options.optimizer,
             rollout_result.data_file if rollout_result else None,
             rollout_result.generated_examples if rollout_result else 0,
         )
@@ -251,6 +269,18 @@ def align_gguf(
         tensor_split=config.tensor_split,
         main_gpu=config.main_gpu,
     )
+    if selected is not Accelerator.CPU:
+        discovered = available_llama_devices(llama_binary("llama-completion"), selected)
+        if config.devices and any(device not in discovered for device in config.devices):
+            raise ConfigurationError("a selected alignment GPU is unavailable")
+        devices = config.devices or discovered
+        if not devices:
+            raise ConfigurationError("alignment GPU backend reports no usable devices")
+        if config.multi_gpu == "on" and len(devices) < 2:
+            raise ConfigurationError("multi-GPU alignment needs at least two devices")
+        eval_options = replace(eval_options, devices=devices)
+        if config.multi_gpu != "off" and len(devices) > 1 and config.split_mode != "layer":
+            raise ConfigurationError("model-sharded GGUF alignment requires layer splitting")
     source_dataset = dataset
     rollout_result: RolloutResult | None = None
     if options.rollouts.enabled:
@@ -288,6 +318,16 @@ def align_gguf(
         source_dataset=source_dataset,
         rollout=rollout_result,
     )
+    if (
+        selected is not Accelerator.CPU
+        and config.multi_gpu != "off"
+        and len(eval_options.devices) > 1
+    ):
+        manifest["model_sharded_training"] = {
+            "method": "one preference optimizer step over layer shards",
+            "devices": list(eval_options.devices),
+            "split_mode": eval_options.split_mode,
+        }
     atomic_json(layout.run_manifest, manifest)
     before = tuple(fingerprint(path, full_hash=True) for path in base.shards)
     corpora = _alignment_corpora(layout, dataset, eval_options.context)
@@ -348,17 +388,28 @@ def align_gguf(
     try:
         for index, item in enumerate(dataset.examples):
             rc = -_evaluate_supervised_loss(
-                binary, base.path, source_adapter, corpora[index][0], eval_options,
-                layout.logs / f"reference-{index}-chosen.log", selected,
+                binary,
+                base.path,
+                source_adapter,
+                corpora[index][0],
+                eval_options,
+                layout.logs / f"reference-{index}-chosen.log",
+                selected,
                 example_weights=(1.0,),
             )
             rr = (
                 -_evaluate_supervised_loss(
-                    binary, base.path, source_adapter, corpora[index][1], eval_options,
-                    layout.logs / f"reference-{index}-rejected.log", selected,
+                    binary,
+                    base.path,
+                    source_adapter,
+                    corpora[index][1],
+                    eval_options,
+                    layout.logs / f"reference-{index}-rejected.log",
+                    selected,
                     example_weights=(1.0,),
                 )
-                if item.rejected is not None else 0.0
+                if item.rejected is not None
+                else 0.0
             )
             references.append((rc, rr))
         current_path = source_adapter
@@ -408,25 +459,33 @@ def align_gguf(
             )
         os.replace(current_path, final_adapter)
         _verify_common(base, before, source_adapter, final_adapter)
-        manifest.update({
-            "status": "completed", "completed_at": _now(),
-            "adapter": str(final_adapter), "losses": losses,
-            "alignment_accelerator_requested": selected.value,
-            "alignment_accelerator": training_accelerator.value,
-            "accelerator_fallback_reason": (
-                fallback_reason
-                or (
-                    "accelerator rejected the backward graph"
-                    if training_accelerator is not selected
-                    else None
-                )
-            ),
-            "invariants": _invariants(),
-        })
+        manifest.update(
+            {
+                "status": "completed",
+                "completed_at": _now(),
+                "adapter": str(final_adapter),
+                "losses": losses,
+                "alignment_accelerator_requested": selected.value,
+                "alignment_accelerator": training_accelerator.value,
+                "accelerator_fallback_reason": (
+                    fallback_reason
+                    or (
+                        "accelerator rejected the backward graph"
+                        if training_accelerator is not selected
+                        else None
+                    )
+                ),
+                "invariants": _invariants(),
+            }
+        )
         atomic_json(layout.run_manifest, manifest)
         return AlignmentResult(
-            destination, final_adapter, layout.run_manifest, tuple(losses),
-            dataset.alignment_type.value, options.optimizer,
+            destination,
+            final_adapter,
+            layout.run_manifest,
+            tuple(losses),
+            dataset.alignment_type.value,
+            options.optimizer,
             rollout_result.data_file if rollout_result else None,
             rollout_result.generated_examples if rollout_result else 0,
         )
@@ -449,12 +508,24 @@ def _example_loss(
     if method is AlignmentType.PPO and item.rejected is not None:
         return 0.5 * (
             preference_loss(
-                "ppo", pc, 0.0, rc, 0.0,
-                beta=options.beta, clip=options.ppo_clip, reward=1.0,
+                "ppo",
+                pc,
+                0.0,
+                rc,
+                0.0,
+                beta=options.beta,
+                clip=options.ppo_clip,
+                reward=1.0,
             )
             + preference_loss(
-                "ppo", pr, 0.0, rr, 0.0,
-                beta=options.beta, clip=options.ppo_clip, reward=-1.0,
+                "ppo",
+                pr,
+                0.0,
+                rr,
+                0.0,
+                beta=options.beta,
+                clip=options.ppo_clip,
+                reward=-1.0,
             )
         )
     return preference_loss(
@@ -483,12 +554,24 @@ def _example_gradients(
 ):
     if method is AlignmentType.PPO and item.rejected is not None:
         chosen, _ = preference_gradients(
-            "ppo", pc, 0.0, rc, 0.0,
-            beta=options.beta, clip=options.ppo_clip, reward=1.0,
+            "ppo",
+            pc,
+            0.0,
+            rc,
+            0.0,
+            beta=options.beta,
+            clip=options.ppo_clip,
+            reward=1.0,
         )
         rejected, _ = preference_gradients(
-            "ppo", pr, 0.0, rr, 0.0,
-            beta=options.beta, clip=options.ppo_clip, reward=-1.0,
+            "ppo",
+            pr,
+            0.0,
+            rr,
+            0.0,
+            beta=options.beta,
+            clip=options.ppo_clip,
+            reward=-1.0,
         )
         return 0.5 * chosen, 0.5 * rejected
     return preference_gradients(
@@ -535,11 +618,11 @@ def _native_alignment_step(
     output.unlink(missing_ok=True)
     log_path.unlink(missing_ok=True)
     environment = offline_environment()
+    if accelerator is Accelerator.CUDA:
+        environment["OSAI_GPU_TIED_EMBEDDINGS"] = "1"
     environment["OSAI_MASK_PROMPT"] = "1"
     environment["OSAI_MAX_SEQ_LENGTH"] = str(settings.context)
-    environment["OSAI_EXAMPLE_WEIGHTS"] = ",".join(
-        format(value, ".17g") for value in weights
-    )
+    environment["OSAI_EXAMPLE_WEIGHTS"] = ",".join(format(value, ".17g") for value in weights)
     checkpoint_dir = output.parent.parent / "outputs" / "checkpoint"
     (checkpoint_dir / "adapter").mkdir(parents=True, exist_ok=True)
     checkpoint_output = checkpoint_dir / "adapter" / "last.gguf"
@@ -551,20 +634,15 @@ def _native_alignment_step(
     environment["OSAI_CHECKPOINT_OUTPUT"] = str(checkpoint_output)
     environment["OSAI_CHECKPOINT_ACK"] = str(checkpoint_ack)
     environment["OSAI_CHECKPOINT_INTERVAL_SECONDS"] = "300"
-    command = _gradient_command(
-        binary, model, adapter, corpus, output, settings, accelerator
-    )
+    command = _gradient_command(binary, model, adapter, corpus, output, settings, accelerator)
     try:
         run_logged(command, log_path=log_path, env=environment)
-    except TrainingError:
-        if accelerator is Accelerator.CPU:
-            raise
-        output.unlink(missing_ok=True)
-        command = _gradient_command(
-            binary, model, adapter, corpus, output, settings, Accelerator.CPU
-        )
-        run_logged(command, log_path=log_path, env=environment)
-        accelerator = Accelerator.CPU
+    except TrainingError as exc:
+        if accelerator is not Accelerator.CPU:
+            raise TrainingError(
+                f"GPU alignment failed without a CPU fallback; see {log_path}"
+            ) from exc
+        raise
     if not output.is_file() or output.stat().st_size == 0:
         raise TrainingError(f"llama.cpp did not save an aligned adapter; see {log_path}")
     pending = checkpoint_output.with_name("last.gguf.pending")
@@ -576,8 +654,7 @@ def _native_alignment_step(
         else ""
     )
     if token and (
-        not checkpoint_ack.is_file()
-        or checkpoint_ack.read_text(encoding="utf-8").strip() != token
+        not checkpoint_ack.is_file() or checkpoint_ack.read_text(encoding="utf-8").strip() != token
     ):
         pending_ack = checkpoint_ack.with_name("last.ack.pending")
         pending_ack.write_text(token + "\n", encoding="utf-8")
@@ -598,8 +675,11 @@ def _alignment_corpora(layout: SessionLayout, dataset: AlignmentDataset, context
             encoding="utf-8",
         )
         chosen = _write_corpus(
-            chosen_source, layout.work / f"alignment-{index}-chosen.txt", context,
-            repeat_to_minimum=False, record_separator="\n<|osai_record_end|>\n",
+            chosen_source,
+            layout.work / f"alignment-{index}-chosen.txt",
+            context,
+            repeat_to_minimum=False,
+            record_separator="\n<|osai_record_end|>\n",
         )
         rejected = None
         if item.rejected is not None:
@@ -609,8 +689,11 @@ def _alignment_corpora(layout: SessionLayout, dataset: AlignmentDataset, context
                 encoding="utf-8",
             )
             rejected = _write_corpus(
-                rejected_source, layout.work / f"alignment-{index}-rejected.txt", context,
-                repeat_to_minimum=False, record_separator="\n<|osai_record_end|>\n",
+                rejected_source,
+                layout.work / f"alignment-{index}-rejected.txt",
+                context,
+                repeat_to_minimum=False,
+                record_separator="\n<|osai_record_end|>\n",
             )
         result.append((chosen, rejected))
     return result
@@ -638,10 +721,16 @@ def _manifest(
     dataset_record = dataset.as_dict()
     dataset_record["train_sha256"] = sha256_file(dataset.path / "train.jsonl")
     result = {
-        "schema_version": 1, "status": "aligning", "started_at": _now(),
-        "stage": "alignment", "backend": backend, "local_only": True,
-        "model": base.as_dict(), "input_adapter": str(adapter),
-        "dataset": dataset_record, "options": asdict(options),
+        "schema_version": 1,
+        "status": "aligning",
+        "started_at": _now(),
+        "stage": "alignment",
+        "backend": backend,
+        "local_only": True,
+        "model": base.as_dict(),
+        "input_adapter": str(adapter),
+        "dataset": dataset_record,
+        "options": asdict(options),
         "rollouts": (
             rollout.as_dict()
             if rollout is not None
@@ -650,9 +739,7 @@ def _manifest(
     }
     if source_dataset is not None and source_dataset.path != dataset.path:
         source_record = source_dataset.as_dict()
-        source_record["train_sha256"] = sha256_file(
-            source_dataset.path / "train.jsonl"
-        )
+        source_record["train_sha256"] = sha256_file(source_dataset.path / "train.jsonl")
         result["source_dataset"] = source_record
     return result
 
@@ -676,10 +763,13 @@ def _invariants():
 
 
 def _fail_manifest(path, manifest, exc):
-    manifest.update({
-        "status": "failed", "completed_at": _now(),
-        "error": {"type": type(exc).__name__, "message": str(exc)},
-    })
+    manifest.update(
+        {
+            "status": "failed",
+            "completed_at": _now(),
+            "error": {"type": type(exc).__name__, "message": str(exc)},
+        }
+    )
     atomic_json(path, manifest)
 
 

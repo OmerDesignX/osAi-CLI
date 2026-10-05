@@ -340,29 +340,31 @@ surrogate without a learned critic model.
 
 ## Multi-GPU: Metal/CUDA/Vulkan
 
-For GGUF training, `--multi-gpu auto` discovers compatible Metal, CUDA, or
-Vulkan devices. The CLI runs one native trainer per GPU concurrently, assigns
-distinct round-robin training-record shards, then publishes the record-weighted
-mean of their LoRA deltas. The resulting adapter rank is the selected rank
-times the GPU count. These workers optimize independently and average only at
-the end of the run; gradients are not synchronized after each step. Native
-llama.cpp tensor or layer splitting is not used for GGUF backpropagation.
-`--multi-gpu on` requires at least two GPUs and at least one record per GPU.
+For GGUF fine-tuning and alignment, `--multi-gpu auto` discovers compatible
+Metal, CUDA, or Vulkan devices. One native trainer divides the model by layer
+across those devices and applies one optimizer update per step. The adapter
+keeps the selected rank. `--multi-gpu on` requires at least two GPUs. Model
+weights are shared across their memory, but activations and the largest layer
+must still fit on their assigned GPU. Row and tensor splitting are not yet
+supported for GGUF backpropagation. A 3 GiB card can participate only when its
+assigned layers and training graph fit; a large model or full context may still
+exceed it. Calibration reports that limit rather than switching to CPU training.
 On Vulkan and Metal systems, automatic GGUF training prefers discrete cards
 over recognized integrated adapters. Intel Macs can use a Metal eGPU when
 llama.cpp lists it; Apple silicon Macs do not support eGPUs. MLX uses local
-NCCL data parallelism on multi-GPU Linux CUDA systems.
+NCCL data parallelism on multi-GPU Linux CUDA systems; select the GGUF engine
+when model sharding is required.
 
 Automatic settings run a bounded one-turn inference benchmark using the selected
-model and accelerator. Each GPU used for GGUF data parallelism is probed
-separately. The largest passing `compact`, `balanced`, `performance`, or
+model and accelerator. GGUF devices are probed together with layer splitting.
+The largest passing `compact`, `balanced`, `performance`, or
 `maximum` profile must also fit conservative host and reported free-GPU-memory
 reserves for training. Benchmark results are cached for 12 hours per model,
 device set, and hardware state. Dataset size never changes the profile. GGUF
 profiles range from 256 to 2048 context tokens and use smaller native
-microbatches at larger contexts. Data-parallel GPUs each need a complete model
-and worker; their VRAM is not pooled. Long supervised records can take much
-longer to train because every assistant token remains in a window. Weighted
+microbatches at larger contexts. The training pilot checks backward memory on
+each GPU and lowers its microbatch after an allocation failure. Long supervised
+records can take much longer to train because every assistant token remains in a window. Weighted
 alignment requires each full sequence to fit the selected context and fails
 explicitly otherwise. The selected values are printed before training and
 stored in the run manifest.
@@ -414,8 +416,8 @@ next safe step and at completion; alignment also saves after each native
 update. MLX saves every `--save-every` updates and at completion. A request
 written to `checkpoint.request` in the session folder
 also saves at the next optimizer step; replace its text with a new unique
-value for each request. Multi-GPU GGUF training waits for every worker's
-snapshot before publishing one combined adapter. The adapter and the
+value for each request. Model-sharded GGUF training writes one adapter at a
+safe optimizer step. The adapter and the
 `merged-model/` bundle are replaced in place, so numbered checkpoint copies
 do not accumulate. The bundle can be selected as a custom model for a later
 run. A checkpoint contains model weights, not optimizer state, so starting a

@@ -43,6 +43,7 @@ struct ggml_opt_context {
     struct ggml_context      * ctx_copy             = nullptr;
     ggml_backend_buffer_t      buf_static           = nullptr;
     ggml_backend_buffer_t      buf_cpu              = nullptr;
+    std::vector<ggml_backend_buffer_t> buf_param;
     std::mt19937               rng;
     enum ggml_opt_loss_type    loss_type;
     enum ggml_opt_build_type   build_type;
@@ -425,6 +426,42 @@ static ggml_cgraph * dup_graph(ggml_context * ctx, ggml_cgraph * src) {
     return dst;
 }
 
+static void ggml_opt_alloc_param_buffers(ggml_opt_context_t opt_ctx) {
+    std::map<ggml_backend_buffer_type_t, std::vector<ggml_tensor *>> by_buft;
+    for (int i = 0; i < opt_ctx->gf->n_nodes; ++i) {
+        ggml_tensor * param = opt_ctx->gf->nodes[i];
+        if (!(param->flags & GGML_TENSOR_FLAG_PARAM) || !param->buffer) {
+            continue;
+        }
+        auto buft = ggml_backend_buffer_get_type(param->buffer);
+        for (ggml_tensor * state : {opt_ctx->grad_accs[i],
+                                    i < int(opt_ctx->grad_m.size()) ? opt_ctx->grad_m[i] : nullptr,
+                                    i < int(opt_ctx->grad_v.size()) ? opt_ctx->grad_v[i] : nullptr}) {
+            if (state && !state->buffer) {
+                by_buft[buft].push_back(state);
+            }
+        }
+    }
+
+    for (const auto & [buft, tensors] : by_buft) {
+        const size_t alignment = ggml_backend_buft_get_alignment(buft);
+        size_t size = 0;
+        for (ggml_tensor * tensor : tensors) {
+            size += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, tensor), alignment);
+        }
+        ggml_backend_buffer_t buffer = ggml_backend_buft_alloc_buffer(buft, size);
+        GGML_ASSERT(buffer && "failed to allocate optimizer state on the parameter device");
+        size_t offset = 0;
+        for (ggml_tensor * tensor : tensors) {
+            GGML_ASSERT(ggml_backend_tensor_alloc(buffer, tensor,
+                (char *) ggml_backend_buffer_get_base(buffer) + offset) == GGML_STATUS_SUCCESS);
+            offset += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, tensor), alignment);
+        }
+        ggml_backend_buffer_clear(buffer, 0);
+        opt_ctx->buf_param.push_back(buffer);
+    }
+}
+
 static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     GGML_ASSERT(opt_ctx->ctx_compute && "no compute context set, either use static graphs or set one with ggml_opt_prepare_alloc");
     GGML_ASSERT((!opt_ctx->static_graphs || opt_ctx->inputs->data) && "when using static graphs the inputs must be allocated statically");
@@ -644,6 +681,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
     }
 
     if (!opt_ctx->buf_static) {
+        ggml_opt_alloc_param_buffers(opt_ctx);
         opt_ctx->buf_static = ggml_backend_alloc_ctx_tensors(
             opt_ctx->ctx_static, ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0));
         ggml_graph_reset(opt_ctx->gb_opt);
@@ -690,6 +728,9 @@ ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
 void ggml_opt_free(ggml_opt_context_t opt_ctx) {
     if (opt_ctx == nullptr) {
         return;
+    }
+    for (ggml_backend_buffer_t buffer : opt_ctx->buf_param) {
+        ggml_backend_buffer_free(buffer);
     }
     ggml_backend_buffer_free(opt_ctx->buf_static);
     ggml_backend_buffer_free(opt_ctx->buf_cpu);

@@ -72,8 +72,8 @@ def benchmark_auto_settings(
 ) -> BenchmarkResult:
     """Find the highest memory-bounded profile that passes local inference.
 
-    The probe never reads a dataset. For data-parallel llama training every
-    selected GPU must load the entire model, so each is checked separately.
+    The probe never reads a dataset. Model-sharded llama training loads one
+    model across the selected devices, so the inference probe uses them together.
     """
 
     if multi_gpu not in {"auto", "on", "off"}:
@@ -106,15 +106,15 @@ def benchmark_auto_settings(
             raise ConfigurationError("the selected GPU backend reports no usable devices")
         free_by_device = llama_device_free_bytes(binary, selected)
         free_gpu_bytes = (
-            min(free_by_device[device] for device in chosen)
+            tuple(free_by_device[device] for device in chosen)
             if chosen and all(device in free_by_device for device in chosen)
-            else None
+            else ()
         )
         executable = binary
     elif engine is Engine.MLX:
         selected = Accelerator.CPU if accelerator == "cpu" else Accelerator.AUTO
         chosen = ()
-        free_gpu_bytes = None
+        free_gpu_bytes = ()
         executable = Path(sys.executable)
     else:
         raise ConfigurationError("automatic benchmark requires a resolved engine")
@@ -126,7 +126,7 @@ def benchmark_auto_settings(
         adapter / "adapters.safetensors" if adapter is not None and adapter.is_dir() else adapter
     )
     key_data = {
-        "schema": 2,
+        "schema": 3,
         "required_context": required_context,
         "model": str(model.path.resolve()),
         "shards": [
@@ -135,7 +135,7 @@ def benchmark_auto_settings(
         "engine": engine.value,
         "accelerator": selected.value,
         "devices": chosen,
-        "free_gpu_gib": free_gpu_bytes // 1024**3 if free_gpu_bytes is not None else None,
+        "free_gpu_gib": [value // 1024**3 for value in free_gpu_bytes],
         "multi_gpu": multi_gpu,
         "memory": baseline.physical_memory_bytes,
         "cpu": os.cpu_count(),
@@ -166,8 +166,14 @@ def benchmark_auto_settings(
             continue
         try:
             if engine is Engine.LLAMA_CPP:
-                for device in chosen or ("",):
-                    _probe_llama(executable, model.path, settings, selected, device, adapter)
+                _probe_llama(
+                    executable,
+                    model.path,
+                    settings,
+                    selected,
+                    ",".join(chosen),
+                    adapter,
+                )
             else:
                 _probe_mlx(model.path, settings, adapter)
         except (OSError, subprocess.TimeoutExpired, RuntimeError) as exc:
@@ -212,8 +218,8 @@ def _fit_required_context(
     )
 
 
-def _gpu_profile_fits(profile: str, model_bytes: int, free_bytes: int | None) -> bool:
-    if free_bytes is None:
+def _gpu_profile_fits(profile: str, model_bytes: int, free_bytes: tuple[int, ...]) -> bool:
+    if not free_bytes:
         return True
     training_reserve = {
         "compact": 2 * 1024**3,
@@ -221,8 +227,12 @@ def _gpu_profile_fits(profile: str, model_bytes: int, free_bytes: int | None) ->
         "performance": 6 * 1024**3,
         "maximum": 10 * 1024**3,
     }[profile]
-    system_reserve = max(512 * 1024**2, free_bytes // 10)
-    return model_bytes + training_reserve + system_reserve <= free_bytes
+    device_count = len(free_bytes)
+    return all(
+        (model_bytes + training_reserve) / device_count + max(256 * 1024**2, available // 10)
+        <= available
+        for available in free_bytes
+    )
 
 
 def _probe_llama(
@@ -261,6 +271,8 @@ def _probe_llama(
         command += ["-dev", "none", "-ngl", "0", "--no-op-offload"]
     else:
         command += ["-dev", device, "-ngl", "auto"]
+        if "," in device:
+            command += ["-sm", "layer"]
     if adapter is not None:
         command += ["--lora", str(adapter)]
     completed = subprocess.run(

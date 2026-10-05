@@ -7,15 +7,9 @@ import math
 import os
 import re
 import shutil
-import subprocess
-import sys
-import time
-import uuid
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext, suppress
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
-from threading import Event, Lock
 from typing import Any
 
 from ..checkpoints import CheckpointPublisher
@@ -34,7 +28,6 @@ from ..session import SessionLayout, record_dataset
 from ..system import doctor, physical_memory_bytes
 from .llama_cpp import ensure_runtime_accelerator
 from .llama_utils import (
-    _combine_lora_adapters,
     _evaluate_loss,
     _import_gguf,
     _import_numpy,
@@ -176,12 +169,8 @@ def train_gradient_gguf(
         raise ConfigurationError(
             "multi-GPU was required, but fewer than two usable devices were found"
         )
-    if settings.multi_gpu != "off" and len(settings.devices) > dataset.train_examples:
-        if settings.multi_gpu == "on":
-            raise ConfigurationError(
-                "required multi-GPU training needs at least one record per GPU"
-            )
-        settings = replace(settings, devices=settings.devices[: dataset.train_examples])
+    if settings.multi_gpu != "off" and len(settings.devices) > 1 and settings.split_mode != "layer":
+        raise ConfigurationError("model-sharded GGUF training currently requires layer splitting")
     training_accelerator = requested_accelerator
     fallback_from: str | None = None
     fallback_reason: str | None = None
@@ -290,14 +279,14 @@ def train_gradient_gguf(
                 else None
             )
 
-            parallel_devices = (
+            sharded_devices = (
                 settings.devices
                 if training_accelerator is not Accelerator.CPU
                 and settings.multi_gpu != "off"
                 and len(settings.devices) > 1
                 else ()
             )
-            evaluation_accelerator = Accelerator.CPU if parallel_devices else requested_accelerator
+            evaluation_accelerator = Accelerator.CPU if sharded_devices else requested_accelerator
             initial_loss = math.nan
             initial_test_loss = None
             perplexity_binary = None
@@ -355,113 +344,77 @@ def train_gradient_gguf(
             training_env["OSAI_CHECKPOINT_OUTPUT"] = str(checkpoint_dir / "adapter" / "last.gguf")
             training_env["OSAI_CHECKPOINT_ACK"] = str(checkpoint_dir / "last.ack")
             training_env["OSAI_CHECKPOINT_INTERVAL_SECONDS"] = "300"
-            if parallel_devices:
-                while True:
-                    try:
-                        epoch_losses, optimizer_steps, measured_speeds = _run_parallel_gradient(
-                            binary,
-                            base.path,
-                            base.architecture,
-                            base.shards,
-                            dataset.path / "train.jsonl",
-                            initial_adapter,
-                            trained_adapter,
-                            internal,
-                            layout.logs,
-                            settings,
-                            training_accelerator,
-                            training_env,
-                            dataset.train_examples,
-                            initial_digest,
-                            np,
+            if sharded_devices:
+                manifest["model_sharded_training"] = {
+                    "method": "one optimizer step over layer shards",
+                    "devices": list(sharded_devices),
+                    "split_mode": settings.split_mode,
+                    "adapter_rank": settings.rank,
+                }
+                atomic_json(manifest_path, manifest)
+                print(
+                    "osai: one shared GGUF trainer on " + ", ".join(sharded_devices),
+                    flush=True,
+                )
+            while True:
+                attempt_offset = log_path.stat().st_size if log_path.exists() else 0
+                command = _gradient_command(
+                    binary,
+                    base.path,
+                    initial_adapter,
+                    train_corpus,
+                    trained_adapter,
+                    settings,
+                    training_accelerator,
+                )
+                try:
+                    publisher = (
+                        nullcontext()
+                        if settings.calibration_pilot
+                        else CheckpointPublisher(
+                            kind="gguf",
+                            model=base.path,
+                            shards=base.shards,
+                            latest=checkpoint_dir / "adapter" / "last.gguf",
                         )
-                    except TrainingError:
-                        worker_logs = [
-                            layout.logs / f"train-gpu-{index}.log"
-                            for index in range(len(parallel_devices))
-                        ]
-                        if (
-                            settings.auto_settings
-                            and any(_memory_failure(log) for log in worker_logs)
-                            and settings.context > 256
-                        ):
-                            settings = _lower_auto_context(settings, training_env, manifest)
-                            atomic_json(manifest_path, manifest)
-                            continue
-                        raise
-                    else:
-                        best_index = min(range(len(epoch_losses)), key=epoch_losses.__getitem__)
-                        best_epoch, best_supervised_loss = best_index + 1, epoch_losses[best_index]
-                        manifest["parallel_training"] = {
-                            "method": "label-weighted mean of independent LoRA deltas",
-                            "devices": list(parallel_devices),
-                            "measured_steps_per_second": list(measured_speeds),
-                            "shard_speeds": list(settings.device_speeds),
-                            "published_rank": settings.rank * len(parallel_devices),
-                        }
-                        atomic_json(manifest_path, manifest)
-                        break
-            if not parallel_devices:
-                while True:
-                    attempt_offset = log_path.stat().st_size if log_path.exists() else 0
-                    command = _gradient_command(
-                        binary,
-                        base.path,
-                        initial_adapter,
-                        train_corpus,
-                        trained_adapter,
-                        settings,
-                        training_accelerator,
                     )
-                    try:
-                        publisher = (
-                            nullcontext()
-                            if settings.calibration_pilot
-                            else CheckpointPublisher(
-                                kind="gguf",
-                                model=base.path,
-                                shards=base.shards,
-                                latest=checkpoint_dir / "adapter" / "last.gguf",
-                            )
-                        )
-                        with publisher:
-                            run_logged(command, log_path=log_path, env=training_env)
-                        successful_offset = attempt_offset
-                        break
-                    except TrainingError as exc:
-                        if (
-                            settings.auto_settings
-                            and training_accelerator is not Accelerator.CPU
-                            and settings.context > 256
-                            and _memory_failure(log_path, attempt_offset)
-                        ):
-                            settings = _lower_auto_context(settings, training_env, manifest)
-                            atomic_json(manifest_path, manifest)
-                            trained_adapter.unlink(missing_ok=True)
-                            successful_offset = log_path.stat().st_size
-                            continue
-                        if settings.multi_gpu == "on":
-                            raise TrainingError(
-                                "required multi-GPU training failed; see the native training log "
-                                f"at {log_path}"
-                            ) from exc
-                        raise
+                    with publisher:
+                        run_logged(command, log_path=log_path, env=training_env)
+                    successful_offset = attempt_offset
+                    break
+                except TrainingError as exc:
+                    if (
+                        settings.auto_settings
+                        and training_accelerator is not Accelerator.CPU
+                        and settings.context > 256
+                        and _memory_failure(log_path, attempt_offset)
+                    ):
+                        settings = _lower_auto_context(settings, training_env, manifest)
+                        atomic_json(manifest_path, manifest)
+                        trained_adapter.unlink(missing_ok=True)
+                        successful_offset = log_path.stat().st_size
+                        continue
+                    if settings.multi_gpu == "on":
+                        raise TrainingError(
+                            "required multi-GPU training failed; see the native training log "
+                            f"at {log_path}"
+                        ) from exc
+                    raise
 
             if not trained_adapter.is_file():
                 raise TrainingError(f"llama.cpp did not save a trained adapter; see {log_path}")
-            if not parallel_devices:
-                epoch_losses, optimizer_steps, _labels, _speed, checkpoint = (
-                    _gradient_worker_log_summary(
-                        log_path,
-                        settings.epochs,
-                        settings.mask_prompt,
-                        0,
-                        start_offset=successful_offset,
-                    )
+            epoch_losses, optimizer_steps, _labels, _speed, checkpoint = (
+                _gradient_worker_log_summary(
+                    log_path,
+                    settings.epochs,
+                    settings.mask_prompt,
+                    0,
+                    start_offset=successful_offset,
                 )
-                best_epoch, best_supervised_loss = checkpoint or _parse_best_checkpoint(
-                    "", epoch_losses
-                )
+            )
+            best_epoch, best_supervised_loss = checkpoint or _parse_best_checkpoint(
+                "", epoch_losses
+            )
             if settings.mask_prompt or settings.calibration_pilot:
                 initial_loss = epoch_losses[0]
 
@@ -603,7 +556,7 @@ def train_gradient_gguf(
             atomic_json(manifest_path, manifest)
             # The original JSONL remains at its recorded path. Large runs can
             # otherwise leave several gigabytes of duplicate text per session.
-            for prepared in (train_corpus, test_corpus, *internal.glob("train-gpu-*.txt")):
+            for prepared in (train_corpus, test_corpus):
                 if prepared is not None:
                     with suppress(OSError):
                         prepared.unlink()
@@ -617,7 +570,7 @@ def train_gradient_gguf(
                 optimizer_steps,
                 loss_reducing_steps,
                 initial_test_loss,
-                measured_speeds if parallel_devices else (),
+                (),
             )
         except BaseException as exc:
             manifest.update(
@@ -676,40 +629,6 @@ def _gradient_command(
     return command
 
 
-def _weighted_record_shards(
-    source: Path, speeds: tuple[float, ...], record_count: int
-) -> tuple[frozenset[int], ...]:
-    """Assign complete records by measured worker speed using bounded memory."""
-
-    with source.open("rb") as handle:
-        lengths = [len(line) for line in handle]
-    if len(lengths) != record_count:
-        raise TrainingError("training record count changed while assigning GPU shards")
-    assigned: list[set[int]] = [set() for _ in speeds]
-    loads = [0] * len(speeds)
-    ordered_rows = sorted(range(record_count), key=lambda index: (-lengths[index], index))
-    for row, device in zip(
-        ordered_rows,
-        sorted(range(len(speeds)), key=lambda index: (-speeds[index], index)),
-        strict=False,
-    ):
-        assigned[device].add(row)
-        loads[device] += lengths[row]
-    for row in ordered_rows[len(speeds) :]:
-        device = min(range(len(speeds)), key=lambda index: (loads[index] / speeds[index], index))
-        assigned[device].add(row)
-        loads[device] += lengths[row]
-    print(
-        "osai: weighted GPU shards "
-        + ", ".join(
-            f"{len(rows)} records at relative speed {speed:.3g}"
-            for rows, speed in zip(assigned, speeds, strict=True)
-        ),
-        flush=True,
-    )
-    return tuple(frozenset(rows) for rows in assigned)
-
-
 def _gradient_worker_log_summary(
     log: Path,
     epochs: int,
@@ -750,303 +669,6 @@ def _gradient_worker_log_summary(
     # Use the native optimizer timer for worker throughput whenever it exists.
     duration = native_seconds or elapsed_seconds or 1
     return tuple(losses), steps, trained_labels, progress_total * epochs / duration, checkpoint
-
-
-def _run_parallel_gradient(
-    binary: Path,
-    model: Path,
-    architecture: str,
-    shards: tuple[Path, ...],
-    source: Path,
-    initial_adapter: Path,
-    output_adapter: Path,
-    work: Path,
-    logs: Path,
-    settings: LlamaGradientOptions,
-    accelerator: Accelerator,
-    environment: dict[str, str],
-    record_count: int,
-    initial_digest: str,
-    np,
-) -> tuple[tuple[float, ...], int, tuple[float, ...]]:
-    """Train independent data shards concurrently, then average exact LoRA deltas."""
-
-    devices = settings.devices
-    count = len(devices)
-    if count < 2 or record_count < count:
-        raise ConfigurationError("parallel GGUF training needs one record per device")
-    print(f"osai: data-parallel LoRA training on {', '.join(devices)}")
-    worker_threads = min(settings.threads, max(1, (os.cpu_count() or 1) // count))
-    print(
-        f"osai: using {worker_threads} CPU threads per GPU worker across {count} devices",
-        flush=True,
-    )
-    speeds = settings.device_speeds or (1.0,) * count
-    selected_rows = _weighted_record_shards(source, speeds, record_count)
-    separator = "\n<|osai_record_end|>\n" if settings.mask_prompt else "\n\n"
-    worker_outputs: list[Path] = []
-    worker_logs: list[Path] = []
-    record_counts: list[int] = []
-    commands: list[list[str]] = []
-    checkpoint_dir = work.parent / "outputs" / "checkpoint"
-    (checkpoint_dir / "adapter").mkdir(parents=True, exist_ok=True)
-    request = Path(environment["OSAI_CHECKPOINT_REQUEST"])
-    checkpoint_outputs: list[Path] = []
-    checkpoint_acks: list[Path] = []
-    worker_environments: list[dict[str, str]] = []
-    for index, device in enumerate(devices):
-        shard = _write_corpus(
-            source,
-            work / f"train-gpu-{index}.txt",
-            max(settings.context, 128),
-            repeat_to_minimum=not settings.mask_prompt,
-            record_separator=separator,
-            shard_index=index,
-            shard_count=count,
-            selected_rows=selected_rows[index] if selected_rows is not None else None,
-        )
-        worker_output = work / f"adapter-gpu-{index}.gguf"
-        worker_output.unlink(missing_ok=True)
-        worker_log = logs / f"train-gpu-{index}.log"
-        worker_log.unlink(missing_ok=True)
-        snapshot = work / f"checkpoint-gpu-{index}.gguf"
-        ack = work / f"checkpoint-gpu-{index}.ack"
-        snapshot.unlink(missing_ok=True)
-        ack.unlink(missing_ok=True)
-        worker_environment = dict(environment)
-        worker_environment["OSAI_CHECKPOINT_OUTPUT"] = str(snapshot)
-        worker_environment["OSAI_CHECKPOINT_ACK"] = str(ack)
-        worker_environment["OSAI_CHECKPOINT_INTERVAL_SECONDS"] = "0"
-        worker_environments.append(worker_environment)
-        checkpoint_outputs.append(snapshot)
-        checkpoint_acks.append(ack)
-        worker_settings = replace(
-            settings,
-            multi_gpu="off",
-            devices=(device,),
-            tensor_split=(),
-            main_gpu=0,
-            threads=worker_threads,
-        )
-        commands.append(
-            _gradient_command(
-                binary,
-                model,
-                initial_adapter,
-                shard,
-                worker_output,
-                worker_settings,
-                accelerator,
-            )
-        )
-        worker_outputs.append(worker_output)
-        worker_logs.append(worker_log)
-        record_counts.append(
-            len(selected_rows[index])
-            if selected_rows is not None
-            else (record_count + count - 1 - index) // count
-        )
-
-    cancel_workers = Event()
-    active_processes: list[subprocess.Popen[str]] = []
-    process_lock = Lock()
-
-    def register_process(process: subprocess.Popen[str]) -> None:
-        with process_lock:
-            active_processes.append(process)
-
-    with (
-        (
-            nullcontext()
-            if settings.calibration_pilot
-            else CheckpointPublisher(
-                kind="gguf",
-                model=model,
-                shards=shards,
-                latest=checkpoint_dir / "adapter" / "last.gguf",
-            )
-        ),
-        ThreadPoolExecutor(max_workers=count) as pool,
-    ):
-        futures = [
-            pool.submit(
-                run_logged,
-                command,
-                log_path=log,
-                env=worker_environment,
-                output_prefix=f"[{device}] ",
-                cancel_event=cancel_workers,
-                on_start=register_process,
-            )
-            for device, command, log, worker_environment in zip(
-                devices, commands, worker_logs, worker_environments, strict=True
-            )
-        ]
-        published = ""
-        next_auto = time.monotonic() + 300
-        failed_worker: int | None = None
-        while not all(future.done() for future in futures):
-            try:
-                token = request.read_text(encoding="utf-8").strip() if request.is_file() else ""
-            except OSError:
-                token = ""
-            if len(token) > 128:
-                token = ""
-            if time.monotonic() >= next_auto and (not token or token == published):
-                token = uuid.uuid4().hex
-                pending = request.with_name(request.name + ".pending")
-                pending.write_text(token + "\n", encoding="utf-8")
-                os.replace(pending, request)
-                next_auto = time.monotonic() + 300
-            if (
-                token
-                and token != published
-                and all(
-                    ack.is_file() and ack.read_text(encoding="utf-8").strip() == token
-                    for ack in checkpoint_acks
-                )
-            ):
-                try:
-                    weights = []
-                    for log, records in zip(worker_logs, record_counts, strict=True):
-                        with log.open("r", encoding="utf-8", errors="replace") as handle:
-                            labels = _SUPERVISED_LABELS_RE.findall(handle.read(32768))
-                        weights.append(
-                            int(labels[-1]) if settings.mask_prompt and labels else records
-                        )
-                    _combine_lora_adapters(
-                        tuple(checkpoint_outputs),
-                        tuple(weights),
-                        checkpoint_dir / "adapter" / "last.gguf",
-                        architecture,
-                        settings.scale * settings.rank,
-                        settings.rank,
-                        np,
-                    )
-                    ack = checkpoint_dir / "last.ack"
-                    pending_ack = checkpoint_dir / "last.ack.pending"
-                    pending_ack.write_text(token + "\n", encoding="utf-8")
-                    os.replace(pending_ack, ack)
-                    print(
-                        "osai: checkpoint saved "
-                        f"path={checkpoint_dir / 'adapter' / 'last.gguf'} generation={token}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                except Exception as exc:
-                    print(f"osai: checkpoint failed reason={exc}", file=sys.stderr, flush=True)
-                published = token
-            failed_worker = next(
-                (
-                    index
-                    for index, future in enumerate(futures)
-                    if future.done() and future.exception()
-                ),
-                None,
-            )
-            if failed_worker is not None:
-                cancel_workers.set()
-                with process_lock:
-                    for process in active_processes:
-                        if process.poll() is None:
-                            with suppress(OSError):
-                                process.terminate()
-                break
-            time.sleep(0.5)
-        if failed_worker is None:
-            failed_worker = next(
-                (
-                    index
-                    for index, future in enumerate(futures)
-                    if future.done() and future.exception()
-                ),
-                None,
-            )
-        if failed_worker is not None:
-            try:
-                futures[failed_worker].result()
-            except TrainingError as exc:
-                raise TrainingError(
-                    f"parallel training failed on {devices[failed_worker]}; "
-                    f"see native log: {worker_logs[failed_worker]}"
-                ) from exc
-        for device, log, future in zip(devices, worker_logs, futures, strict=True):
-            try:
-                future.result()
-            except TrainingError as exc:
-                raise TrainingError(
-                    f"parallel training failed on {device}; see native log: {log}"
-                ) from exc
-    for snapshot, ack in zip(checkpoint_outputs, checkpoint_acks, strict=True):
-        snapshot.unlink(missing_ok=True)
-        ack.unlink(missing_ok=True)
-
-    all_losses = []
-    optimizer_steps = 0
-    training_weights: list[int] = []
-    measured_speeds: list[float] = []
-    for device, output, log, records, future in zip(
-        devices, worker_outputs, worker_logs, record_counts, futures, strict=True
-    ):
-        if not output.is_file():
-            raise TrainingError(f"parallel training on {device} saved no adapter; see {log}")
-        _verify_adapter(output, architecture)
-        if _adapter_tensor_digest(output, np) == initial_digest:
-            raise VerificationError(f"parallel optimizer did not change LoRA tensors on {device}")
-        result = future.result()
-        losses, steps, labels, speed, _checkpoint = _gradient_worker_log_summary(
-            log, settings.epochs, settings.mask_prompt, getattr(result, "elapsed_seconds", 0) or 0
-        )
-        all_losses.append(losses)
-        optimizer_steps += steps
-        measured_speeds.append(speed)
-        if settings.mask_prompt:
-            if labels is None or labels < 1:
-                raise TrainingError(f"parallel worker reported no supervised labels; see {log}")
-            training_weights.append(labels)
-        else:
-            training_weights.append(records)
-
-    _combine_lora_adapters(
-        tuple(worker_outputs),
-        tuple(training_weights),
-        output_adapter,
-        architecture,
-        settings.scale * settings.rank,
-        settings.rank,
-        np,
-    )
-    if not settings.calibration_pilot:
-        latest = checkpoint_dir / "adapter" / "last.gguf"
-        with CheckpointPublisher(kind="gguf", model=model, shards=shards, latest=latest):
-            pending = latest.with_name("last.gguf.pending")
-            shutil.copyfile(output_adapter, pending)
-            os.replace(pending, latest)
-            print(
-                f"osai: checkpoint saved path={latest} generation=final",
-                file=sys.stderr,
-                flush=True,
-            )
-    total = sum(training_weights)
-    epoch_losses = tuple(
-        sum(
-            losses[epoch] * weight
-            for losses, weight in zip(all_losses, training_weights, strict=True)
-        )
-        / total
-        for epoch in range(settings.epochs)
-    )
-    (logs / "train.log").write_text(
-        "[osai] parallel devices="
-        + ",".join(devices)
-        + "\n"
-        + "\n".join(
-            f"[osai] {device} log={log}" for device, log in zip(devices, worker_logs, strict=True)
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    return epoch_losses, optimizer_steps, tuple(measured_speeds)
 
 
 def _evaluate_supervised_loss(

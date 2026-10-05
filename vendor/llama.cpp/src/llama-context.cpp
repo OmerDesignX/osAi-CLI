@@ -3411,12 +3411,19 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     GGML_ASSERT(model->hparams.n_ctx_train % n_batch  == 0);
     GGML_ASSERT(n_batch                    % n_ubatch == 0);
 
+    if (cparams.pipeline_parallel) {
+        cparams.pipeline_parallel = false;
+        sched_need_reserve = true;
+    }
+
     if (cparams.flash_attn) {
         LLAMA_LOG_INFO("%s: disabling flash attention, FLASH_ATTN_EXT has no backward pass\n", __func__);
         cparams.flash_attn = false;
 
         // the graph changes without flash attention, need to reserve again
         sched_need_reserve = true;
+    }
+    if (sched_need_reserve) {
         sched_reserve();
     }
 
