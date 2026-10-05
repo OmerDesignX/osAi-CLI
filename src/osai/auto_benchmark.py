@@ -79,6 +79,13 @@ def benchmark_auto_settings(
     if multi_gpu not in {"auto", "on", "off"}:
         raise ConfigurationError("multi_gpu must be auto, on, or off")
     if engine is Engine.LLAMA_CPP:
+        # A stale native trainer must be rebuilt before probing its companion
+        # completion binary, otherwise calibration can fit a different build
+        # from the one that will actually train.
+        if llama_binary("llama-finetune") is None:
+            from .backends.llama_cpp import ensure_runtime_accelerator
+
+            ensure_runtime_accelerator(accelerator)
         selected = select_llama_accelerator(accelerator)
         binary = llama_binary("llama-completion")
         if binary is None:

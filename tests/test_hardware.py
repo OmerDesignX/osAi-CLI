@@ -74,6 +74,17 @@ def test_auto_runtime_needs_cmake_when_only_cpu_build_is_packaged(monkeypatch):
         llama_cpp.ensure_runtime_accelerator("auto")
 
 
+def test_cpu_runtime_rebuilds_missing_or_stale_trainer(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(llama_cpp, "llama_binary", lambda _name: None)
+    monkeypatch.setattr(llama_cpp, "llama_runtime_build", lambda: tmp_path / "native")
+    monkeypatch.setattr(llama_cpp, "build_llama_cpp", lambda **kwargs: calls.append(kwargs))
+    llama_cpp.ensure_runtime_accelerator("cpu")
+    assert len(calls) == 1
+    assert calls[0]["accelerator"] is Accelerator.CPU
+    assert calls[0]["build_dir"] == tmp_path / "native"
+
+
 def test_cuda_build_targets_every_installed_gpu_architecture(monkeypatch):
     monkeypatch.setattr(
         llama_cpp.shutil, "which", lambda name: "nvidia-smi" if name == "nvidia-smi" else None
@@ -135,12 +146,30 @@ def test_writable_native_cache_takes_precedence_only_when_complete(monkeypatch, 
     suffix = ".exe" if os.name == "nt" else ""
     name = f"llama-finetune{suffix}"
     (packaged / name).write_bytes(b"package")
+    (packaged.parent / "OSAI_BUILD.json").write_text('{"llamaAccelerator":"cuda"}')
     (cached / name).write_bytes(b"cached")
+    tokenizer = cached / f"llama-tokenize{suffix}"
+    tokenizer.write_bytes(b"cached tokenizer")
     monkeypatch.setattr("osai.paths.project_root", lambda: tmp_path / "source")
     monkeypatch.setattr("osai.paths.llama_runtime_build", lambda: tmp_path / "cache")
     assert llama_binary("llama-finetune") == packaged / name
-    (tmp_path / "cache" / "OSAI_BUILD.json").write_text('{"llamaAccelerator":"cuda"}')
+    marker = tmp_path / "cache" / "OSAI_BUILD.json"
+    marker.write_text('{"llamaAccelerator":"cuda"}')
     assert llama_binary("llama-finetune") == cached / name
+
+    source = tmp_path / "source" / "vendor" / "llama.cpp" / "src" / "llama-context.cpp"
+    source.parent.mkdir()
+    source.write_text("updated native source", encoding="utf-8")
+    built_at = 1_700_000_000_000_000_000
+    os.utime(marker, ns=(built_at, built_at))
+    os.utime(source, ns=(built_at + 1_000_000_000, built_at + 1_000_000_000))
+    assert llama_binary("llama-finetune") == packaged / name
+    assert hardware._compiled_llama_accelerator() == "cuda"
+    assert llama_binary("llama-tokenize") == tokenizer
+
+    os.utime(packaged.parent / "OSAI_BUILD.json", ns=(built_at, built_at))
+    assert llama_binary("llama-finetune") is None
+    assert hardware._compiled_llama_accelerator() is None
 
 
 def test_mps_is_not_mislabeled_as_a_llama_backend():

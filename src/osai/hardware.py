@@ -164,7 +164,7 @@ def select_llama_accelerator(
 
 
 def _compiled_llama_accelerator() -> str | None:
-    from .paths import llama_runtime_build, project_root
+    from .paths import llama_build_is_current, llama_runtime_build, project_root
 
     root = project_root()
     candidates = (
@@ -172,6 +172,8 @@ def _compiled_llama_accelerator() -> str | None:
         root / "vendor" / "llama.cpp" / "build" / "OSAI_BUILD.json",
     )
     for path in candidates:
+        if not llama_build_is_current(path.parent):
+            continue
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):

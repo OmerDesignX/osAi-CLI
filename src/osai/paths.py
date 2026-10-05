@@ -39,6 +39,61 @@ def llama_cpp_root() -> Path:
     return project_root() / "vendor" / "llama.cpp"
 
 
+def llama_build_is_current(build: Path) -> bool:
+    """Reject a native build whose source changed after its successful build."""
+
+    marker = build / "OSAI_BUILD.json"
+    try:
+        built_at = marker.stat().st_mtime_ns
+        root = llama_cpp_root()
+        sources = (
+            root / "CMakeLists.txt",
+            root / "ggml" / "CMakeLists.txt",
+        )
+        directories = (
+            root / "src",
+            root / "include",
+            root / "common",
+            root / "cmake",
+            root / "ggml" / "src",
+            root / "ggml" / "include",
+            root / "ggml" / "cmake",
+            root / "examples" / "training",
+        )
+        suffixes = {
+            ".c",
+            ".cc",
+            ".cpp",
+            ".h",
+            ".hpp",
+            ".cu",
+            ".cuh",
+            ".metal",
+            ".mm",
+            ".m",
+            ".cmake",
+            ".glsl",
+            ".comp",
+            ".in",
+        }
+        for source in sources:
+            if source.is_file() and source.stat().st_mtime_ns > built_at:
+                return False
+        for directory in directories:
+            if not directory.is_dir():
+                continue
+            for source in directory.rglob("*"):
+                if (
+                    source.is_file()
+                    and (source.suffix in suffixes or source.name == "CMakeLists.txt")
+                    and source.stat().st_mtime_ns > built_at
+                ):
+                    return False
+    except OSError:
+        return False
+    return True
+
+
 def llama_runtime_build() -> Path:
     """Writable native build cache, separate from the installed application."""
 
@@ -78,11 +133,18 @@ def llama_binary(name: str) -> Path | None:
     # compatible with vendored snapshots on either side of that change.
     aliases = (name, "llama-completion") if name == "llama-cli" else (name,)
     from_cache = llama_runtime_build()
-    build_roots = (
-        (from_cache, root / "build")
-        if (from_cache / "OSAI_BUILD.json").is_file()
-        else (root / "build",)
-    )
+    packaged = root / "build"
+    # The tokenizer may be needed for a full-content scan before the trainer
+    # has had a chance to rebuild a stale native cache. Never launch a stale
+    # trainer: ensure_runtime_accelerator checks the marker and rebuilds it.
+    require_current = name == "llama-finetune"
+    build_roots = []
+    if (from_cache / "OSAI_BUILD.json").is_file() and (
+        not require_current or llama_build_is_current(from_cache)
+    ):
+        build_roots.append(from_cache)
+    if not require_current or llama_build_is_current(packaged):
+        build_roots.append(packaged)
     candidates = tuple(
         candidate
         for build in build_roots

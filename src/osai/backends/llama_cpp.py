@@ -159,6 +159,14 @@ def ensure_runtime_accelerator(requested: str | Accelerator) -> None:
 
     choice = requested if isinstance(requested, Accelerator) else Accelerator(requested)
     if choice is Accelerator.CPU:
+        if llama_binary("llama-finetune") is None:
+            build_llama_cpp(
+                log_path=llama_runtime_build() / "osai-runtime-build.log",
+                jobs=min(4, os.cpu_count() or 1),
+                accelerator=Accelerator.CPU,
+                cpu_fallback=False,
+                build_dir=llama_runtime_build(),
+            )
         return
     report = detect_hardware()
     candidate = choice

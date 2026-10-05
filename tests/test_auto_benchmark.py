@@ -50,6 +50,24 @@ def test_benchmark_downgrades_failed_profile_and_reuses_cache(monkeypatch, tmp_p
     assert calls == ["maximum", "performance"]
 
 
+def test_benchmark_rebuilds_stale_trainer_before_probing(monkeypatch, tmp_path: Path):
+    model = _model(tmp_path)
+    binary = tmp_path / "llama-completion"
+    binary.write_bytes(b"binary")
+    rebuilt = []
+    monkeypatch.setattr(
+        "osai.auto_benchmark.llama_binary",
+        lambda name: None if name == "llama-finetune" and not rebuilt else binary,
+    )
+    monkeypatch.setattr("osai.backends.llama_cpp.ensure_runtime_accelerator", rebuilt.append)
+    monkeypatch.setattr("osai.auto_benchmark.llama_runtime_build", lambda: tmp_path / "native")
+    monkeypatch.setattr("osai.auto_benchmark.select_llama_accelerator", lambda _: Accelerator.CPU)
+    monkeypatch.setattr("osai.auto_benchmark._probe_llama", lambda *_args: None)
+
+    benchmark_auto_settings(model, engine=Engine.LLAMA_CPP, accelerator="cpu", force=True)
+    assert rebuilt == ["cpu"]
+
+
 def test_benchmark_probes_each_cuda_gpu_for_data_parallel_training(monkeypatch, tmp_path: Path):
     model = _model(tmp_path)
     binary = tmp_path / "llama-completion"
