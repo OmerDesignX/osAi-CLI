@@ -51,7 +51,7 @@ def test_worker_summary_streams_native_metrics_and_skips_failed_attempt(tmp_path
         (0.5,),
         2,
         120,
-        400.0,
+        500.0,
         None,
     )
     with log.open("a", encoding="utf-8") as handle:

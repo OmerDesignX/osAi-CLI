@@ -746,7 +746,9 @@ def _gradient_worker_log_summary(
     if not all(math.isfinite(value) for value in losses):
         raise TrainingError(f"llama.cpp reported a non-finite training loss; see {log}")
     steps = supervised_steps if mask_prompt else progress_total * epochs
-    duration = elapsed_seconds or native_seconds or 1
+    # The process duration also includes model loading and dataset tokenization.
+    # Use the native optimizer timer for worker throughput whenever it exists.
+    duration = native_seconds or elapsed_seconds or 1
     return tuple(losses), steps, trained_labels, progress_total * epochs / duration, checkpoint
 
 

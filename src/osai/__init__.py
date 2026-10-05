@@ -5,4 +5,4 @@ from .errors import OsAiError
 from .hardware import Accelerator, Engine
 
 __all__ = ["Accelerator", "Engine", "ModelFormat", "OsAiError", "TrainingConfig"]
-__version__ = "0.1.21"
+__version__ = "0.1.22"
