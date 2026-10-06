@@ -66,9 +66,12 @@ script compiles llama.cpp on that computer. It installs CMake and Ninja into
 the private Python environment. On Windows it detects Microsoft C++ Build
 Tools, CUDA, and Vulkan SDK installations without manual path settings. When
 the Vulkan runtime is present but its SDK is missing, setup downloads a
-SHA-256-verified SDK into its private build cache. When Microsoft C++ Build
-Tools are absent it downloads a verified portable C++ toolchain for CPU and
-Vulkan builds. CUDA compilation requires Microsoft C++ Build Tools and a CUDA
+SHA-256-verified SDK into its private build cache. When Microsoft C++
+runtime DLLs are missing or outdated, setup verifies and installs Microsoft's
+pinned x64 Redistributable before compiling Vulkan shaders. Windows may request
+administrator approval for this prerequisite; setup never restarts the computer.
+When Microsoft C++ Build Tools are absent it downloads a verified portable C++
+toolchain for CPU and Vulkan builds. CUDA compilation requires Microsoft C++ Build Tools and a CUDA
 Toolkit. Linux can also use distribution Vulkan
 development packages and `glslc` without defining `VULKAN_SDK`. A failed GPU
 build tries another available GPU backend and reports an error

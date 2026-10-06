@@ -1,4 +1,7 @@
+import hashlib
 import importlib.util
+import io
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -123,3 +126,158 @@ def test_gpu_setup_does_not_silently_install_cpu_backend(monkeypatch, tmp_path: 
     build = next(command for command, _ in commands if "build-llama" in command)
     assert "--also-vulkan" in build
     assert "--no-cpu-fallback" in build
+
+
+def windows_sdk(monkeypatch, tmp_path):
+    compiler = tmp_path / "Bin" / "glslc.exe"
+    compiler.parent.mkdir()
+    compiler.touch()
+    installer = tmp_path / "Helpers" / "VC_redist.X64.exe"
+    installer.parent.mkdir()
+    installer.touch()
+    monkeypatch.setattr(setup_osai, "_windows_vc_redist_installer", lambda: installer)
+    monkeypatch.setattr(
+        setup_osai, "_file_sha256", lambda _: setup_osai.WINDOWS_VC_REDIST_SHA256
+    )
+    return {"VULKAN_SDK": str(tmp_path), "PATH": "build-tools"}, compiler, installer
+
+
+def test_working_shader_compiler_needs_no_runtime_install(monkeypatch, tmp_path):
+    environment, compiler, _ = windows_sdk(monkeypatch, tmp_path)
+
+    def probe(selected, selected_environment):
+        assert selected == compiler
+        assert selected_environment == environment
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(setup_osai, "_probe_windows_glslc", probe)
+    monkeypatch.setattr(
+        setup_osai,
+        "_windows_vc_redist_installer",
+        lambda: pytest.fail("unnecessary runtime install"),
+    )
+    setup_osai._ensure_windows_vulkan_runtime(environment)
+
+
+@pytest.mark.parametrize("missing_dll_code", [-1073741515, 3221225781, -1073741511, 3221225785])
+@pytest.mark.parametrize("installer_code", [0, 1638, 3010])
+def test_missing_shader_dll_installs_verified_runtime(
+    monkeypatch, tmp_path, missing_dll_code, installer_code
+):
+    environment, _, installer = windows_sdk(monkeypatch, tmp_path)
+    results = iter([missing_dll_code, 0])
+    monkeypatch.setattr(
+        setup_osai, "_probe_windows_glslc", lambda *_: SimpleNamespace(returncode=next(results))
+    )
+    commands = []
+
+    def run(command, **kwargs):
+        commands.append(command)
+        assert kwargs["env"] == environment
+        return SimpleNamespace(returncode=installer_code)
+
+    monkeypatch.setattr(setup_osai.subprocess, "run", run)
+    setup_osai._ensure_windows_vulkan_runtime(environment)
+    assert commands == [[str(installer), "/install", "/quiet", "/norestart"]]
+
+
+def test_runtime_installer_checksum_is_required(monkeypatch, tmp_path):
+    environment, _, _ = windows_sdk(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        setup_osai, "_probe_windows_glslc", lambda *_: SimpleNamespace(returncode=-1073741515)
+    )
+    monkeypatch.setattr(setup_osai, "_file_sha256", lambda _: "tampered")
+    monkeypatch.setattr(
+        setup_osai.subprocess, "run", lambda *_args, **_kwargs: pytest.fail("unverified installer")
+    )
+    with pytest.raises(setup_osai.SetupError, match="SHA-256 verification"):
+        setup_osai._ensure_windows_vulkan_runtime(environment)
+
+
+def test_other_shader_errors_do_not_install_runtime(monkeypatch, tmp_path):
+    environment, _, _ = windows_sdk(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        setup_osai,
+        "_probe_windows_glslc",
+        lambda *_: SimpleNamespace(returncode=1, stdout="", stderr="compiler error"),
+    )
+    monkeypatch.setattr(
+        setup_osai,
+        "_windows_vc_redist_installer",
+        lambda: pytest.fail("unnecessary runtime install"),
+    )
+    with pytest.raises(setup_osai.SetupError, match="compiler error"):
+        setup_osai._ensure_windows_vulkan_runtime(environment)
+
+
+def test_runtime_installer_failure_reports_admin_prompt(monkeypatch, tmp_path):
+    environment, _, _ = windows_sdk(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        setup_osai, "_probe_windows_glslc", lambda *_: SimpleNamespace(returncode=-1073741515)
+    )
+    monkeypatch.setattr(
+        setup_osai.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(returncode=1602)
+    )
+    with pytest.raises(setup_osai.SetupError, match="approve the Windows administrator prompt"):
+        setup_osai._ensure_windows_vulkan_runtime(environment)
+
+
+def test_runtime_install_must_make_compiler_executable(monkeypatch, tmp_path):
+    environment, _, _ = windows_sdk(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        setup_osai, "_probe_windows_glslc", lambda *_: SimpleNamespace(returncode=-1073741515)
+    )
+    monkeypatch.setattr(
+        setup_osai.subprocess, "run", lambda *_args, **_kwargs: SimpleNamespace(returncode=0)
+    )
+    with pytest.raises(setup_osai.SetupError, match="still cannot start"):
+        setup_osai._ensure_windows_vulkan_runtime(environment)
+
+
+def test_shader_probe_timeout_is_reported(monkeypatch, tmp_path):
+    environment, _, _ = windows_sdk(monkeypatch, tmp_path)
+
+    def probe(*_):
+        raise subprocess.TimeoutExpired("glslc", 30)
+
+    monkeypatch.setattr(setup_osai, "_probe_windows_glslc", probe)
+    with pytest.raises(setup_osai.SetupError, match="timed out"):
+        setup_osai._ensure_windows_vulkan_runtime(environment)
+
+
+@pytest.mark.parametrize("failure", [None, "checksum", "redirect"])
+def test_runtime_download_requires_verified_microsoft_payload(monkeypatch, tmp_path, failure):
+    payload = b"verified Microsoft runtime payload"
+    monkeypatch.setattr(setup_osai, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        setup_osai,
+        "WINDOWS_VC_REDIST_SHA256",
+        hashlib.sha256(payload if failure != "checksum" else b"expected").hexdigest(),
+    )
+
+    class Response(io.BytesIO):
+        url = (
+            "https://untrusted.example/runtime.exe"
+            if failure == "redirect"
+            else setup_osai.WINDOWS_VC_REDIST_URL
+        )
+
+    def download(request, **_kwargs):
+        assert request.full_url == setup_osai.WINDOWS_VC_REDIST_URL
+        return Response(payload)
+
+    monkeypatch.setattr(setup_osai.urllib.request, "urlopen", download)
+    destination = tmp_path / "build" / "osai-tools" / "VC_redist.x64.exe"
+    if failure:
+        with pytest.raises(setup_osai.SetupError):
+            setup_osai._windows_vc_redist_installer()
+        assert not destination.exists()
+    else:
+        assert setup_osai._windows_vc_redist_installer().read_bytes() == payload
+        monkeypatch.setattr(
+            setup_osai.urllib.request,
+            "urlopen",
+            lambda *_args, **_kwargs: pytest.fail("verified cache must be reused"),
+        )
+        assert setup_osai._windows_vc_redist_installer() == destination
+    assert not destination.with_suffix(".part").exists()

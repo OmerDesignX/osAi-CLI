@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
 import os
@@ -34,6 +35,12 @@ WINDOWS_VULKAN_URL = (
     "https://sdk.lunarg.com/sdk/download/1.4.357.0/windows/vulkansdk-windows-X64-1.4.357.0.exe"
 )
 WINDOWS_VULKAN_SHA256 = "81f474711e9042f4cd22b31b2f7a8870db2e428b21586fb43dd80150be97310d"
+WINDOWS_VC_REDIST_URL = (
+    "https://download.visualstudio.microsoft.com/download/pr/"
+    "bd1c8d9d-ba95-4eee-bc6e-df1fcc876373/"
+    "CC0FF0EB1DC3F5188AE6300FAEF32BF5BEEBA4BDD6E8E445A9184072096B713B/VC_redist.x64.exe"
+)
+WINDOWS_VC_REDIST_SHA256 = "cc0ff0eb1dc3f5188ae6300faef32bf5beeba4bdd6e8e445a9184072096b713b"
 
 
 class SetupError(RuntimeError):
@@ -249,6 +256,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         environment = _child_environment(target_python)
         if not args.skip_llama_build and plan.system == "Windows":
             environment.update(_windows_compiler_environment(plan, target_python))
+            if plan.llama_accelerator in {"vulkan", "cuda"} and _vulkan_available():
+                try:
+                    _ensure_windows_vulkan_runtime(environment)
+                except SetupError as exc:
+                    if plan.llama_accelerator != "cuda":
+                        raise
+                    print(f"osai setup: Vulkan preflight failed ({exc}); trying CUDA", flush=True)
         for command, extra_environment in commands:
             merged_environment = environment | extra_environment
             _run(command, environment=merged_environment)
@@ -667,6 +681,106 @@ def _download_windows_toolchain(archive: Path) -> None:
             temporary.unlink(missing_ok=True)
         print(f"Toolchain checksum mismatch; retrying download ({attempt + 1}/2)", flush=True)
     raise SetupError("the portable C++ toolchain failed SHA-256 verification")
+
+
+def _probe_windows_glslc(
+    compiler: Path, environment: dict[str, str]
+) -> subprocess.CompletedProcess:
+    # Missing DLLs otherwise open a Windows error dialog and stall unattended setup.
+    kernel32 = ctypes.windll.kernel32
+    previous_mode = kernel32.SetErrorMode(0x0001 | 0x0002 | 0x8000)
+    try:
+        return subprocess.run(
+            [str(compiler), "--version"],
+            env=environment,
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    finally:
+        kernel32.SetErrorMode(previous_mode)
+
+
+def _ensure_windows_vulkan_runtime(environment: dict[str, str]) -> None:
+    """Preflight the shader compiler and supply its missing Microsoft C++ runtime."""
+
+    sdk = environment.get("VULKAN_SDK")
+    compiler = Path(sdk) / "Bin" / "glslc.exe" if sdk else None
+    if compiler is None or not compiler.is_file():
+        found = shutil.which("glslc", path=environment.get("PATH", ""))
+        if not found:
+            raise SetupError("the selected Vulkan shader compiler could not be found")
+        compiler = Path(found)
+    try:
+        result = _probe_windows_glslc(compiler, environment)
+        if result.returncode == 0:
+            return
+        if result.returncode & 0xFFFFFFFF not in {0xC0000135, 0xC0000139}:
+            details = (result.stdout + result.stderr).strip()
+            raise SetupError(f"Vulkan shader compiler failed ({result.returncode}): {details}")
+        # copy_only SDK extraction intentionally skips system prerequisites.
+        # Its bundled redistributable is older than the shader compiler needs.
+        installer = _windows_vc_redist_installer()
+        if not installer.is_file() or _file_sha256(installer) != WINDOWS_VC_REDIST_SHA256:
+            raise SetupError("the Microsoft C++ runtime failed SHA-256 verification")
+        print(
+            "Installing the verified Microsoft C++ runtime required by Vulkan; "
+            "Windows may request administrator approval",
+            flush=True,
+        )
+        installed = subprocess.run(
+            [str(installer), "/install", "/quiet", "/norestart"],
+            env=environment,
+            check=False,
+            timeout=10 * 60,
+        )
+        if installed.returncode not in {0, 1638, 3010}:
+            raise SetupError(
+                "Microsoft C++ runtime installation failed "
+                f"(exit code {installed.returncode}); approve the Windows administrator "
+                "prompt or install the Microsoft Visual C++ x64 Redistributable and retry"
+            )
+        if _probe_windows_glslc(compiler, environment).returncode != 0:
+            raise SetupError(
+                "Vulkan shader compiler still cannot start after installing the Microsoft "
+                "C++ runtime; restart Windows if requested, then retry setup"
+            )
+    except subprocess.TimeoutExpired as exc:
+        raise SetupError("timed out preparing the Vulkan shader compiler runtime") from exc
+
+
+def _windows_vc_redist_installer() -> Path:
+    """Download the pinned Microsoft Visual C++ 14.44 x64 Redistributable."""
+
+    installer = PROJECT_ROOT / "build" / "osai-tools" / "VC_redist.x64.exe"
+    if installer.is_file() and _file_sha256(installer) == WINDOWS_VC_REDIST_SHA256:
+        return installer
+    installer.parent.mkdir(parents=True, exist_ok=True)
+    temporary = installer.with_suffix(".part")
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        request = urllib.request.Request(WINDOWS_VC_REDIST_URL, headers={"User-Agent": "osAi-CLI"})
+        with (
+            urllib.request.urlopen(request, timeout=120) as response,
+            temporary.open("wb") as output,
+        ):
+            if response.url.split("/", 3)[2] != "download.visualstudio.microsoft.com":
+                raise SetupError("the Microsoft C++ runtime redirected to an untrusted host")
+            while chunk := response.read(1024 * 1024):
+                size += len(chunk)
+                if size > 40_000_000:
+                    raise SetupError("the Microsoft C++ runtime exceeded its download size limit")
+                output.write(chunk)
+                digest.update(chunk)
+        if digest.hexdigest() != WINDOWS_VC_REDIST_SHA256:
+            raise SetupError("the Microsoft C++ runtime failed SHA-256 verification")
+        temporary.replace(installer)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return installer
 
 
 def _install_windows_vulkan_sdk() -> Path:
