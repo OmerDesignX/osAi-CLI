@@ -365,3 +365,50 @@ def test_multi_gpu_calibration_rejects_single_device_pilot(monkeypatch, tmp_path
             engine=Engine.LLAMA_CPP,
             multi_gpu="on",
         )
+
+
+@pytest.mark.parametrize(
+    "used_devices",
+    [
+        ["CUDA0", "CUDA1"],
+        ["CUDA0", "CUDA1", "CUDA1"],
+        ["CUDA0", "CUDA1", "CUDA3"],
+        ["CUDA1", "CUDA0", "CUDA2"],
+        ["CUDA0", "CUDA1", "CUDA2"],
+    ],
+)
+def test_three_gpu_calibration_verifies_the_exact_sharding_devices(
+    monkeypatch, tmp_path, used_devices
+):
+    model = _model(tmp_path)
+    settings = select_auto_settings(model, engine=Engine.LLAMA_CPP, memory_bytes=64 * 1024**3)
+    devices = ("CUDA0", "CUDA1", "CUDA2")
+    benchmark = BenchmarkResult(settings, "llama.cpp", "cuda", devices, 0.1)
+    requested = []
+
+    def pilot(_model, _sample, output, *, options, accelerator):
+        requested.append(options.devices)
+        manifest = output.parent / f"sharded-{len(requested)}.json"
+        manifest.write_text(json.dumps({
+            "options": {"context": options.context},
+            "model_sharded_training": {"devices": used_devices},
+        }))
+        return SimpleNamespace(
+            losses=(0.5, 0.4, 0.3), manifest=manifest, accelerator=accelerator,
+            initial_test_loss=0.5, test_loss=0.3,
+        )
+
+    monkeypatch.setattr("osai.calibration.train_gradient_gguf", pilot)
+    if tuple(used_devices) != devices:
+        with pytest.raises(ConfigurationError, match="every selected GPU"):
+            calibrate_training(
+                model.path, model, _data(tmp_path), benchmark,
+                engine=Engine.LLAMA_CPP, multi_gpu="on",
+            )
+    else:
+        result = calibrate_training(
+            model.path, model, _data(tmp_path), benchmark,
+            engine=Engine.LLAMA_CPP, multi_gpu="on",
+        )
+        assert result.devices == devices
+    assert requested and all(selected == devices for selected in requested)

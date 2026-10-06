@@ -144,8 +144,18 @@ def test_cpu_gradient_command_disables_repack_and_devices():
     assert command[command.index("-ngl") + 1] == "0"
 
 
-def test_metal_gradient_command_preserves_multi_gpu_devices():
-    options = LlamaGradientOptions(multi_gpu="on", devices=("MTL0", "MTL1"), split_mode="layer")
+@pytest.mark.parametrize("count", [2, 3, 4, 8])
+@pytest.mark.parametrize(
+    "accelerator,prefix",
+    [
+        (Accelerator.METAL, "MTL"),
+        (Accelerator.VULKAN, "Vulkan"),
+        (Accelerator.CUDA, "CUDA"),
+    ],
+)
+def test_gradient_command_preserves_every_selected_gpu(count, accelerator, prefix):
+    devices = tuple(f"{prefix}{index}" for index in range(count))
+    options = LlamaGradientOptions(multi_gpu="on", devices=devices, split_mode="layer")
     command = _gradient_command(
         Path("llama-finetune"),
         Path("base.gguf"),
@@ -153,9 +163,9 @@ def test_metal_gradient_command_preserves_multi_gpu_devices():
         Path("train.txt"),
         Path("trained.gguf"),
         options,
-        Accelerator.METAL,
+        accelerator,
     )
-    assert command[command.index("-dev") + 1] == "MTL0,MTL1"
+    assert command[command.index("-dev") + 1] == ",".join(devices)
     assert command[command.index("-sm") + 1] == "layer"
 
 

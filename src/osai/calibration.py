@@ -414,7 +414,7 @@ def calibrate_training(
                         )
                     if len(benchmark.devices) > 1 and multi_gpu != "off":
                         used_devices = manifest.get("model_sharded_training", {}).get("devices", [])
-                        if len(used_devices) != len(benchmark.devices):
+                        if tuple(used_devices) != benchmark.devices:
                             raise ConfigurationError(
                                 "Calibration did not use every selected GPU; check the "
                                 "multi-GPU backend before training"

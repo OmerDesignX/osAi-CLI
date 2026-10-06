@@ -96,6 +96,8 @@ def benchmark_auto_settings(
             chosen = ()
         elif multi_gpu == "off":
             chosen = chosen[:1]
+        if len(set(chosen)) != len(chosen):
+            raise ConfigurationError("each GPU must appear only once in the device list")
         if multi_gpu == "on" and len(chosen) < 2:
             raise ConfigurationError(
                 "multi-GPU was requested but fewer than two devices were found"

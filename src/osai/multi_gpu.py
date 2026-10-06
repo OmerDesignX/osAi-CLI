@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 import subprocess
 from collections.abc import Sequence
@@ -46,10 +47,14 @@ def available_llama_devices(
     }.get(accelerator)
     if prefix is None:
         return ()
-    devices = re.findall(
-        rf"^\s*({prefix}\d+):\s*(.+)$",
-        result.stdout + "\n" + (getattr(result, "stderr", "") or ""),
-        re.M | re.I,
+    devices = list(
+        dict(
+            re.findall(
+                rf"^\s*({prefix}\d+):\s*(.+)$",
+                result.stdout + "\n" + (getattr(result, "stderr", "") or ""),
+                re.M | re.I,
+            )
+        ).items()
     )
     if accelerator is Accelerator.VULKAN:
         typed = [
@@ -128,12 +133,28 @@ def llama_device_arguments(
         raise ConfigurationError("multi-GPU mode requires layer, row, or tensor splitting")
     if settings.multi_gpu == "on" and settings.devices and len(settings.devices) < 2:
         raise ConfigurationError("multi-GPU mode needs at least two explicit devices")
+    if len(set(settings.devices)) != len(settings.devices):
+        raise ConfigurationError("each GPU must appear only once in the device list")
+    if any(not math.isfinite(value) or value <= 0 for value in settings.tensor_split):
+        raise ConfigurationError("tensor_split values must be finite and positive")
+    if (
+        settings.multi_gpu != "off"
+        and settings.devices
+        and settings.tensor_split
+        and len(settings.tensor_split) != len(settings.devices)
+    ):
+        raise ConfigurationError(
+            "tensor_split needs one weight for every selected GPU; leave it empty "
+            "to distribute the model automatically"
+        )
     if accelerator is Accelerator.CPU:
         return ["-fit", "off", "-dev", "none", "-ngl", "0", "--no-op-offload"]
 
     arguments = ["-fit", "off", "-ngl", "auto"]
     if settings.devices:
         devices = settings.devices[:1] if settings.multi_gpu == "off" else settings.devices
+        if not 0 <= settings.main_gpu < len(devices):
+            raise ConfigurationError("main_gpu must index the selected GPU list")
         arguments.extend(["-dev", ",".join(devices)])
     mode = "none" if settings.multi_gpu == "off" else settings.split_mode
     arguments.extend(["-sm", mode, "-mg", str(settings.main_gpu)])

@@ -68,7 +68,8 @@ def test_benchmark_rebuilds_stale_trainer_before_probing(monkeypatch, tmp_path: 
     assert rebuilt == ["cpu"]
 
 
-def test_benchmark_probes_cuda_model_shards_together(monkeypatch, tmp_path: Path):
+@pytest.mark.parametrize("count", [2, 3, 4, 8])
+def test_benchmark_probes_all_cuda_model_shards_together(monkeypatch, tmp_path: Path, count):
     model = _model(tmp_path)
     binary = tmp_path / "llama-completion"
     binary.write_bytes(b"binary")
@@ -76,9 +77,10 @@ def test_benchmark_probes_cuda_model_shards_together(monkeypatch, tmp_path: Path
     monkeypatch.setattr("osai.auto_benchmark.llama_binary", lambda _name: binary)
     monkeypatch.setattr("osai.auto_benchmark.llama_runtime_build", lambda: tmp_path / "native")
     monkeypatch.setattr("osai.auto_benchmark.select_llama_accelerator", lambda _: Accelerator.CUDA)
+    devices = tuple(f"CUDA{index}" for index in range(count))
     monkeypatch.setattr(
         "osai.auto_benchmark.available_llama_devices",
-        lambda _binary, _accelerator, **_kwargs: ("CUDA0", "CUDA1"),
+        lambda _binary, _accelerator, **_kwargs: devices,
     )
     probed = []
     monkeypatch.setattr(
@@ -90,8 +92,8 @@ def test_benchmark_probes_cuda_model_shards_together(monkeypatch, tmp_path: Path
         model, engine=Engine.LLAMA_CPP, accelerator="cuda", multi_gpu="on", force=True
     )
 
-    assert selected.devices == ("CUDA0", "CUDA1")
-    assert probed == ["CUDA0,CUDA1"]
+    assert selected.devices == devices
+    assert probed == [",".join(devices)]
 
 
 def test_benchmark_rejects_integrated_vulkan_device_when_discrete_exists(

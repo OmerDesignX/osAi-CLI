@@ -346,7 +346,7 @@ surrogate without a learned critic model.
 
 ## Multi-GPU: Metal/CUDA/Vulkan
 
-For GGUF fine-tuning and alignment, `--multi-gpu auto` discovers compatible
+For GGUF fine-tuning and alignment, `--multi-gpu auto` discovers all compatible
 Metal, CUDA, or Vulkan devices. One native trainer divides the model by layer
 across those devices and applies one optimizer update per step. The adapter
 keeps the selected rank. `--multi-gpu on` requires at least two GPUs. Model
@@ -360,6 +360,15 @@ over recognized integrated adapters. Intel Macs can use a Metal eGPU when
 llama.cpp lists it; Apple silicon Macs do not support eGPUs. MLX uses local
 NCCL data parallelism on multi-GPU Linux CUDA systems; select the GGUF engine
 when model sharding is required.
+
+There is no two-GPU limit: three or more compatible devices participate in the
+same layer-sharded model. Leave `--device` and `--tensor-split` unset to select
+all devices exposed by the chosen backend and distribute layers automatically.
+For a manual split, supply one positive weight per selected GPU, for example
+`--device Vulkan0 --device Vulkan1 --device Vulkan2 --tensor-split 1,1,1`.
+Calibration verifies the exact ordered device list. A GPU stopped by Windows
+(such as Code 43) must have its driver issue resolved before CUDA or Vulkan can
+expose it for training; an OS inventory entry alone cannot make it usable.
 
 Automatic settings run a bounded one-turn inference benchmark using the selected
 model and accelerator. GGUF devices are probed together with layer splitting.
@@ -520,7 +529,7 @@ directly to alignment.
 | `--multi-gpu auto\|on\|off` | Automatically use available devices, require multiple GPUs, or force one GPU. |
 | `--device NAME` | llama.cpp device name; repeat to set device order. |
 | `--split-mode none\|layer\|row\|tensor` | llama.cpp model split. Default: `layer`. |
-| `--tensor-split LIST` | Comma-separated llama.cpp device proportions, such as `3,1`. |
+| `--tensor-split LIST` | One positive weight per selected GPU, such as `1,1,1` for three GPUs. Unset uses automatic proportions. |
 | `--main-gpu N` | llama.cpp main GPU index. Default: `0`. |
 | `--distributed-workers N` | MLX Linux CUDA/NCCL worker count. `0` chooses a safe count. |
 | `--auto-settings`, `--no-auto-settings` | With Auto, scan the selected training files for the longest record first, check the model context limit, then fit the hardware and calibrate a short local sample before the full run. Auto is disabled by default. Explicit tuning flags override its choices. |

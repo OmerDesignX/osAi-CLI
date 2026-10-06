@@ -1,4 +1,5 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -39,6 +40,62 @@ def test_llama_multi_gpu_maps_native_split_flags(tmp_path: Path):
     assert command[command.index("-sm") + 1] == "tensor"
     assert command[command.index("-ts") + 1] == "3,1"
     assert command[command.index("-mg") + 1] == "1"
+
+
+@pytest.mark.parametrize("count", [3, 4, 8])
+@pytest.mark.parametrize(
+    "accelerator,prefix",
+    [(Accelerator.CUDA, "CUDA"), (Accelerator.VULKAN, "Vulkan"), (Accelerator.METAL, "MTL")],
+)
+def test_all_native_gpus_reach_the_model_sharding_command(
+    monkeypatch, tmp_path, count, accelerator, prefix
+):
+    expected = tuple(f"{prefix}{index}" for index in range(count))
+    report = "\n".join(
+        f"  {device}: Discrete GPU (8192 MiB, 6144 MiB free) [type=dedicated]"
+        for device in expected
+    )
+    monkeypatch.setattr(
+        "osai.multi_gpu.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=report, stderr=report),
+    )
+    devices = available_llama_devices(tmp_path / "llama-completion", accelerator)
+    assert devices == expected
+    command = llama_device_arguments(
+        accelerator,
+        _config(tmp_path, devices=devices, tensor_split=(1.0,) * count, main_gpu=count - 1),
+    )
+    assert command[command.index("-dev") + 1] == ",".join(expected)
+    assert command[command.index("-ts") + 1] == ",".join("1" for _ in expected)
+    assert command[command.index("-sm") + 1] == "layer"
+    assert command[command.index("-mg") + 1] == str(count - 1)
+
+
+@pytest.mark.parametrize("weights", [(1.0, 1.0), (1.0, 1.0, 1.0, 1.0)])
+def test_manual_split_cannot_silently_omit_or_add_gpu_weights(tmp_path, weights):
+    settings = _config(tmp_path, devices=("CUDA0", "CUDA1", "CUDA2"), tensor_split=weights)
+    with pytest.raises(ConfigurationError, match="one weight for every selected GPU"):
+        llama_device_arguments(Accelerator.CUDA, settings)
+
+
+def test_device_list_cannot_count_one_gpu_twice(tmp_path):
+    settings = _config(tmp_path, devices=("CUDA0", "CUDA1", "CUDA1"))
+    with pytest.raises(ConfigurationError, match="only once"):
+        llama_device_arguments(Accelerator.CUDA, settings)
+
+
+@pytest.mark.parametrize("index", [3, 4])
+def test_main_gpu_is_an_index_into_the_selected_devices(tmp_path, index):
+    settings = _config(tmp_path, devices=("CUDA0", "CUDA1", "CUDA2"), main_gpu=index)
+    with pytest.raises(ConfigurationError, match="index the selected GPU list"):
+        llama_device_arguments(Accelerator.CUDA, settings)
+
+
+@pytest.mark.parametrize("weight", [float("nan"), float("inf")])
+def test_nonfinite_gpu_split_is_rejected(tmp_path, weight):
+    settings = _config(tmp_path, devices=("CUDA0", "CUDA1", "CUDA2"), tensor_split=(1, 1, weight))
+    with pytest.raises(ConfigurationError, match="finite and positive"):
+        llama_device_arguments(Accelerator.CUDA, settings)
 
 
 def test_llama_metal_multi_gpu_uses_explicit_physical_devices(tmp_path: Path):
