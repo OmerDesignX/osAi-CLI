@@ -128,6 +128,24 @@ def test_gpu_setup_does_not_silently_install_cpu_backend(monkeypatch, tmp_path: 
     assert "--no-cpu-fallback" in build
 
 
+def test_portable_compiler_exposes_windows_10_file_apis(monkeypatch, tmp_path):
+    binary = tmp_path / "build" / "osai-tools" / "llvm-mingw-20260616-ucrt-x86_64" / "bin"
+    binary.mkdir(parents=True)
+    (binary / "clang++.exe").touch()
+    monkeypatch.setattr(setup_osai, "PROJECT_ROOT", tmp_path)
+    monkeypatch.delenv("OSAI_VSDEVCMD", raising=False)
+    monkeypatch.delenv("PROGRAMFILES(X86)", raising=False)
+    monkeypatch.setenv("CFLAGS", "-O2")
+    monkeypatch.setenv("CXXFLAGS", "-fno-omit-frame-pointer")
+    environment = setup_osai._windows_compiler_environment(
+        plan(system="Windows", vulkan_available=True), tmp_path / "Scripts" / "python.exe"
+    )
+    assert environment["CFLAGS"] == "-O2 -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00"
+    assert environment["CXXFLAGS"] == (
+        "-fno-omit-frame-pointer -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00"
+    )
+
+
 def windows_sdk(monkeypatch, tmp_path):
     compiler = tmp_path / "Bin" / "glslc.exe"
     compiler.parent.mkdir()
@@ -159,7 +177,10 @@ def test_working_shader_compiler_needs_no_runtime_install(monkeypatch, tmp_path)
     setup_osai._ensure_windows_vulkan_runtime(environment)
 
 
-@pytest.mark.parametrize("missing_dll_code", [-1073741515, 3221225781, -1073741511, 3221225785])
+@pytest.mark.parametrize(
+    "missing_dll_code",
+    [-1073741515, 3221225781, -1073741511, 3221225785, -1073741819, 3221225477],
+)
 @pytest.mark.parametrize("installer_code", [0, 1638, 3010])
 def test_missing_shader_dll_installs_verified_runtime(
     monkeypatch, tmp_path, missing_dll_code, installer_code

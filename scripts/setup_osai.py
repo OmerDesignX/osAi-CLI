@@ -642,6 +642,12 @@ def _windows_compiler_environment(plan: SetupPlan, target_python: Path) -> dict[
         "CC": str(binary_dir / "clang.exe"),
         "CXX": str(compiler),
         "CMAKE_GENERATOR": "Ninja",
+        # llvm-mingw defaults to Windows 7, which hides CreateFile2 used by
+        # llama.cpp. Match osAi's Windows 10 minimum without changing MSVC.
+        "CFLAGS": (os.environ.get("CFLAGS", "") + " -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00").strip(),
+        "CXXFLAGS": (
+            os.environ.get("CXXFLAGS", "") + " -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00"
+        ).strip(),
         "PATH": str(target_python.parent)
         + os.pathsep
         + str(binary_dir)
@@ -717,7 +723,7 @@ def _ensure_windows_vulkan_runtime(environment: dict[str, str]) -> None:
         result = _probe_windows_glslc(compiler, environment)
         if result.returncode == 0:
             return
-        if result.returncode & 0xFFFFFFFF not in {0xC0000135, 0xC0000139}:
+        if result.returncode & 0xFFFFFFFF not in {0xC0000135, 0xC0000139, 0xC0000005}:
             details = (result.stdout + result.stderr).strip()
             raise SetupError(f"Vulkan shader compiler failed ({result.returncode}): {details}")
         # copy_only SDK extraction intentionally skips system prerequisites.

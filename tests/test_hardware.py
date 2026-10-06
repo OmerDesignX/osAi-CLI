@@ -97,6 +97,37 @@ def test_cuda_build_targets_every_installed_gpu_architecture(monkeypatch):
     assert llama_cpp._cuda_architectures() == ("86", "89")
 
 
+@pytest.mark.parametrize(
+    "system,accelerator,native",
+    [
+        ("Windows", Accelerator.CPU, "ON"),
+        ("Windows", Accelerator.VULKAN, "ON"),
+        ("Windows", Accelerator.CUDA, "ON"),
+        ("Darwin", Accelerator.METAL, "OFF"),
+        ("Linux", Accelerator.CPU, "OFF"),
+        ("Linux", Accelerator.CUDA, "OFF"),
+    ],
+)
+def test_local_windows_build_detects_cpu_without_changing_gpu_backend(
+    monkeypatch, tmp_path, system, accelerator, native
+):
+    monkeypatch.setattr(llama_cpp.platform, "system", lambda: system)
+    monkeypatch.setattr(llama_cpp, "_cuda_architectures", lambda: ())
+    commands = []
+    monkeypatch.setattr(
+        llama_cpp, "run_logged", lambda command, **_kwargs: commands.append(command)
+    )
+    llama_cpp._configure("cmake", tmp_path, tmp_path / "build", tmp_path / "log", accelerator)
+    flags = commands[0]
+    assert f"-DGGML_NATIVE={native}" in flags
+    for backend, selected in (
+        ("METAL", Accelerator.METAL),
+        ("CUDA", Accelerator.CUDA),
+        ("VULKAN", Accelerator.VULKAN),
+    ):
+        assert f"-DGGML_{backend}={'ON' if accelerator is selected else 'OFF'}" in flags
+
+
 def test_explicit_cuda_build_failure_never_switches_backend(monkeypatch, tmp_path):
     monkeypatch.setattr(llama_cpp, "llama_cpp_root", lambda: tmp_path)
     monkeypatch.setattr(llama_cpp, "_cmake_executable", lambda: "cmake")

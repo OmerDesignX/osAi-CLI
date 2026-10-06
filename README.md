@@ -71,8 +71,11 @@ runtime DLLs are missing or outdated, setup verifies and installs Microsoft's
 pinned x64 Redistributable before compiling Vulkan shaders. Windows may request
 administrator approval for this prerequisite; setup never restarts the computer.
 When Microsoft C++ Build Tools are absent it downloads a verified portable C++
-toolchain for CPU and Vulkan builds. CUDA compilation requires Microsoft C++ Build Tools and a CUDA
-Toolkit. Linux can also use distribution Vulkan
+toolchain for CPU and Vulkan builds. This compiler targets Windows 10, and its
+required runtime DLLs are kept beside the native binaries so they also work
+outside the setup shell. Windows builds detect the local CPU's supported
+instructions, including on older processors without AVX2. CUDA compilation
+requires Microsoft C++ Build Tools and a CUDA Toolkit. Linux can also use distribution Vulkan
 development packages and `glslc` without defining `VULKAN_SDK`. A failed GPU
 build tries another available GPU backend and reports an error
 if none can be built. CPU-only setup must be selected explicitly.

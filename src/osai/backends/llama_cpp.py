@@ -116,8 +116,10 @@ def build_llama_cpp(
                 f"retrying with {candidates[index + 1][0].value}"
                 f"{'+vulkan' if candidates[index + 1][1] else ''}"
             )
-    if os.name == "nt" and selected is Accelerator.CUDA:
-        _copy_cuda_runtime_dlls(build)
+    if os.name == "nt":
+        _copy_windows_portable_runtime_dlls(build)
+        if selected is Accelerator.CUDA:
+            _copy_cuda_runtime_dlls(build)
     atomic_json(
         build / "OSAI_BUILD.json",
         {
@@ -132,6 +134,35 @@ def build_llama_cpp(
         selected.value,
         requested.value if selected is not requested else None,
     )
+
+
+def _copy_windows_portable_runtime_dlls(build: Path) -> None:
+    """Keep portable-compiler builds usable outside the setup compiler shell."""
+
+    try:
+        cache = (build / "CMakeCache.txt").read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return
+    compiler_path = next(
+        (
+            line.partition("=")[2]
+            for line in cache.splitlines()
+            if line.startswith("CMAKE_CXX_COMPILER:FILEPATH=")
+        ),
+        None,
+    )
+    if not compiler_path:
+        return
+    compiler = Path(compiler_path)
+    if not compiler.parent.parent.name.startswith("llvm-mingw-"):
+        return
+    destination = build / "bin"
+    destination.mkdir(parents=True, exist_ok=True)
+    for name in ("libc++.dll", "libunwind.dll", "libomp.dll", "libwinpthread-1.dll"):
+        source = compiler.parent / name
+        if not source.is_file():
+            raise DependencyError(f"portable C++ runtime is missing: {source}")
+        shutil.copy2(source, destination / name)
 
 
 def _copy_cuda_runtime_dlls(build: Path) -> None:
@@ -309,9 +340,10 @@ def _configure(
         "-DLLAMA_CURL=OFF",
         "-DLLAMA_BUILD_EXAMPLES=ON",
         "-DCMAKE_BUILD_TYPE=Release",
-        # Some macOS toolchains stall during host-specific CPU feature probes.
-        # Metal performs model compute, so keep the CPU fallback portable.
-        "-DGGML_NATIVE=OFF",
+        # Windows setup compiles locally: detect the host CPU rather than use
+        # GGML's default AVX2/FMA flags, which crash on older x64 processors.
+        # Keep other platforms unchanged (some macOS feature probes stall).
+        f"-DGGML_NATIVE={'ON' if platform.system() == 'Windows' else 'OFF'}",
         f"-DGGML_METAL={'ON' if accelerator is Accelerator.METAL else 'OFF'}",
         f"-DGGML_CUDA={'ON' if accelerator is Accelerator.CUDA else 'OFF'}",
         f"-DGGML_VULKAN={'ON' if accelerator is Accelerator.VULKAN or also_vulkan else 'OFF'}",
