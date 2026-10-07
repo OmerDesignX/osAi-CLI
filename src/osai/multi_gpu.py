@@ -156,7 +156,12 @@ def llama_device_arguments(
         if not 0 <= settings.main_gpu < len(devices):
             raise ConfigurationError("main_gpu must index the selected GPU list")
         arguments.extend(["-dev", ",".join(devices)])
-    mode = "none" if settings.multi_gpu == "off" else settings.split_mode
+    # A single explicit Metal device is the normal Apple-silicon topology.
+    # Do not ask llama.cpp to split a model when there is nowhere to split it;
+    # Intel Macs with two or more physical Metal devices still retain the
+    # requested layer split below.
+    one_explicit_device = bool(settings.devices) and len(devices) == 1
+    mode = "none" if settings.multi_gpu == "off" or one_explicit_device else settings.split_mode
     arguments.extend(["-sm", mode, "-mg", str(settings.main_gpu)])
     if settings.tensor_split and settings.multi_gpu != "off":
         arguments.extend(["-ts", ",".join(format(value, ".8g") for value in settings.tensor_split)])

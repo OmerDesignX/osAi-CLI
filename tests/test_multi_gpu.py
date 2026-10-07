@@ -110,6 +110,44 @@ def test_llama_metal_multi_gpu_uses_explicit_physical_devices(tmp_path: Path):
     assert command[command.index("-sm") + 1] == "layer"
 
 
+def test_intel_mac_pro_uses_every_discrete_metal_gpu(monkeypatch, tmp_path: Path):
+    class Completed:
+        returncode = 0
+        stdout = (
+            "Available devices:\n"
+            "  MTL0: AMD FirePro D700 (6144 MiB, 5120 MiB free)\n"
+            "  MTL1: AMD FirePro D700 (6144 MiB, 5120 MiB free)\n"
+        )
+
+    monkeypatch.setattr("osai.multi_gpu.subprocess.run", lambda *_args, **_kwargs: Completed())
+    devices = available_llama_devices(tmp_path / "llama-completion", Accelerator.METAL)
+    assert devices == ("MTL0", "MTL1")
+    command = llama_device_arguments(
+        Accelerator.METAL,
+        _config(tmp_path, multi_gpu="auto", devices=devices, split_mode="layer"),
+    )
+    assert command[command.index("-dev") + 1] == "MTL0,MTL1"
+    assert command[command.index("-sm") + 1] == "layer"
+
+
+def test_apple_silicon_uses_its_single_unified_metal_device_without_splitting(
+    monkeypatch, tmp_path: Path
+):
+    class Completed:
+        returncode = 0
+        stdout = "Available devices:\n  MTL0: Apple M1\n"
+
+    monkeypatch.setattr("osai.multi_gpu.subprocess.run", lambda *_args, **_kwargs: Completed())
+    devices = available_llama_devices(tmp_path / "llama-completion", Accelerator.METAL)
+    assert devices == ("MTL0",)
+    command = llama_device_arguments(
+        Accelerator.METAL,
+        _config(tmp_path, multi_gpu="auto", devices=devices, split_mode="layer"),
+    )
+    assert command[command.index("-dev") + 1] == "MTL0"
+    assert command[command.index("-sm") + 1] == "none"
+
+
 def test_llama_single_gpu_disables_splitting(tmp_path: Path):
     settings = _config(tmp_path, multi_gpu="off", devices=("Vulkan0", "Vulkan1"))
     command = llama_device_arguments(Accelerator.VULKAN, settings)
@@ -176,13 +214,17 @@ def test_metal_prefers_external_gpu_over_integrated_card(monkeypatch, tmp_path):
             "Available devices:\n"
             "  MTL0: Intel Iris Plus Graphics\n"
             "  MTL1: AMD Radeon RX 6800 XT eGPU\n"
+            "  MTL2: AMD Radeon RX 5700 XT eGPU\n"
         )
 
     monkeypatch.setattr("osai.multi_gpu.subprocess.run", lambda *_args, **_kwargs: Completed())
-    assert available_llama_devices(tmp_path / "llama-completion", Accelerator.METAL) == ("MTL1",)
+    assert available_llama_devices(tmp_path / "llama-completion", Accelerator.METAL) == (
+        "MTL1",
+        "MTL2",
+    )
     assert available_llama_devices(
         tmp_path / "llama-completion", Accelerator.METAL, include_integrated=True
-    ) == ("MTL1",)
+    ) == ("MTL1", "MTL2")
 
 
 def test_vulkan_required_multi_gpu_never_adds_integrated_card(monkeypatch, tmp_path):

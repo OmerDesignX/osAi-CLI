@@ -99,7 +99,8 @@ def _resolve_distributed_workers(
     if accelerator != "cuda":
         if config.multi_gpu == "on":
             raise ConfigurationError(
-                "MLX multi-GPU requires Linux CUDA/NCCL; Metal exposes one unified GPU"
+                "MLX multi-GPU requires Linux CUDA/NCCL; Apple silicon exposes one "
+                "unified Metal GPU, while multi-GPU Intel Macs use llama.cpp Metal"
             )
         return 1
     requested = config.distributed_workers or available

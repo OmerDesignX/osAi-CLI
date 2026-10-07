@@ -356,10 +356,13 @@ supported for GGUF backpropagation. A 3 GiB card can participate only when its
 assigned layers and training graph fit; a large model or full context may still
 exceed it. Calibration reports that limit rather than switching to CPU training.
 On Vulkan and Metal systems, automatic GGUF training prefers discrete cards
-over recognized integrated adapters. Intel Macs can use a Metal eGPU when
-llama.cpp lists it; Apple silicon Macs do not support eGPUs. MLX uses local
-NCCL data parallelism on multi-GPU Linux CUDA systems; select the GGUF engine
-when model sharding is required.
+over recognized integrated adapters. Intel Mac Pro systems with multiple AMD
+GPUs, including the dual-GPU 2013 Mac Pro, shard across every Metal device
+reported by llama.cpp. Intel Macs can also use multiple Metal eGPUs when the
+driver exposes them. Apple silicon presents its CPU/GPU memory as one unified
+Metal device and therefore does not create duplicate workers or model splits.
+MLX uses local NCCL data parallelism on multi-GPU Linux CUDA systems; select
+the GGUF engine when physical-device model sharding is required.
 
 There is no two-GPU limit: three or more compatible devices participate in the
 same layer-sharded model. Leave `--device` and `--tensor-split` unset to select
