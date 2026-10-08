@@ -207,6 +207,29 @@ def test_cuda_auto_discovers_both_native_devices(monkeypatch, tmp_path):
     )
 
 
+def test_cuda_auto_adds_dedicated_amd_vulkan_without_duplicate_nvidia(monkeypatch, tmp_path):
+    report = """Available devices:
+  CUDA0: NVIDIA GeForce RTX 3060 (12000 MiB, 10000 MiB free) [type=dedicated]
+  CUDA1: NVIDIA GeForce RTX 3060 (12000 MiB, 9000 MiB free) [type=dedicated]
+  Vulkan0: AMD Radeon(TM) Graphics (32000 MiB, 30000 MiB free) [type=integrated]
+  Vulkan1: NVIDIA GeForce RTX 3060 (12000 MiB, 10000 MiB free) [type=dedicated]
+  Vulkan2: AMD Radeon RX 7900 XTX (24000 MiB, 20000 MiB free) [type=dedicated]
+"""
+    monkeypatch.setattr(
+        "osai.multi_gpu.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=report, stderr=""),
+    )
+    binary = tmp_path / "llama-completion"
+    assert available_llama_devices(binary, Accelerator.CUDA) == ("CUDA0", "CUDA1")
+    devices = available_llama_devices(binary, Accelerator.CUDA, include_amd_vulkan=True)
+    assert devices == ("CUDA0", "CUDA1", "Vulkan2")
+    free = llama_device_free_bytes(binary, Accelerator.CUDA)
+    assert set(free) == set(devices)
+    assert free["Vulkan2"] == 20000 * 1024**2
+    command = llama_device_arguments(Accelerator.CUDA, _config(tmp_path, devices=devices))
+    assert command[command.index("-dev") + 1] == "CUDA0,CUDA1,Vulkan2"
+
+
 def test_metal_prefers_external_gpu_over_integrated_card(monkeypatch, tmp_path):
     class Completed:
         returncode = 0

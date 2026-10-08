@@ -40,7 +40,6 @@ from .health import check_sessions
 from .io import OutputLock, atomic_json
 from .learning_proof import prove_learning
 from .merge import MergedModelResult, merge_gguf_model, merge_mlx_model
-from .model_tools import export_bundle
 from .model_download import (
     DEFAULT_MODEL_VERSION,
     MODEL_VERSIONS,
@@ -48,6 +47,7 @@ from .model_download import (
     ModelDownload,
     ensure_official_model,
 )
+from .model_tools import export_bundle
 from .multi_gpu import available_llama_devices
 from .paths import llama_binary, project_root
 from .rollouts import RolloutSettings
@@ -520,6 +520,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--also-vulkan",
         action="store_true",
         help="include Vulkan alongside CUDA when the SDK is available",
+    )
+    build_parser.add_argument(
+        "--require-vulkan",
+        action="store_true",
+        help="fail if a combined CUDA and Vulkan build cannot be completed",
     )
     build_parser.set_defaults(handler=_build_llama)
 
@@ -1706,7 +1711,11 @@ def _calibrate(args: argparse.Namespace) -> int:
 def _auto_devices(args: argparse.Namespace) -> int:
     report = detect_hardware()
     accelerator = select_llama_accelerator(args.accelerator, report)
-    devices = available_llama_devices(llama_binary("llama-completion"), accelerator)
+    devices = available_llama_devices(
+        llama_binary("llama-completion"),
+        accelerator,
+        include_amd_vulkan=args.accelerator == "auto",
+    )
     _print_json({"accelerator": accelerator.value, "devices": list(devices)})
     return 0
 
@@ -1797,6 +1806,7 @@ def _build_llama(args: argparse.Namespace) -> int:
         accelerator=args.accelerator,
         cpu_fallback=args.cpu_fallback,
         also_vulkan=args.also_vulkan,
+        require_vulkan=args.require_vulkan,
     )
     _print_json(
         {

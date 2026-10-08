@@ -270,7 +270,11 @@ def align_gguf(
         main_gpu=config.main_gpu,
     )
     if selected is not Accelerator.CPU:
-        discovered = available_llama_devices(llama_binary("llama-completion"), selected)
+        discovered = available_llama_devices(
+            llama_binary("llama-completion"),
+            selected,
+            include_amd_vulkan=accelerator == Accelerator.AUTO,
+        )
         if config.devices and any(device not in discovered for device in config.devices):
             raise ConfigurationError("a selected alignment GPU is unavailable")
         devices = config.devices or discovered
@@ -279,6 +283,8 @@ def align_gguf(
         if config.multi_gpu == "on" and len(devices) < 2:
             raise ConfigurationError("multi-GPU alignment needs at least two devices")
         eval_options = replace(eval_options, devices=devices)
+        if not config.devices:
+            config = replace(config, devices=devices)
         if config.multi_gpu != "off" and len(devices) > 1 and config.split_mode != "layer":
             raise ConfigurationError("model-sharded GGUF alignment requires layer splitting")
     source_dataset = dataset

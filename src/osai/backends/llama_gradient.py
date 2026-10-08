@@ -176,6 +176,7 @@ def train_gradient_gguf(
         discovered = available_llama_devices(
             llama_binary("llama-completion"),
             requested_accelerator,
+            include_amd_vulkan=accelerator == Accelerator.AUTO,
         )
         if settings.devices and any(device not in discovered for device in settings.devices):
             raise ConfigurationError(

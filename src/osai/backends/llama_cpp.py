@@ -14,6 +14,7 @@ from ..errors import ConfigurationError, DependencyError, TrainingError, Verific
 from ..hardware import (
     Accelerator,
     _vulkan_build_available,
+    dedicated_amd_vulkan_available,
     detect_hardware,
     select_llama_accelerator,
 )
@@ -54,6 +55,7 @@ def build_llama_cpp(
     cpu_fallback: bool = True,
     build_dir: Path | None = None,
     also_vulkan: bool = False,
+    require_vulkan: bool = False,
 ) -> LlamaBuildResult:
     root = llama_cpp_root()
     if not root.is_dir():
@@ -71,13 +73,20 @@ def build_llama_cpp(
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.unlink(missing_ok=True)
     requested = select_llama_accelerator(accelerator, for_build=True)
+    if require_vulkan and (requested is not Accelerator.CUDA or not also_vulkan):
+        raise ConfigurationError("requiring Vulkan alongside CUDA needs --also-vulkan")
     automatic = Accelerator(accelerator) is Accelerator.AUTO
     candidates = [(requested, also_vulkan and requested is Accelerator.CUDA)]
-    if candidates[0][1]:
+    if candidates[0][1] and not require_vulkan:
         candidates.append((Accelerator.CUDA, False))
-    if automatic and requested is Accelerator.CUDA and _vulkan_build_available():
+    if (
+        automatic
+        and not require_vulkan
+        and requested is Accelerator.CUDA
+        and _vulkan_build_available()
+    ):
         candidates.append((Accelerator.VULKAN, False))
-    if automatic and cpu_fallback and requested is not Accelerator.CPU:
+    if automatic and not require_vulkan and cpu_fallback and requested is not Accelerator.CPU:
         candidates.append((Accelerator.CPU, False))
 
     build_command = [
@@ -221,7 +230,15 @@ def ensure_runtime_accelerator(requested: str | Accelerator) -> None:
                     "install the platform build tools or explicitly select --accelerator cpu"
                 )
             return
-    if candidate.value in (report.compiled_llama_accelerator or "").split("+"):
+    mixed_amd = (
+        choice is Accelerator.AUTO
+        and candidate is Accelerator.CUDA
+        and report.vulkan
+        and _vulkan_build_available()
+        and dedicated_amd_vulkan_available()
+    )
+    compiled = (report.compiled_llama_accelerator or "").split("+")
+    if candidate.value in compiled and (not mixed_amd or "vulkan" in compiled):
         return
     if candidate is Accelerator.CUDA and not (
         shutil.which("nvcc")
@@ -240,7 +257,9 @@ def ensure_runtime_accelerator(requested: str | Accelerator) -> None:
     if _cmake_executable() is None:
         if choice is Accelerator.AUTO:
             packaged = (report.compiled_llama_accelerator or "").split("+")
-            if any(backend in packaged for backend in ("metal", "cuda", "vulkan")):
+            if not mixed_amd and any(
+                backend in packaged for backend in ("metal", "cuda", "vulkan")
+            ):
                 print(
                     "osai: CMake is unavailable; using the packaged GPU trainer",
                     flush=True,
@@ -255,12 +274,11 @@ def ensure_runtime_accelerator(requested: str | Accelerator) -> None:
             accelerator=candidate,
             cpu_fallback=False,
             build_dir=llama_runtime_build(),
-            also_vulkan=(
-                candidate is Accelerator.CUDA and report.vulkan and _vulkan_build_available()
-            ),
+            also_vulkan=mixed_amd,
+            require_vulkan=mixed_amd,
         )
     except (TrainingError, DependencyError, OSError) as exc:
-        if choice is not Accelerator.AUTO:
+        if choice is not Accelerator.AUTO or mixed_amd:
             raise
         available = (detect_hardware().compiled_llama_accelerator or "").split("+")
         if not any(backend in available for backend in ("metal", "cuda", "vulkan")):

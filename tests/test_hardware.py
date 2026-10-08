@@ -74,6 +74,71 @@ def test_auto_runtime_needs_cmake_when_only_cpu_build_is_packaged(monkeypatch):
         llama_cpp.ensure_runtime_accelerator("auto")
 
 
+def test_runtime_rebuilds_cuda_for_dedicated_amd_vulkan(monkeypatch, tmp_path):
+    detected = report(accelerator="cuda")
+    detected = detected.__class__(
+        **{**detected.as_dict(), "vulkan": True, "compiled_llama_accelerator": "cuda"}
+    )
+    builds = []
+    monkeypatch.setattr(llama_cpp, "detect_hardware", lambda: detected)
+    monkeypatch.setattr(llama_cpp, "_vulkan_build_available", lambda: True)
+    monkeypatch.setattr(llama_cpp, "dedicated_amd_vulkan_available", lambda: True)
+    monkeypatch.setattr(llama_cpp.shutil, "which", lambda name: name)
+    monkeypatch.setattr(llama_cpp, "_cmake_executable", lambda: "cmake")
+    monkeypatch.setattr(llama_cpp, "llama_runtime_build", lambda: tmp_path)
+    monkeypatch.setattr(llama_cpp, "build_llama_cpp", lambda **kwargs: builds.append(kwargs))
+    llama_cpp.ensure_runtime_accelerator("auto")
+    assert len(builds) == 1
+    assert builds[0]["also_vulkan"] is True
+    assert builds[0]["require_vulkan"] is True
+
+
+def test_runtime_keeps_cuda_build_for_integrated_amd(monkeypatch):
+    detected = report(accelerator="cuda")
+    detected = detected.__class__(
+        **{**detected.as_dict(), "vulkan": True, "compiled_llama_accelerator": "cuda"}
+    )
+    monkeypatch.setattr(llama_cpp, "detect_hardware", lambda: detected)
+    monkeypatch.setattr(llama_cpp, "_vulkan_build_available", lambda: True)
+    monkeypatch.setattr(llama_cpp, "dedicated_amd_vulkan_available", lambda: False)
+    monkeypatch.setattr(llama_cpp.shutil, "which", lambda name: "nvcc" if name == "nvcc" else None)
+    monkeypatch.setattr(
+        llama_cpp, "build_llama_cpp", lambda **_kwargs: pytest.fail("unexpected rebuild")
+    )
+    llama_cpp.ensure_runtime_accelerator("auto")
+
+
+def test_dedicated_amd_probe_excludes_integrated_card(monkeypatch):
+    output = """GPU0:
+        vendorID = 0x1002
+        deviceType = PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+    GPU1:
+        vendorID = 0x10de
+        deviceType = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+    """
+    monkeypatch.setattr(hardware.shutil, "which", lambda _name: "vulkaninfo")
+    monkeypatch.setattr(
+        hardware.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=output),
+    )
+    assert hardware.dedicated_amd_vulkan_available() is False
+
+
+def test_dedicated_amd_probe_finds_discrete_card(monkeypatch):
+    output = """GPU0:
+        vendorID = 0x1002
+        deviceType = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+    """
+    monkeypatch.setattr(hardware.shutil, "which", lambda _name: "vulkaninfo")
+    monkeypatch.setattr(
+        hardware.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout=output),
+    )
+    assert hardware.dedicated_amd_vulkan_available() is True
+
+
 def test_cpu_runtime_rebuilds_missing_or_stale_trainer(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(llama_cpp, "llama_binary", lambda _name: None)
@@ -150,6 +215,30 @@ def test_explicit_cuda_build_failure_never_switches_backend(monkeypatch, tmp_pat
             cpu_fallback=True,
         )
     assert attempts == [(Accelerator.CUDA, False)]
+
+
+def test_required_mixed_build_does_not_fall_back_to_cuda_only(monkeypatch, tmp_path):
+    monkeypatch.setattr(llama_cpp, "llama_cpp_root", lambda: tmp_path)
+    monkeypatch.setattr(llama_cpp, "_cmake_executable", lambda: "cmake")
+    monkeypatch.setattr(
+        llama_cpp, "select_llama_accelerator", lambda *_args, **_kwargs: Accelerator.CUDA
+    )
+    attempts = []
+
+    def fail_configure(_cmake, _root, _build, _log, accelerator, also_vulkan=False):
+        attempts.append((accelerator, also_vulkan))
+        raise TrainingError("combined build failed")
+
+    monkeypatch.setattr(llama_cpp, "_configure", fail_configure)
+    with pytest.raises(TrainingError, match="combined build failed"):
+        llama_cpp.build_llama_cpp(
+            log_path=tmp_path / "build.log",
+            build_dir=tmp_path / "build",
+            accelerator=Accelerator.CUDA,
+            also_vulkan=True,
+            require_vulkan=True,
+        )
+    assert attempts == [(Accelerator.CUDA, True)]
 
 
 def test_combined_cuda_vulkan_build_accepts_both_backends():

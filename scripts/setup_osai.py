@@ -223,9 +223,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         _require_supported_python()
+        _discover_local_sdks()
+        mixed_amd = (
+            args.llama_accelerator == "auto"
+            and _cuda_major() is not None
+            and _dedicated_amd_vulkan_available()
+        )
         _discover_local_sdks(
             install_missing=not args.dry_run,
-            prefer_vulkan=args.llama_accelerator == "vulkan",
+            prefer_vulkan=args.llama_accelerator == "vulkan" or mixed_amd,
         )
         if args.jobs is not None and args.jobs < 1:
             raise SetupError("--jobs must be at least 1")
@@ -234,6 +240,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             mlx_accelerator=args.mlx_accelerator,
             llama_accelerator=args.llama_accelerator,
         )
+        if mixed_amd and not plan.vulkan_available and not args.dry_run:
+            raise SetupError(
+                "a dedicated AMD GPU was detected beside CUDA, but the Vulkan SDK is unavailable"
+            )
         requirements = REQUIREMENTS_ROOT / plan.requirements
         if not requirements.is_file():
             raise SetupError(f"missing requirements file: {requirements}")
@@ -250,6 +260,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             skip_mlx_build=args.skip_mlx_build,
             skip_llama_build=args.skip_llama_build,
             jobs=args.jobs,
+            also_vulkan=mixed_amd and plan.llama_accelerator == "cuda" and plan.vulkan_available,
         )
         _print_plan(plan, target_python, install_target, args)
         if args.dry_run:
@@ -259,7 +270,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         environment = _child_environment(target_python)
         if not args.skip_llama_build and plan.system == "Windows":
             environment.update(_windows_compiler_environment(plan, target_python))
-            if plan.llama_accelerator == "vulkan" and _vulkan_available():
+            if (plan.llama_accelerator == "vulkan" or mixed_amd) and _vulkan_available():
                 _ensure_windows_vulkan_runtime(environment)
         for command, extra_environment in commands:
             merged_environment = environment | extra_environment
@@ -282,6 +293,7 @@ def _setup_commands(
     skip_mlx_build: bool,
     skip_llama_build: bool,
     jobs: int | None,
+    also_vulkan: bool = False,
 ) -> list[tuple[list[str], dict[str, str]]]:
     commands: list[tuple[list[str], dict[str, str]]] = []
     index_arguments = _index_arguments(wheelhouse)
@@ -360,6 +372,8 @@ def _setup_commands(
         if plan.llama_accelerator != "cpu":
             # An available GPU must not silently become a CPU-only install.
             build_command.append("--no-cpu-fallback")
+        if also_vulkan:
+            build_command.extend(["--also-vulkan", "--require-vulkan"])
         if jobs is not None:
             build_command.extend(["--jobs", str(jobs)])
         commands.append((build_command, {}))
@@ -587,6 +601,125 @@ def _vulkan_available() -> bool:
     if sdk and (Path(sdk) / ("Bin/glslc.exe" if os.name == "nt" else "bin/glslc")).is_file():
         return True
     return shutil.which("glslc") is not None
+
+
+def _vulkan_summary_has_dedicated_amd(summary: str) -> bool:
+    for device in re.split(r"(?=^GPU\d+:\s*$)", summary, flags=re.M):
+        vendor = re.search(r"^\s*vendorID\s*=\s*(0x[0-9a-f]+|\d+)", device, re.M | re.I)
+        kind = re.search(r"^\s*deviceType\s*=\s*(\S+)", device, re.M | re.I)
+        if (
+            vendor
+            and kind
+            and int(vendor.group(1), 0) == 0x1002
+            and (kind.group(1) == "PHYSICAL_DEVICE_TYPE_DISCRETE_GPU")
+        ):
+            return True
+    return False
+
+
+def _dedicated_amd_vulkan_available() -> bool:
+    tool = shutil.which("vulkaninfo")
+    if not tool:
+        sdk = os.environ.get("VULKAN_SDK")
+        if sdk:
+            candidate = Path(sdk) / ("Bin/vulkaninfo.exe" if os.name == "nt" else "bin/vulkaninfo")
+            if candidate.is_file():
+                tool = str(candidate)
+    if not tool and os.name == "nt":
+        candidate = (
+            Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "System32" / "vulkaninfo.exe"
+        )
+        if candidate.is_file():
+            tool = str(candidate)
+    if tool:
+        try:
+            result = subprocess.run(
+                [tool, "--summary"], text=True, capture_output=True, timeout=15, check=False
+            )
+            if result.returncode == 0 and _vulkan_summary_has_dedicated_amd(result.stdout):
+                return True
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return _dedicated_amd_vulkan_via_loader()
+
+
+def _dedicated_amd_vulkan_via_loader() -> bool:
+    """Query device vendor and physical type without requiring an installed SDK."""
+
+    if platform.system() not in {"Windows", "Linux"}:
+        return False
+
+    class ApplicationInfo(ctypes.Structure):
+        _fields_ = [
+            ("sType", ctypes.c_uint32),
+            ("pNext", ctypes.c_void_p),
+            ("pApplicationName", ctypes.c_char_p),
+            ("applicationVersion", ctypes.c_uint32),
+            ("pEngineName", ctypes.c_char_p),
+            ("engineVersion", ctypes.c_uint32),
+            ("apiVersion", ctypes.c_uint32),
+        ]
+
+    class InstanceCreateInfo(ctypes.Structure):
+        _fields_ = [
+            ("sType", ctypes.c_uint32),
+            ("pNext", ctypes.c_void_p),
+            ("flags", ctypes.c_uint32),
+            ("pApplicationInfo", ctypes.POINTER(ApplicationInfo)),
+            ("enabledLayerCount", ctypes.c_uint32),
+            ("ppEnabledLayerNames", ctypes.c_void_p),
+            ("enabledExtensionCount", ctypes.c_uint32),
+            ("ppEnabledExtensionNames", ctypes.c_void_p),
+        ]
+
+    try:
+        loader = (
+            ctypes.WinDLL("vulkan-1.dll")
+            if platform.system() == "Windows"
+            else ctypes.CDLL("libvulkan.so.1")
+        )
+        loader.vkCreateInstance.argtypes = [
+            ctypes.POINTER(InstanceCreateInfo),
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p),
+        ]
+        loader.vkCreateInstance.restype = ctypes.c_int32
+        loader.vkEnumeratePhysicalDevices.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint32),
+            ctypes.c_void_p,
+        ]
+        loader.vkEnumeratePhysicalDevices.restype = ctypes.c_int32
+        loader.vkGetPhysicalDeviceProperties.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        loader.vkGetPhysicalDeviceProperties.restype = None
+        loader.vkDestroyInstance.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        loader.vkDestroyInstance.restype = None
+        application = ApplicationInfo(0, None, b"osAi setup", 0, None, 0, 1 << 22)
+        info = InstanceCreateInfo(1, None, 0, ctypes.pointer(application), 0, None, 0, None)
+        instance = ctypes.c_void_p()
+        if loader.vkCreateInstance(ctypes.byref(info), None, ctypes.byref(instance)) != 0:
+            return False
+        try:
+            count = ctypes.c_uint32()
+            if loader.vkEnumeratePhysicalDevices(instance, ctypes.byref(count), None) != 0:
+                return False
+            if count.value == 0 or count.value > 64:
+                return False
+            devices = (ctypes.c_void_p * count.value)()
+            if loader.vkEnumeratePhysicalDevices(instance, ctypes.byref(count), devices) != 0:
+                return False
+            for device in devices[: count.value]:
+                # VkPhysicalDeviceProperties begins with five uint32 fields:
+                # api, driver, vendor, device, and physical device type.
+                properties = (ctypes.c_uint32 * 2048)()
+                loader.vkGetPhysicalDeviceProperties(device, properties)
+                if properties[2] == 0x1002 and properties[4] == 2:
+                    return True
+        finally:
+            loader.vkDestroyInstance(instance, None)
+    except (AttributeError, OSError, ValueError):
+        return False
+    return False
 
 
 def _child_environment(target_python: Path) -> dict[str, str]:

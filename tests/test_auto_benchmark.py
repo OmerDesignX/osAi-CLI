@@ -108,7 +108,7 @@ def test_benchmark_rejects_integrated_vulkan_device_when_discrete_exists(
     )
     monkeypatch.setattr(
         "osai.auto_benchmark.available_llama_devices",
-        lambda _binary, _accelerator: ("Vulkan1", "Vulkan2"),
+        lambda _binary, _accelerator, **_kwargs: ("Vulkan1", "Vulkan2"),
     )
 
     with pytest.raises(ConfigurationError, match="unavailable"):

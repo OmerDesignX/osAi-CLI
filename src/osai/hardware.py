@@ -7,7 +7,9 @@ import importlib.util
 import json
 import os
 import platform
+import re
 import shutil
+import subprocess
 from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
@@ -211,6 +213,38 @@ def _vulkan_build_available() -> bool:
     # Linux distributions usually install Vulkan headers, loader, and shader
     # compiler into the system prefix rather than defining VULKAN_SDK.
     return os.name != "nt" and shutil.which("glslc") is not None
+
+
+def dedicated_amd_vulkan_available() -> bool:
+    """Identify a discrete AMD Vulkan adapter when a Vulkan SDK is installed."""
+
+    sdk = os.environ.get("VULKAN_SDK")
+    tool = shutil.which("vulkaninfo")
+    if not tool and sdk:
+        candidate = Path(sdk) / ("Bin/vulkaninfo.exe" if os.name == "nt" else "bin/vulkaninfo")
+        if candidate.is_file():
+            tool = str(candidate)
+    if not tool:
+        return False
+    try:
+        result = subprocess.run(
+            [tool, "--summary"], capture_output=True, text=True, timeout=15, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode:
+        return False
+    for block in re.split(r"(?=^GPU\d+:)", result.stdout, flags=re.M):
+        vendor = re.search(r"^\s*vendorID\s*=\s*(0x[\da-fA-F]+)", block, re.M)
+        kind = re.search(r"^\s*deviceType\s*=\s*(\S+)", block, re.M)
+        if (
+            vendor
+            and kind
+            and int(vendor.group(1), 16) == 0x1002
+            and kind.group(1) == "PHYSICAL_DEVICE_TYPE_DISCRETE_GPU"
+        ):
+            return True
+    return False
 
 
 def _cuda_build_available() -> bool:

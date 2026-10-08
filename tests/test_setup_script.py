@@ -126,6 +126,39 @@ def test_gpu_setup_does_not_silently_install_cpu_backend(monkeypatch, tmp_path: 
     assert "--no-cpu-fallback" in build
 
 
+def test_mixed_cuda_amd_setup_requires_both_native_backends(tmp_path: Path):
+    commands = setup_osai._setup_commands(
+        target_python=tmp_path / "python",
+        plan=plan(system="Windows", cuda_major=12, vulkan_available=True),
+        requirements=tmp_path / "requirements.txt",
+        install_target=tmp_path / "osai.whl",
+        wheelhouse=None,
+        dev=False,
+        skip_mlx_build=True,
+        skip_llama_build=False,
+        jobs=2,
+        also_vulkan=True,
+    )
+    build = next(command for command, _ in commands if "build-llama" in command)
+    assert "--also-vulkan" in build
+    assert "--require-vulkan" in build
+    assert "--no-cpu-fallback" in build
+
+
+def test_only_dedicated_amd_vulkan_gpu_triggers_mixed_build():
+    summary = """GPU0:
+        vendorID = 0x1002
+        deviceType = PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU
+GPU1:
+        vendorID = 0x10de
+        deviceType = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU
+"""
+    assert not setup_osai._vulkan_summary_has_dedicated_amd(summary)
+    assert setup_osai._vulkan_summary_has_dedicated_amd(
+        summary + "GPU2:\n vendorID = 0x1002\n deviceType = PHYSICAL_DEVICE_TYPE_DISCRETE_GPU\n"
+    )
+
+
 def test_windows_cuda_setup_skips_vulkan_sdk_download(monkeypatch, tmp_path: Path):
     monkeypatch.setattr(setup_osai.platform, "system", lambda: "Windows")
     monkeypatch.setattr(setup_osai, "_cuda_major", lambda: 12)

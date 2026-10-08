@@ -22,7 +22,11 @@ class DeviceSettings(Protocol):
 
 
 def available_llama_devices(
-    binary: Path | None, accelerator: Accelerator, *, include_integrated: bool = False
+    binary: Path | None,
+    accelerator: Accelerator,
+    *,
+    include_integrated: bool = False,
+    include_amd_vulkan: bool = False,
 ) -> tuple[str, ...]:
     """Resolve native IDs, excluding integrated Vulkan adapters for training."""
 
@@ -81,7 +85,21 @@ def available_llama_devices(
             external = re.compile(r"\b(?:eGPU|external|removable)\b", re.I)
             discrete.sort(key=lambda item: not bool(external.search(item[1])))
             return tuple(device for device, _label in discrete)
-    return tuple(device for device, _label in devices)
+    selected = tuple(device for device, _label in devices)
+    if accelerator is Accelerator.CUDA and include_amd_vulkan:
+        selected += _dedicated_amd_vulkan_ids(
+            result.stdout + "\n" + (getattr(result, "stderr", "") or "")
+        )
+    return selected
+
+
+def _dedicated_amd_vulkan_ids(output: str) -> tuple[str, ...]:
+    return tuple(
+        device
+        for device, label in re.findall(r"^\s*(Vulkan\d+):\s*(.+)$", output, re.M | re.I)
+        if re.search(r"\b(?:AMD|Radeon)\b", label, re.I)
+        and re.search(r"\[type=dedicated\]\s*$", label, re.I)
+    )
 
 
 def llama_device_free_bytes(binary: Path | None, accelerator: Accelerator) -> dict[str, int]:
@@ -109,7 +127,7 @@ def llama_device_free_bytes(binary: Path | None, accelerator: Accelerator) -> di
     if prefix is None:
         return {}
     output = result.stdout + "\n" + (getattr(result, "stderr", "") or "")
-    return {
+    free = {
         device: int(free) * 1024**2
         for device, free in re.findall(
             rf"^\s*({prefix}\d+):[^\n]*?\b(\d+)\s+MiB\s+free\b",
@@ -117,6 +135,16 @@ def llama_device_free_bytes(binary: Path | None, accelerator: Accelerator) -> di
             re.M | re.I,
         )
     }
+    if accelerator is Accelerator.CUDA:
+        for device in _dedicated_amd_vulkan_ids(output):
+            match = re.search(
+                rf"^\s*{re.escape(device)}:[^\n]*?\b(\d+)\s+MiB\s+free\b",
+                output,
+                re.M | re.I,
+            )
+            if match:
+                free[device] = int(match.group(1)) * 1024**2
+    return free
 
 
 def llama_device_arguments(
