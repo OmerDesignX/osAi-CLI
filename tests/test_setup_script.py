@@ -93,9 +93,7 @@ def test_offline_mode_requires_wheelhouse():
 
 def test_current_environment_preserves_the_active_python_path():
     args = SimpleNamespace(current_environment=True)
-    assert setup_osai._target_python(args, dry_run=True) == Path(
-        sys.executable
-    ).absolute()
+    assert setup_osai._target_python(args, dry_run=True) == Path(sys.executable).absolute()
 
 
 def test_setup_selects_wheel_for_current_revision(monkeypatch, tmp_path: Path):
@@ -124,8 +122,36 @@ def test_gpu_setup_does_not_silently_install_cpu_backend(monkeypatch, tmp_path: 
         jobs=2,
     )
     build = next(command for command, _ in commands if "build-llama" in command)
-    assert "--also-vulkan" in build
+    assert "--also-vulkan" not in build
     assert "--no-cpu-fallback" in build
+
+
+def test_windows_cuda_setup_skips_vulkan_sdk_download(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(setup_osai.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(setup_osai, "_cuda_major", lambda: 12)
+    monkeypatch.delenv("VULKAN_SDK", raising=False)
+    monkeypatch.setenv("SYSTEMROOT", str(tmp_path))
+    (tmp_path / "System32").mkdir()
+    (tmp_path / "System32" / "vulkan-1.dll").touch()
+    monkeypatch.setattr(
+        setup_osai,
+        "_install_windows_vulkan_sdk",
+        lambda: pytest.fail("CUDA setup must not download the Vulkan SDK"),
+    )
+    setup_osai._discover_local_sdks(install_missing=True)
+
+
+def test_explicit_vulkan_setup_can_download_sdk_with_cuda_present(monkeypatch, tmp_path: Path):
+    monkeypatch.setattr(setup_osai.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(setup_osai, "_cuda_major", lambda: 12)
+    monkeypatch.delenv("VULKAN_SDK", raising=False)
+    monkeypatch.setenv("SYSTEMROOT", str(tmp_path))
+    (tmp_path / "System32").mkdir()
+    (tmp_path / "System32" / "vulkan-1.dll").touch()
+    sdk = tmp_path / "VulkanSDK"
+    monkeypatch.setattr(setup_osai, "_install_windows_vulkan_sdk", lambda: sdk)
+    setup_osai._discover_local_sdks(install_missing=True, prefer_vulkan=True)
+    assert setup_osai.os.environ["VULKAN_SDK"] == str(sdk)
 
 
 def test_portable_compiler_exposes_windows_10_file_apis(monkeypatch, tmp_path):
@@ -154,9 +180,7 @@ def windows_sdk(monkeypatch, tmp_path):
     installer.parent.mkdir()
     installer.touch()
     monkeypatch.setattr(setup_osai, "_windows_vc_redist_installer", lambda: installer)
-    monkeypatch.setattr(
-        setup_osai, "_file_sha256", lambda _: setup_osai.WINDOWS_VC_REDIST_SHA256
-    )
+    monkeypatch.setattr(setup_osai, "_file_sha256", lambda _: setup_osai.WINDOWS_VC_REDIST_SHA256)
     return {"VULKAN_SDK": str(tmp_path), "PATH": "build-tools"}, compiler, installer
 
 

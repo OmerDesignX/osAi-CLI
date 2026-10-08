@@ -223,7 +223,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         _require_supported_python()
-        _discover_local_sdks(install_missing=not args.dry_run)
+        _discover_local_sdks(
+            install_missing=not args.dry_run,
+            prefer_vulkan=args.llama_accelerator == "vulkan",
+        )
         if args.jobs is not None and args.jobs < 1:
             raise SetupError("--jobs must be at least 1")
         wheelhouse = _wheelhouse(args.offline, args.wheelhouse)
@@ -256,13 +259,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         environment = _child_environment(target_python)
         if not args.skip_llama_build and plan.system == "Windows":
             environment.update(_windows_compiler_environment(plan, target_python))
-            if plan.llama_accelerator in {"vulkan", "cuda"} and _vulkan_available():
-                try:
-                    _ensure_windows_vulkan_runtime(environment)
-                except SetupError as exc:
-                    if plan.llama_accelerator != "cuda":
-                        raise
-                    print(f"osai setup: Vulkan preflight failed ({exc}); trying CUDA", flush=True)
+            if plan.llama_accelerator == "vulkan" and _vulkan_available():
+                _ensure_windows_vulkan_runtime(environment)
         for command, extra_environment in commands:
             merged_environment = environment | extra_environment
             _run(command, environment=merged_environment)
@@ -359,8 +357,6 @@ def _setup_commands(
             "--accelerator",
             plan.llama_accelerator,
         ]
-        if plan.llama_accelerator == "cuda" and _vulkan_available():
-            build_command.append("--also-vulkan")
         if plan.llama_accelerator != "cpu":
             # An available GPU must not silently become a CPU-only install.
             build_command.append("--no-cpu-fallback")
@@ -453,7 +449,7 @@ def _macos_major() -> int | None:
         return None
 
 
-def _discover_local_sdks(*, install_missing: bool = False) -> None:
+def _discover_local_sdks(*, install_missing: bool = False, prefer_vulkan: bool = False) -> None:
     """Find conventional SDK installs without asking for environment configuration."""
 
     if platform.system() == "Linux" and not os.environ.get("CUDA_PATH"):
@@ -482,6 +478,7 @@ def _discover_local_sdks(*, install_missing: bool = False) -> None:
     if (
         not os.environ.get("VULKAN_SDK")
         and install_missing
+        and (prefer_vulkan or _cuda_major() is None)
         and (
             Path(os.environ.get("SYSTEMROOT", r"C:\Windows")) / "System32" / "vulkan-1.dll"
         ).is_file()
