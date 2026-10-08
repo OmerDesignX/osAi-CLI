@@ -20,6 +20,7 @@ from .fusion import (
     resolve_gguf_fusion_bundle,
 )
 from .hardware import Accelerator, select_llama_accelerator
+from .merged_export import export_gguf_weights, export_mlx_weights
 from .offline import offline_environment
 from .paths import llama_binary
 from .process import run_logged
@@ -57,7 +58,6 @@ def merge_mlx_model(
         raise ConfigurationError("MLX merge requires an MLX base")
     layout.create()
     destination = layout.merged / "mlx"
-    _require_new_destination(destination)
     stage = Path(tempfile.mkdtemp(prefix="mlx-merge-", dir=layout.work)) / "model"
     backend = (
         MlxVlmBackend(python=python, accelerator=accelerator)
@@ -67,12 +67,23 @@ def merge_mlx_model(
     validation_log = layout.logs / "validate-merged-mlx.log"
     try:
         backend.preflight()
-        create_mlx_fusion_bundle(base.path, adapter_dir, stage)
-        merged = inspect_model(stage, ModelFormat.MLX)
+        if destination.exists():
+            shutil.copy2(adapter_dir / "adapters.safetensors", destination / "osai_adapter" / "adapters.safetensors")
+            shutil.copy2(adapter_dir / "adapter_config.json", destination / "osai_adapter" / "adapter_config.json")
+            bundle = destination
+        else:
+            create_mlx_fusion_bundle(base.path, adapter_dir, stage)
+            bundle = stage
+        merged = inspect_model(bundle, ModelFormat.MLX)
         _verify_merged_metadata(base, merged)
-        backend.verify_fusion(base.path, adapter_dir, stage, log_path=validation_log)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(stage, destination)
+        backend.verify_fusion(base.path, adapter_dir, bundle, log_path=validation_log)
+        export_mlx_weights(base.path, adapter_dir, bundle / "merged", work=layout.work,
+                           log=layout.logs / "export-merged-mlx.log", python=backend.python,
+                           multimodal=multimodal)
+        inspect_model(bundle / "merged", ModelFormat.MLX)
+        if bundle == stage:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(stage, destination)
     finally:
         shutil.rmtree(stage.parent, ignore_errors=True)
     published = inspect_model(destination, ModelFormat.MLX)
@@ -85,7 +96,7 @@ def merge_mlx_model(
         ),
         validation_log=validation_log,
         temporary_full_precision_intermediate=False,
-        merge_strategy="lossless-embedded-quantized-residual",
+        merge_strategy="fused-mlx-weights-and-adapter",
         temporary_quantized_unified_base=False,
     )
 
@@ -109,29 +120,39 @@ def merge_gguf_model(
         )
     layout.create()
     destination = layout.merged / "gguf"
-    _require_new_destination(destination)
-    _check_gguf_disk_budget(base, layout.root)
     stage_root = Path(tempfile.mkdtemp(prefix="gguf-merge-", dir=layout.work))
     stage = stage_root / "gguf"
     validation_log = layout.logs / "validate-merged-gguf.log"
     try:
-        bundle = create_gguf_fusion_bundle(base.path, base.shards, adapter, stage)
+        if destination.exists():
+            bundle = resolve_gguf_fusion_bundle(destination)
+            export_target = destination
+        else:
+            bundle = create_gguf_fusion_bundle(base.path, base.shards, adapter, stage)
+            export_target = stage
         merged = inspect_model(bundle.model, ModelFormat.GGUF)
         _verify_merged_metadata(base, merged)
+        export_gguf_weights(bundle.model, bundle.shards, adapter,
+                            export_target / "merged.gguf", work=layout.work,
+                            log=layout.logs / "export-merged-gguf.log", threads=threads)
+        if destination.exists():
+            pending_adapter = bundle.adapter.with_name("osai_adapter.gguf.pending")
+            shutil.copy2(adapter, pending_adapter)
+            os.replace(pending_adapter, bundle.adapter)
         _validate_gguf_load(
             completion,
-            bundle.model,
+            export_target / "merged.gguf",
             validation_log,
             accelerator=accelerator,
-            adapter=bundle.adapter,
             threads=threads,
         )
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(stage, destination)
+        if export_target == stage:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(stage, destination)
     finally:
         shutil.rmtree(stage_root, ignore_errors=True)
     published_bundle = resolve_gguf_fusion_bundle(destination)
-    published = inspect_model(published_bundle.model, ModelFormat.GGUF)
+    published = inspect_model(destination / "merged.gguf", ModelFormat.GGUF)
     return MergedModelResult(
         path=destination,
         format=ModelFormat.GGUF.value,
@@ -141,7 +162,7 @@ def merge_gguf_model(
         ),
         validation_log=validation_log,
         temporary_full_precision_intermediate=False,
-        merge_strategy="lossless-embedded-quantized-residual",
+        merge_strategy="quantized-tensor-fusion-and-adapter",
         temporary_quantized_unified_base=False,
     )
 

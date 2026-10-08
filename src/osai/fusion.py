@@ -76,7 +76,7 @@ def create_mlx_fusion_bundle(
             if not source.is_file() or ".git" in source.parts:
                 continue
             relative = source.relative_to(base_path)
-            if relative.parts[0] == MLX_EMBEDDED_ADAPTER or relative.name == FUSION_MANIFEST:
+            if relative.parts[0] in {MLX_EMBEDDED_ADAPTER, "merged"} or relative.name == FUSION_MANIFEST:
                 continue
             copied = target / relative
             modes.append(clone_or_copy(source, copied))

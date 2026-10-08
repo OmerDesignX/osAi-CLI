@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -69,7 +70,7 @@ class SessionLayout:
 
     @property
     def base_adapter(self) -> Path:
-        return self.root / "outputs" / "base-plus-adapter"
+        return self.work / "base-plus-adapter"
 
     @property
     def adapters(self) -> Path:
@@ -77,7 +78,7 @@ class SessionLayout:
 
     @property
     def merged(self) -> Path:
-        return self.root / "outputs" / "merged-model"
+        return self.root / "outputs"
 
     @property
     def run_manifest(self) -> Path:
@@ -243,6 +244,12 @@ def clone_or_copy(source: Path, destination: Path) -> str:
                 f"refusing to replace existing published base file: {destination}"
             )
     clone_command: list[str] | None = None
+    if os.name == "nt":
+        try:
+            os.link(source, destination)
+            return "hardlink"
+        except OSError:
+            destination.unlink(missing_ok=True)
     if sys.platform == "darwin":
         clone_command = ["/bin/cp", "-c", "-p", str(source), str(destination)]
     elif sys.platform.startswith("linux") and (cp := shutil.which("cp")):

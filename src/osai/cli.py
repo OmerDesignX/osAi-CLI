@@ -40,6 +40,7 @@ from .health import check_sessions
 from .io import OutputLock, atomic_json
 from .learning_proof import prove_learning
 from .merge import MergedModelResult, merge_gguf_model, merge_mlx_model
+from .model_tools import export_bundle
 from .model_download import (
     DEFAULT_MODEL_VERSION,
     MODEL_VERSIONS,
@@ -493,6 +494,14 @@ def build_parser() -> argparse.ArgumentParser:
     export_parser.add_argument("--output", required=True, type=Path)
     export_parser.add_argument("--dtype", choices=["f16", "f32"], default="f16")
     export_parser.set_defaults(handler=_export_gguf)
+
+    merged_parser = subparsers.add_parser(
+        "export-merged", help="fuse a saved base and adapter into standalone weights"
+    )
+    merged_parser.add_argument("--source", required=True, type=Path)
+    merged_parser.add_argument("--output", required=True, type=Path)
+    merged_parser.add_argument("--python", type=Path)
+    merged_parser.set_defaults(handler=_export_merged)
 
     build_parser = subparsers.add_parser("build-llama", help="build vendored llama.cpp")
     build_parser.add_argument(
@@ -1758,6 +1767,12 @@ def _ensure_official_tier(args: argparse.Namespace, engine: Engine) -> ModelDown
     except BaseException:
         progress.finish_error()
         raise
+
+
+def _export_merged(args: argparse.Namespace) -> int:
+    published = export_bundle(args.source, args.output, python=args.python)
+    _print_json({"status": "completed", "merged_model": str(published)})
+    return 0
 
 
 def _export_gguf(args: argparse.Namespace) -> int:

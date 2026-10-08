@@ -50,6 +50,8 @@ def test_mlx_fusion_rejects_an_invalid_existing_manifest(tmp_path: Path):
 def test_mlx_fusion_can_continue_without_nesting_previous_adapter(tmp_path: Path):
     base, adapter = _sources(tmp_path)
     first = create_mlx_fusion_bundle(base, adapter, tmp_path / "first")
+    (first.path / "merged").mkdir()
+    (first.path / "merged" / "model.safetensors").write_bytes(b"old-fused-weights")
     (adapter / "adapters.safetensors").write_bytes(b"updated-residual")
 
     second = create_mlx_fusion_bundle(first.path, adapter, tmp_path / "second")
@@ -57,6 +59,7 @@ def test_mlx_fusion_can_continue_without_nesting_previous_adapter(tmp_path: Path
     assert (second.path / "model.safetensors").read_bytes() == b"quantized-weights"
     assert (second.adapter / "adapters.safetensors").read_bytes() == b"updated-residual"
     assert not (second.adapter / "osai_adapter").exists()
+    assert not (second.path / "merged").exists()
     assert resolve_mlx_fusion_adapter(second.path) == second.adapter
 
 

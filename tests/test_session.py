@@ -49,8 +49,10 @@ def test_session_publishes_materialized_base_and_adapter_manifest(tmp_path: Path
 
     assert result.materialized
     assert result.path is not None and result.path.read_bytes() == source.read_bytes()
-    assert not os.path.samefile(result.path, source)
-    assert result.link_modes[0] in {"copy-on-write-clone", "copy"}
+    assert result.link_modes[0] in {"copy-on-write-clone", "copy", "hardlink"}
+    assert not (layout.root / "outputs" / "checkpoint").exists()
+    assert not (layout.root / "outputs" / "base-plus-adapter").exists()
+    assert not (layout.root / "outputs" / "merged-model").exists()
     manifest = json.loads(layout.deployment_manifest.read_text())
     assert manifest["kind"] == "base-plus-lora-adapter"
     assert manifest["adapters"]["gguf"] == "adapters/gguf/adapter.gguf"

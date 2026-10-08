@@ -141,7 +141,7 @@ class MlxVlmBackend(MlxBackend):
             ]
         log_path = layout.logs / "train.log"
         log_path.unlink(missing_ok=True)
-        checkpoint_dir = layout.root / "outputs" / "checkpoint"
+        checkpoint_dir = layout.work / "checkpoint"
         (checkpoint_dir / "adapter").mkdir(parents=True, exist_ok=True)
         checkpoint_environment = self.environment()
         checkpoint_environment.update(
@@ -157,6 +157,7 @@ class MlxVlmBackend(MlxBackend):
             kind="mlx",
             model=config.training_model,
             latest=checkpoint_dir / "adapter" / "adapters.safetensors",
+            multimodal=True,
         ):
             result = run_logged(
                 command, log_path=log_path, env=checkpoint_environment

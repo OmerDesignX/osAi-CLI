@@ -152,7 +152,11 @@ def train_gradient_gguf(
     _validate_output(destination, base.path, dataset.path)
     layout = SessionLayout.at(destination)
     layout.create()
-    resume_snapshot = layout.root / "outputs" / "checkpoint" / "adapter" / "last.gguf.resume"
+    resume_snapshot = layout.work / "checkpoint" / "adapter" / "last.gguf.resume"
+    if resume and not resume_snapshot.is_file():
+        legacy_snapshot = layout.root / "outputs" / "checkpoint" / "adapter" / "last.gguf.resume"
+        if legacy_snapshot.is_file():
+            resume_snapshot = legacy_snapshot
     resume_input = layout.work / "resume-input.json"
     previous_resume: dict[str, Any] | None = None
     if resume:
@@ -410,7 +414,7 @@ def train_gradient_gguf(
                 training_env["OSAI_GPU_TIED_EMBEDDINGS"] = "1"
             training_env["OSAI_MASK_PROMPT"] = "1" if settings.mask_prompt else "0"
             training_env["OSAI_MAX_SEQ_LENGTH"] = str(settings.context)
-            checkpoint_dir = layout.root / "outputs" / "checkpoint"
+            checkpoint_dir = layout.work / "checkpoint"
             (checkpoint_dir / "adapter").mkdir(parents=True, exist_ok=True)
             training_env["OSAI_CHECKPOINT_REQUEST"] = os.environ.get(
                 "OSAI_CHECKPOINT_REQUEST", str(layout.root / "checkpoint.request")

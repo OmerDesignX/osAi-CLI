@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import json
 import shutil
+from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import patch
 
@@ -69,23 +71,75 @@ def test_latest_checkpoint_replaces_adapter_and_ack(tmp_path: Path) -> None:
 def test_checkpoint_model_updates_embedded_adapter(tmp_path: Path) -> None:
     model = tmp_path / "base.gguf"
     model.write_bytes(b"base")
-    latest = tmp_path / "outputs" / "checkpoint" / "adapter" / "last.gguf"
+    latest = tmp_path / ".internal" / "checkpoint" / "adapter" / "last.gguf"
     latest.parent.mkdir(parents=True)
     latest.write_bytes(b"first")
 
     def create_bundle(_model: Path, _shards: tuple[Path, ...], adapter: Path, stage: Path):
         stage.mkdir(parents=True)
+        (stage / "model").mkdir()
+        shutil.copyfile(model, stage / "model" / model.name)
         shutil.copyfile(adapter, stage / "osai_adapter.gguf")
         (stage / "osai_fusion.json").write_text("{}", encoding="utf-8")
+        return SimpleNamespace(model=stage / "model" / model.name,
+                               shards=(stage / "model" / model.name,),
+                               adapter=stage / "osai_adapter.gguf")
+
+    def export(_model, _shards, adapter, destination, **_kwargs):
+        destination.write_bytes(b"merged-" + adapter.read_bytes())
+        return destination
+
+    def resolve(directory):
+        return SimpleNamespace(model=directory / "model" / model.name,
+                               shards=(directory / "model" / model.name,),
+                               adapter=directory / "osai_adapter.gguf")
 
     publisher = CheckpointPublisher(kind="gguf", model=model, shards=(model,), latest=latest)
-    with patch("osai.fusion.create_gguf_fusion_bundle", side_effect=create_bundle):
+    with patch("osai.fusion.create_gguf_fusion_bundle", side_effect=create_bundle), \
+         patch("osai.fusion.resolve_gguf_fusion_bundle", side_effect=resolve), \
+         patch("osai.merged_export.export_gguf_weights", side_effect=export):
         publisher._publish_if_new()
         published = publisher.destination / "osai_adapter.gguf"
         assert published.read_bytes() == b"first"
+        assert (publisher.destination / "merged.gguf").read_bytes() == b"merged-first"
         replacement = latest.with_name("replacement.gguf")
         replacement.write_bytes(b"second")
         os.replace(replacement, latest)
         publisher._publish_if_new()
         assert published.read_bytes() == b"second"
+        assert (publisher.destination / "merged.gguf").read_bytes() == b"merged-second"
+        chosen = tmp_path / "chosen"
+        chosen.mkdir()
+        (latest.parent.parent / "last.ack").write_text("manual-save\n", encoding="utf-8")
+        (tmp_path / "checkpoint-export.json").write_text(
+            json.dumps({"generation": "manual-save", "directory": str(chosen)}),
+            encoding="utf-8",
+        )
+        replacement.write_bytes(b"third")
+        os.replace(replacement, latest)
+        publisher._publish_if_new()
+        assert (chosen / "gguf" / "osai_adapter.gguf").read_bytes() == b"third"
+        assert (chosen / "gguf" / "merged.gguf").read_bytes() == b"merged-third"
+        assert not (tmp_path / "checkpoint-export.json").exists()
         assert not list(publisher.destination.parent.glob("*.pending"))
+
+
+def test_checkpoint_model_waits_for_newer_adapter_before_acknowledging(
+    tmp_path: Path, capsys
+) -> None:
+    model = tmp_path / "base.gguf"
+    model.write_bytes(b"base")
+    latest = tmp_path / ".internal" / "checkpoint" / "adapter" / "last.gguf"
+    latest.parent.mkdir(parents=True)
+    latest.write_bytes(b"first")
+    publisher = CheckpointPublisher(kind="gguf", model=model, shards=(model,), latest=latest)
+
+    def publish() -> None:
+        replacement = latest.with_name("replacement.gguf")
+        replacement.write_bytes(b"newer-adapter")
+        os.replace(replacement, latest)
+
+    with patch.object(publisher, "_publish", side_effect=publish):
+        publisher._publish_if_new()
+    assert publisher.signature is None
+    assert "checkpoint model ready" not in capsys.readouterr().out

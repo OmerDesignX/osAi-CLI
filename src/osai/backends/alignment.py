@@ -169,7 +169,7 @@ def align_mlx(
             "--",
             *command[1:],
         ]
-    checkpoint_dir = layout.root / "outputs" / "checkpoint"
+    checkpoint_dir = layout.work / "checkpoint"
     (checkpoint_dir / "adapter").mkdir(parents=True, exist_ok=True)
     checkpoint_environment = backend.environment()
     checkpoint_environment.update(
@@ -438,7 +438,7 @@ def align_gguf(
                     kind="gguf",
                     model=base.path,
                     shards=base.shards,
-                    latest=layout.root / "outputs" / "checkpoint" / "adapter" / "last.gguf",
+                    latest=layout.work / "checkpoint" / "adapter" / "last.gguf",
                 ):
                     training_accelerator = _native_alignment_step(
                         binary,
@@ -623,7 +623,7 @@ def _native_alignment_step(
     environment["OSAI_MASK_PROMPT"] = "1"
     environment["OSAI_MAX_SEQ_LENGTH"] = str(settings.context)
     environment["OSAI_EXAMPLE_WEIGHTS"] = ",".join(format(value, ".17g") for value in weights)
-    checkpoint_dir = output.parent.parent / "outputs" / "checkpoint"
+    checkpoint_dir = output.parent / "checkpoint"
     (checkpoint_dir / "adapter").mkdir(parents=True, exist_ok=True)
     checkpoint_output = checkpoint_dir / "adapter" / "last.gguf"
     checkpoint_request = Path(

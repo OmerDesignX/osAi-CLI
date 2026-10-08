@@ -201,7 +201,7 @@ class MlxBackend:
             flush=True,
         )
         adapter_dir = layout.adapters / "mlx"
-        checkpoint_dir = layout.root / "outputs" / "checkpoint"
+        checkpoint_dir = layout.work / "checkpoint"
         (checkpoint_dir / "adapter").mkdir(parents=True, exist_ok=True)
         checkpoint_environment = self.environment()
         checkpoint_environment.update(

@@ -87,10 +87,9 @@ remaining blocks still participate in the frozen forward pass. Longer
 structured records are windowed without discarding assistant labels; the CLI
 reports the number of windowed records.
 
-Training publishes both `base-plus-adapter` and a standalone lossless deployment
-bundle by default. In both MLX and GGUF bundles, fusion keeps the quantized base
-files byte-for-byte unchanged and embeds the exact adapter residual. The fusion
-path performs no model dequantization or requantization.
+Training publishes an adapter and standalone fused weights under
+`outputs/gguf/` or `outputs/mlx/`. The original base files remain unchanged.
+GGUF fusion preserves base tensor types; MLX saves quantized fused weights.
 
 ## Install
 
@@ -410,8 +409,8 @@ osai train \
   --data /path/to/data
 ```
 
-To continue a finished run, use its `outputs/merged-model/` folder as the
-custom model. It already has the required `gguf/` or `mlx/` layout. The CLI
+To continue a finished run, use its `outputs/gguf/` or `outputs/mlx/` folder as
+the custom model. The CLI
 resumes its embedded LoRA adapter, then writes a new adapter and merged model
 into the next session. Automatic settings retain the adapter's rank and target
 shape so previous learning is preserved.
@@ -422,11 +421,13 @@ shape so previous learning is preserved.
 sessions/2026-09-05_14-30-00_small-auto/
 ├── manifests/
 ├── logs/
-├── outputs/checkpoint/
-│   ├── adapter/               # one replaceable latest adapter
-│   └── merged-model/          # reusable model with the latest adapter
-├── outputs/base-plus-adapter/
-└── outputs/merged-model/
+├── .internal/checkpoint/      # resume state and save acknowledgments
+└── outputs/
+    └── gguf/                  # or mlx/
+        ├── model/             # original GGUF shards and projector
+        ├── osai_adapter.gguf
+        ├── osai_fusion.json
+        └── merged.gguf        # standalone fused model
 ```
 
 During a run, GGUF saves the current LoRA roughly every five minutes at the
@@ -435,27 +436,25 @@ update. MLX saves every `--save-every` updates and at completion. A request
 written to `checkpoint.request` in the session folder
 also saves at the next optimizer step; replace its text with a new unique
 value for each request. Model-sharded GGUF training writes one adapter at a
-safe optimizer step. The adapter and the
-`merged-model/` bundle are replaced in place, so numbered checkpoint copies
-do not accumulate. The bundle can be selected as a custom model for a later
-run. A checkpoint contains model weights, not optimizer state, so starting a
-new run from it does not reproduce the interrupted optimizer exactly.
+safe optimizer step. The adapter and fused model are replaced in place, so
+numbered checkpoint copies do not accumulate. GGUF fine-tuning also saves
+optimizer state and dataset position under `.internal` for exact resume.
 
 Combined runs place the supervised stage below `stages/fine-tuning/` and place
 the final aligned adapter and merged model in the parent session's `outputs/`.
-For MLX, the standalone output keeps every quantized base tensor unchanged and
-embeds the adapter in `osai_adapter/`. The bundled MLX loader applies it from
-`osai_fusion.json` automatically. Before publication, osAi compares every
-next-token logit with the original base-plus-adapter path and requires an exact
-match.
+For MLX, the output keeps the base unchanged, embeds the adapter in
+`osai_adapter/`, and writes standalone fused weights under `merged/`.
 
 For GGUF, the bundle keeps the original file or split shards and any multimodal
 projector unchanged under `model/`, stores the exact adapter as
 `osai_adapter.gguf`, and records them in `osai_fusion.json`. SHA-256 checks
 require every copied base, projector, and adapter file to match its source. Raw
-llama.cpp commands load the manifest's model with
-`--lora osai_adapter.gguf`; no unified, dequantized, or requantized model is
-created.
+llama.cpp can load the manifest's base with `--lora osai_adapter.gguf`, or
+load `merged.gguf` alone. A split base is unified temporarily for export,
+then that temporary file is removed.
+
+Export an existing bundle to a chosen folder with
+`osai export-merged --source SESSION_OR_OUTPUT --output DESTINATION`.
 
 Each run receives a new local date-and-time folder automatically. Use
 `--session-name NAME` to change its suffix or `--sessions-root PATH` to choose a
@@ -564,7 +563,7 @@ directly to alignment.
 | `--gguf-threads N` | CPU threads used by GGUF training and fusion validation. Default: `2`. |
 | `--target-module NAME` | Adapt a projection; repeat for several. Choices: `self_attn.q_proj`, `self_attn.k_proj`, `self_attn.v_proj`, `self_attn.o_proj`, `mlp.gate_proj`, `mlp.up_proj`, `mlp.down_proj`. |
 | `--strict-base-hash`, `--no-strict-base-hash` | Enable or disable full pre/post base-file hashes. Enabled by default. |
-| `--merge`, `--no-merge` | Enable or disable the standalone lossless quantized-residual bundle. Enabled by default. |
+| `--merge`, `--no-merge` | Enable or disable standalone fused weights. Enabled by default. |
 | `--materialize-base`, `--no-materialize-base` | Copy/clone the base into the deployment folder or reference its local path. Enabled by default. |
 | `--python PATH` | Python executable containing MLX, MLX LM, and MLX-VLM. |
 
