@@ -146,12 +146,65 @@ def test_explicit_vulkan_setup_can_download_sdk_with_cuda_present(monkeypatch, t
     monkeypatch.setattr(setup_osai, "_cuda_major", lambda: 12)
     monkeypatch.delenv("VULKAN_SDK", raising=False)
     monkeypatch.setenv("SYSTEMROOT", str(tmp_path))
+    monkeypatch.setattr(setup_osai, "_find_windows_vulkan_sdk", lambda _: None)
     (tmp_path / "System32").mkdir()
     (tmp_path / "System32" / "vulkan-1.dll").touch()
     sdk = tmp_path / "VulkanSDK"
     monkeypatch.setattr(setup_osai, "_install_windows_vulkan_sdk", lambda: sdk)
     setup_osai._discover_local_sdks(install_missing=True, prefer_vulkan=True)
     assert setup_osai.os.environ["VULKAN_SDK"] == str(sdk)
+
+
+def test_windows_setup_reuses_registered_sdk_from_older_install(monkeypatch, tmp_path: Path):
+    sdk = tmp_path / "older-install" / "vulkan-sdk"
+    for relative in ("Bin/glslc.exe", "Include/vulkan/vulkan.h", "Lib/vulkan-1.lib"):
+        file = sdk / relative
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.touch()
+    monkeypatch.setattr(setup_osai.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(setup_osai, "_cuda_major", lambda: None)
+    monkeypatch.setattr(setup_osai, "_windows_registered_vulkan_sdk_locations", lambda: [sdk])
+    monkeypatch.setenv("PROGRAMFILES", str(tmp_path / "Program Files"))
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "AppData"))
+    monkeypatch.setenv("SYSTEMROOT", str(tmp_path))
+    monkeypatch.setenv("VULKAN_SDK", str(tmp_path / "removed-sdk"))
+    (tmp_path / "System32").mkdir()
+    (tmp_path / "System32" / "vulkan-1.dll").touch()
+    monkeypatch.setattr(
+        setup_osai,
+        "_install_windows_vulkan_sdk",
+        lambda: pytest.fail("an installed SDK should be reused"),
+    )
+    setup_osai._discover_local_sdks(install_missing=True)
+    assert setup_osai.os.environ["VULKAN_SDK"] == str(sdk)
+
+
+def test_windows_vulkan_download_uses_shared_cache_once(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    sdk = setup_osai._shared_windows_vulkan_sdk()
+    installer = sdk.parent / f"vulkansdk-{setup_osai.WINDOWS_VULKAN_VERSION}.exe"
+    installer.parent.mkdir(parents=True)
+    installer.touch()
+    monkeypatch.setattr(setup_osai, "_file_sha256", lambda _: setup_osai.WINDOWS_VULKAN_SHA256)
+    monkeypatch.setattr(
+        setup_osai.shutil,
+        "disk_usage",
+        lambda _: SimpleNamespace(free=4 * 1024**3),
+    )
+    calls = []
+
+    def install(command, **_kwargs):
+        calls.append(command)
+        for relative in ("Bin/glslc.exe", "Include/vulkan/vulkan.h", "Lib/vulkan-1.lib"):
+            file = sdk / relative
+            file.parent.mkdir(parents=True, exist_ok=True)
+            file.touch()
+
+    monkeypatch.setattr(setup_osai.subprocess, "run", install)
+    assert setup_osai._install_windows_vulkan_sdk() == sdk
+    assert setup_osai._install_windows_vulkan_sdk() == sdk
+    assert len(calls) == 1
+    assert calls[0][2] == str(sdk)
 
 
 def test_portable_compiler_exposes_windows_10_file_apis(monkeypatch, tmp_path):

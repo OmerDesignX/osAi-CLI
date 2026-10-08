@@ -467,14 +467,12 @@ def _discover_local_sdks(*, install_missing: bool = False, prefer_vulkan: bool =
             if (candidate / "bin" / "nvcc.exe").is_file():
                 os.environ["CUDA_PATH"] = str(candidate)
                 break
-    if not os.environ.get("VULKAN_SDK"):
-        for root in (Path(r"C:\VulkanSDK"), program_files / "VulkanSDK"):
-            for candidate in sorted(root.glob("*"), reverse=True):
-                if (candidate / "Bin" / "glslc.exe").is_file():
-                    os.environ["VULKAN_SDK"] = str(candidate)
-                    break
-            if os.environ.get("VULKAN_SDK"):
-                break
+    sdk = _find_windows_vulkan_sdk(program_files)
+    if sdk:
+        os.environ["VULKAN_SDK"] = str(sdk)
+    else:
+        # An old environment variable may point into an installation that was removed.
+        os.environ.pop("VULKAN_SDK", None)
     if (
         not os.environ.get("VULKAN_SDK")
         and install_missing
@@ -492,6 +490,76 @@ def _discover_local_sdks(*, install_missing: bool = False, prefer_vulkan: bool =
             subprocess.TimeoutExpired,
         ) as exc:
             print(f"osai setup: Vulkan SDK download unavailable ({exc}); continuing", flush=True)
+
+
+def _complete_windows_vulkan_sdk(sdk: Path) -> bool:
+    return all(
+        (sdk / relative).is_file()
+        for relative in ("Bin/glslc.exe", "Include/vulkan/vulkan.h", "Lib/vulkan-1.lib")
+    )
+
+
+def _shared_windows_vulkan_sdk() -> Path:
+    local_data = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    return local_data / "osAi" / "toolchains" / "vulkan-sdk" / WINDOWS_VULKAN_VERSION
+
+
+def _windows_registered_vulkan_sdk_locations() -> list[Path]:
+    """Read installed SDK locations, including older osAi per-install copies."""
+
+    try:
+        import winreg
+    except ImportError:
+        return []
+
+    locations: list[Path] = []
+    uninstall = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+    views = (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY)
+    for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        for view in views:
+            try:
+                root = winreg.OpenKey(hive, uninstall, 0, winreg.KEY_READ | view)
+            except OSError:
+                continue
+            with root:
+                index = 0
+                while True:
+                    try:
+                        name = winreg.EnumKey(root, index)
+                    except OSError:
+                        break
+                    index += 1
+                    try:
+                        entry = winreg.OpenKey(root, name)
+                        with entry:
+                            display_name = winreg.QueryValueEx(entry, "DisplayName")[0]
+                            if not isinstance(display_name, str) or not display_name.startswith(
+                                "Vulkan SDK"
+                            ):
+                                continue
+                            location = winreg.QueryValueEx(entry, "InstallLocation")[0]
+                            if isinstance(location, str) and location:
+                                locations.append(Path(location))
+                    except OSError:
+                        continue
+    return list(dict.fromkeys(locations))
+
+
+def _find_windows_vulkan_sdk(program_files: Path) -> Path | None:
+    configured = os.environ.get("VULKAN_SDK")
+    if configured and _complete_windows_vulkan_sdk(Path(configured)):
+        return Path(configured)
+    shared = _shared_windows_vulkan_sdk()
+    if _complete_windows_vulkan_sdk(shared):
+        return shared
+    for root in (Path(r"C:\VulkanSDK"), program_files / "VulkanSDK"):
+        for candidate in sorted(root.glob("*"), reverse=True):
+            if _complete_windows_vulkan_sdk(candidate):
+                return candidate
+    for candidate in _windows_registered_vulkan_sdk_locations():
+        if _complete_windows_vulkan_sdk(candidate):
+            return candidate
+    return None
 
 
 def _cuda_major() -> int | None:
@@ -787,15 +855,14 @@ def _windows_vc_redist_installer() -> Path:
 
 
 def _install_windows_vulkan_sdk() -> Path:
-    """Copy a verified Vulkan SDK into the private source build directory."""
+    """Install one reusable SDK outside versioned CLI source checkouts."""
 
-    tools = PROJECT_ROOT / "build" / "osai-tools"
-    sdk = tools / "vulkan-sdk" / WINDOWS_VULKAN_VERSION
-    if (sdk / "Bin" / "glslc.exe").is_file() and (
-        sdk / "Include" / "vulkan" / "vulkan.h"
-    ).is_file():
+    sdk = _shared_windows_vulkan_sdk()
+    tools = sdk.parent
+    if _complete_windows_vulkan_sdk(sdk):
         return sdk
-    if shutil.disk_usage(PROJECT_ROOT).free < 3 * 1024**3:
+    tools.parent.mkdir(parents=True, exist_ok=True)
+    if shutil.disk_usage(tools.parent).free < 3 * 1024**3:
         raise SetupError("at least 3 GiB free disk is needed for the Vulkan SDK")
     tools.mkdir(parents=True, exist_ok=True)
     installer = tools / f"vulkansdk-{WINDOWS_VULKAN_VERSION}.exe"
@@ -840,8 +907,8 @@ def _install_windows_vulkan_sdk() -> Path:
         check=True,
         timeout=30 * 60,
     )
-    if not (sdk / "Bin" / "glslc.exe").is_file():
-        raise SetupError("the downloaded Vulkan SDK did not contain glslc.exe")
+    if not _complete_windows_vulkan_sdk(sdk):
+        raise SetupError("the downloaded Vulkan SDK is incomplete")
     return sdk
 
 
