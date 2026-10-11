@@ -68,8 +68,14 @@ def merge_mlx_model(
     try:
         backend.preflight()
         if destination.exists():
-            shutil.copy2(adapter_dir / "adapters.safetensors", destination / "osai_adapter" / "adapters.safetensors")
-            shutil.copy2(adapter_dir / "adapter_config.json", destination / "osai_adapter" / "adapter_config.json")
+            shutil.copy2(
+                adapter_dir / "adapters.safetensors",
+                destination / "osai_adapter" / "adapters.safetensors",
+            )
+            shutil.copy2(
+                adapter_dir / "adapter_config.json",
+                destination / "osai_adapter" / "adapter_config.json",
+            )
             bundle = destination
         else:
             create_mlx_fusion_bundle(base.path, adapter_dir, stage)
@@ -151,7 +157,7 @@ def merge_gguf_model(
             os.replace(stage, destination)
     finally:
         shutil.rmtree(stage_root, ignore_errors=True)
-    published_bundle = resolve_gguf_fusion_bundle(destination)
+    resolve_gguf_fusion_bundle(destination)
     published = inspect_model(destination / "merged.gguf", ModelFormat.GGUF)
     return MergedModelResult(
         path=destination,
