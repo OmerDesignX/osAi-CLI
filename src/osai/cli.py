@@ -48,7 +48,7 @@ from .model_download import (
     ensure_official_model,
 )
 from .model_tools import export_bundle
-from .multi_gpu import available_llama_devices
+from .multi_gpu import available_llama_devices, llama_device_free_bytes
 from .paths import llama_binary, project_root
 from .rollouts import RolloutSettings
 from .session import (
@@ -465,7 +465,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--split-mode", choices=["none", "layer", "row", "tensor"], default="layer"
     )
     calibration_parser.add_argument("--tensor-split")
-    calibration_parser.add_argument("--main-gpu", type=int, default=0)
+    calibration_parser.add_argument("--main-gpu", type=int)
     calibration_parser.add_argument("--distributed-workers", type=int, default=0)
     calibration_parser.add_argument("--bundled-root", type=Path)
     calibration_parser.add_argument("--custom-root", type=Path)
@@ -1314,7 +1314,7 @@ def _resolve_training_settings(
     if args.auto_settings:
         expected = ModelFormat.MLX if engine is Engine.MLX else ModelFormat.GGUF
         model_path = config.training_model if engine is Engine.MLX else config.model
-        selected = benchmark_auto_settings(
+        measured = benchmark_auto_settings(
             inspect_model(model_path, expected),
             engine=engine,
             accelerator=args.accelerator,
@@ -1322,7 +1322,16 @@ def _resolve_training_settings(
             devices=config.devices,
             adapter=_embedded_adapter(config.model, engine),
             required_context=required_context,
-        ).settings
+        )
+        selected = measured.settings
+        measured_devices = getattr(measured, "devices", ())
+        measured_split = getattr(measured, "tensor_split", ())
+        measured_main = getattr(measured, "main_gpu", 0)
+        automatic_devices = config.devices or measured_devices
+        automatic_split = config.tensor_split or measured_split
+        automatic_main = (
+            config.main_gpu if config.tensor_split or args.main_gpu is not None else measured_main
+        )
         config = replace(
             config,
             auto_settings=True,
@@ -1335,6 +1344,9 @@ def _resolve_training_settings(
             gguf_batch_size=selected.gguf_batch_size,
             gguf_threads=selected.gguf_threads,
             target_modules=selected.target_modules,
+            devices=automatic_devices,
+            tensor_split=automatic_split,
+            main_gpu=automatic_main,
         )
         print(
             "osai: auto settings "
@@ -1346,6 +1358,13 @@ def _resolve_training_settings(
             f"rank={selected.rank} threads={selected.gguf_threads}",
             file=sys.stderr,
         )
+        if len(config.devices) > 1 and config.tensor_split:
+            print(
+                "osai: auto sharding "
+                f"main={config.devices[config.main_gpu]} weights="
+                + ",".join(format(value, ".6g") for value in config.tensor_split),
+                file=sys.stderr,
+            )
 
     overrides: dict[str, Any] = {}
     for argument, field_name in (
@@ -1711,12 +1730,20 @@ def _calibrate(args: argparse.Namespace) -> int:
 def _auto_devices(args: argparse.Namespace) -> int:
     report = detect_hardware()
     accelerator = select_llama_accelerator(args.accelerator, report)
+    binary = llama_binary("llama-completion")
     devices = available_llama_devices(
-        llama_binary("llama-completion"),
+        binary,
         accelerator,
         include_amd_vulkan=args.accelerator == "auto",
     )
-    _print_json({"accelerator": accelerator.value, "devices": list(devices)})
+    free = llama_device_free_bytes(binary, accelerator)
+    _print_json(
+        {
+            "accelerator": accelerator.value,
+            "devices": list(devices),
+            "free_bytes": {device: free[device] for device in devices if device in free},
+        }
+    )
     return 0
 
 

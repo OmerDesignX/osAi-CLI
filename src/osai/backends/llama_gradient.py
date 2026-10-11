@@ -27,7 +27,12 @@ from ..formats import inspect_model
 from ..fusion import resolve_gguf_fusion_bundle
 from ..hardware import Accelerator, select_llama_accelerator
 from ..io import OutputLock, atomic_json, fingerprint, sha256_file
-from ..multi_gpu import available_llama_devices, llama_device_arguments
+from ..multi_gpu import (
+    automatic_llama_device_plan,
+    available_llama_devices,
+    llama_device_arguments,
+    llama_device_free_bytes,
+)
 from ..offline import offline_environment
 from ..paths import llama_binary
 from ..process import run_logged
@@ -191,6 +196,28 @@ def train_gradient_gguf(
             )
         if not settings.devices:
             raise ConfigurationError("the selected GPU backend reports no usable devices")
+        if (
+            settings.auto_settings
+            and settings.multi_gpu != "off"
+            and len(settings.devices) > 1
+            and not settings.tensor_split
+        ):
+            plan = automatic_llama_device_plan(
+                settings.devices,
+                llama_device_free_bytes(llama_binary("llama-completion"), requested_accelerator),
+            )
+            if plan.tensor_split:
+                settings = replace(
+                    settings,
+                    tensor_split=plan.tensor_split,
+                    main_gpu=plan.main_gpu,
+                )
+                print(
+                    "osai: automatic GPU sharding "
+                    f"main={settings.devices[settings.main_gpu]} weights="
+                    + ",".join(format(value, ".6g") for value in settings.tensor_split),
+                    flush=True,
+                )
     if settings.multi_gpu == "on" and len(settings.devices) < 2:
         raise ConfigurationError(
             "multi-GPU was required, but fewer than two usable devices were found"

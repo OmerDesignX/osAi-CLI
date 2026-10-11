@@ -52,6 +52,8 @@ class CalibrationResult:
     accelerator: str
     devices: tuple[str, ...]
     device_speeds: tuple[float, ...] = ()
+    tensor_split: tuple[float, ...] = ()
+    main_gpu: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -67,6 +69,8 @@ class CalibrationResult:
             "accelerator": self.accelerator,
             "devices": list(self.devices),
             "device_speeds": list(self.device_speeds),
+            "tensor_split": list(self.tensor_split),
+            "main_gpu": self.main_gpu,
         }
 
 
@@ -121,8 +125,19 @@ def _pilot_microbatch(
         if not all(device in free for device in benchmark.devices):
             return settings.gguf_batch_size
         available = min(free[device] for device in benchmark.devices)
-    model_share = model.size_bytes / max(1, len(benchmark.devices))
-    headroom = max(0, available - model_share)
+        benchmark_split = getattr(benchmark, "tensor_split", ())
+        weights = (
+            benchmark_split
+            if len(benchmark_split) == len(benchmark.devices)
+            else (1.0,) * len(benchmark.devices)
+        )
+        total_weight = sum(weights)
+        headroom = min(
+            max(0, free[device] - model.size_bytes * weight / total_weight)
+            for device, weight in zip(benchmark.devices, weights, strict=True)
+        )
+    else:
+        headroom = max(0, available - model.size_bytes)
     context_bound = max(1, math.isqrt(settings.max_seq_length))
     # Packed model bytes per block are not a measure of activation bytes per token.
     # The native pilot verifies this memory-bounded candidate and halves it on OOM.
@@ -299,7 +314,7 @@ def calibrate_training(
     grad_accumulation_steps: int = 1,
     split_mode: str = "layer",
     tensor_split: tuple[float, ...] = (),
-    main_gpu: int = 0,
+    main_gpu: int | None = None,
     distributed_workers: int = 0,
     require_full_context: bool = False,
     total_training_rows: int | None = None,
@@ -314,6 +329,8 @@ def calibrate_training(
             "Calibration needs positive scale and accumulation, and valid dropout"
         )
     selected_optimizer = "adamw" if optimizer == "auto" else optimizer
+    effective_tensor_split = tensor_split or benchmark.tensor_split
+    effective_main_gpu = benchmark.main_gpu if main_gpu is None else main_gpu
     notify = progress or (
         lambda message: print(f"osai: calibration {message}", file=sys.stderr, flush=True)
     )
@@ -384,8 +401,8 @@ def calibrate_training(
                                     multi_gpu=multi_gpu,
                                     devices=benchmark.devices,
                                     split_mode=split_mode,
-                                    tensor_split=tensor_split,
-                                    main_gpu=main_gpu,
+                                    tensor_split=effective_tensor_split,
+                                    main_gpu=effective_main_gpu,
                                     auto_settings=False,
                                     calibration_pilot=True,
                                 ),
@@ -512,6 +529,8 @@ def calibrate_training(
                         benchmark.devices,
                         # Short pilot rows do not measure sustained device throughput.
                         (),
+                        effective_tensor_split,
+                        effective_main_gpu,
                     )
                     score = after_test if after_test is not None else last
                     if score < best_test_loss:

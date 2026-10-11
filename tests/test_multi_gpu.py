@@ -8,6 +8,7 @@ from osai.config import ModelFormat, TrainingConfig
 from osai.errors import ConfigurationError
 from osai.hardware import Accelerator
 from osai.multi_gpu import (
+    automatic_llama_device_plan,
     available_llama_devices,
     llama_device_arguments,
     llama_device_free_bytes,
@@ -108,6 +109,47 @@ def test_llama_metal_multi_gpu_uses_explicit_physical_devices(tmp_path: Path):
     command = llama_device_arguments(Accelerator.METAL, settings)
     assert command[command.index("-dev") + 1] == "MTL0,MTL1"
     assert command[command.index("-sm") + 1] == "layer"
+
+
+@pytest.mark.parametrize("prefix", ["MTL", "CUDA", "Vulkan"])
+def test_automatic_sharding_weights_unequal_gpus_and_uses_largest_as_main(prefix):
+    gib = 1024**3
+    devices = (f"{prefix}0", f"{prefix}1")
+    plan = automatic_llama_device_plan(
+        devices,
+        {devices[0]: 4 * gib, devices[1]: 8 * gib},
+    )
+
+    assert plan.devices == devices
+    assert plan.main_gpu == 1
+    assert len(plan.tensor_split) == 2
+    assert plan.tensor_split[1] > plan.tensor_split[0] * 1.9
+
+    command = llama_device_arguments(
+        Accelerator.METAL if prefix == "MTL" else Accelerator.CUDA,
+        _config(
+            Path("/tmp"),
+            devices=devices,
+            tensor_split=plan.tensor_split,
+            main_gpu=plan.main_gpu,
+        ),
+    )
+    assert command[command.index("-mg") + 1] == "1"
+    assert "-ts" in command
+
+
+@pytest.mark.parametrize("count,memory_gib", [(2, 3), (2, 4), (3, 4)])
+def test_automatic_sharding_uses_every_equal_memory_card(count, memory_gib):
+    devices = tuple(f"MTL{index}" for index in range(count))
+    plan = automatic_llama_device_plan(
+        devices,
+        {device: memory_gib * 1024**3 for device in devices},
+    )
+
+    assert plan.devices == devices
+    assert plan.main_gpu == 0
+    assert len(plan.tensor_split) == count
+    assert len(set(plan.tensor_split)) == 1
 
 
 def test_intel_mac_pro_uses_every_discrete_metal_gpu(monkeypatch, tmp_path: Path):

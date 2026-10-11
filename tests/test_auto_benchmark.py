@@ -34,7 +34,16 @@ def test_benchmark_downgrades_failed_profile_and_reuses_cache(monkeypatch, tmp_p
     monkeypatch.setattr("osai.auto_benchmark.select_llama_accelerator", lambda _: Accelerator.CPU)
     calls = []
 
-    def probe(_binary, _model, settings, _accelerator, _device, _adapter):
+    def probe(
+        _binary,
+        _model,
+        settings,
+        _accelerator,
+        _device,
+        _adapter,
+        _tensor_split,
+        _main_gpu,
+    ):
         calls.append(settings.profile)
         if settings.profile == "maximum":
             raise RuntimeError("out of memory")
@@ -85,7 +94,9 @@ def test_benchmark_probes_all_cuda_model_shards_together(monkeypatch, tmp_path: 
     probed = []
     monkeypatch.setattr(
         "osai.auto_benchmark._probe_llama",
-        lambda _binary, _model, _settings, _accelerator, device, _adapter: probed.append(device),
+        lambda _binary, _model, _settings, _accelerator, device, _adapter, _split, _main: (
+            probed.append(device)
+        ),
     )
 
     selected = benchmark_auto_settings(
@@ -140,8 +151,8 @@ def test_benchmark_reserves_gpu_memory_for_backward_pass(monkeypatch, tmp_path: 
     probed = []
     monkeypatch.setattr(
         "osai.auto_benchmark._probe_llama",
-        lambda _binary, _model, settings, _accelerator, _device, _adapter: probed.append(
-            settings.profile
+        lambda _binary, _model, settings, _accelerator, _device, _adapter, _split, _main: (
+            probed.append(settings.profile)
         ),
     )
 
@@ -174,8 +185,8 @@ def test_two_12_gib_gpus_select_more_context_with_model_sharding(monkeypatch, tm
     probed = []
     monkeypatch.setattr(
         "osai.auto_benchmark._probe_llama",
-        lambda _binary, _model, settings, _accelerator, device, _adapter: probed.append(
-            (settings.max_seq_length, device)
+        lambda _binary, _model, settings, _accelerator, device, _adapter, _split, _main: (
+            probed.append((settings.max_seq_length, device))
         ),
     )
 
@@ -185,6 +196,47 @@ def test_two_12_gib_gpus_select_more_context_with_model_sharding(monkeypatch, tm
     assert selected.settings.max_seq_length == 2048
     assert selected.settings.gguf_batch_size == 1
     assert probed == [(2048, "CUDA0,CUDA1")]
+
+
+def test_asymmetric_metal_gpus_use_vram_weighted_probe_and_largest_main(monkeypatch, tmp_path):
+    model = _model(tmp_path)
+    binary = tmp_path / "llama-completion"
+    binary.write_bytes(b"binary")
+    monkeypatch.setattr("osai.auto_settings.physical_memory_bytes", lambda: 64 * 1024**3)
+    monkeypatch.setattr("osai.auto_benchmark.llama_binary", lambda _name: binary)
+    monkeypatch.setattr("osai.auto_benchmark.llama_runtime_build", lambda: tmp_path / "native")
+    monkeypatch.setattr("osai.auto_benchmark.select_llama_accelerator", lambda _: Accelerator.METAL)
+    monkeypatch.setattr(
+        "osai.auto_benchmark.available_llama_devices",
+        lambda _binary, _accelerator, **_kwargs: ("MTL0", "MTL1"),
+    )
+    monkeypatch.setattr(
+        "osai.auto_benchmark.llama_device_free_bytes",
+        lambda _binary, _accelerator: {
+            "MTL0": 4 * 1024**3,
+            "MTL1": 8 * 1024**3,
+        },
+    )
+    probed = []
+    monkeypatch.setattr(
+        "osai.auto_benchmark._probe_llama",
+        lambda _binary, _model, _settings, _accelerator, device, _adapter, split, main: (
+            probed.append((device, split, main))
+        ),
+    )
+
+    selected = benchmark_auto_settings(
+        model,
+        engine=Engine.LLAMA_CPP,
+        accelerator="metal",
+        multi_gpu="on",
+        force=True,
+    )
+
+    assert selected.devices == ("MTL0", "MTL1")
+    assert selected.main_gpu == 1
+    assert selected.tensor_split[1] > selected.tensor_split[0] * 1.9
+    assert probed == [("MTL0,MTL1", selected.tensor_split, 1)]
 
 
 def test_two_3_gib_gpus_can_fit_a_sharded_compact_model(monkeypatch, tmp_path):
@@ -219,7 +271,9 @@ def test_two_3_gib_gpus_can_fit_a_sharded_compact_model(monkeypatch, tmp_path):
     probed = []
     monkeypatch.setattr(
         "osai.auto_benchmark._probe_llama",
-        lambda _binary, _model, _settings, _accelerator, device, _adapter: probed.append(device),
+        lambda _binary, _model, _settings, _accelerator, device, _adapter, _split, _main: (
+            probed.append(device)
+        ),
     )
 
     selected = benchmark_auto_settings(model, engine=Engine.LLAMA_CPP, multi_gpu="on")
@@ -249,8 +303,8 @@ def test_full_context_is_probed_across_gpu_shards_with_smaller_memory_settings(
     probed = []
     monkeypatch.setattr(
         "osai.auto_benchmark._probe_llama",
-        lambda _binary, _model, settings, _accelerator, device, _adapter: probed.append(
-            (settings, device)
+        lambda _binary, _model, settings, _accelerator, device, _adapter, _split, _main: (
+            probed.append((settings, device))
         ),
     )
     result = benchmark_auto_settings(

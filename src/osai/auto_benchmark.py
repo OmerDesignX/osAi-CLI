@@ -13,6 +13,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -24,7 +25,11 @@ from .auto_settings import AutoTrainingSettings, select_auto_settings
 from .errors import ConfigurationError, DependencyError
 from .formats import ModelInspection
 from .hardware import Accelerator, Engine, select_llama_accelerator
-from .multi_gpu import available_llama_devices, llama_device_free_bytes
+from .multi_gpu import (
+    automatic_llama_device_plan,
+    available_llama_devices,
+    llama_device_free_bytes,
+)
 from .offline import offline_environment
 from .paths import llama_binary, llama_runtime_build
 
@@ -47,6 +52,8 @@ class BenchmarkResult:
     devices: tuple[str, ...]
     elapsed_seconds: float
     cached: bool = False
+    tensor_split: tuple[float, ...] = ()
+    main_gpu: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -56,6 +63,8 @@ class BenchmarkResult:
             "devices": list(self.devices),
             "elapsed_seconds": self.elapsed_seconds,
             "cached": self.cached,
+            "tensor_split": list(self.tensor_split),
+            "main_gpu": self.main_gpu,
         }
 
 
@@ -114,11 +123,13 @@ def benchmark_auto_settings(
             if chosen and all(device in free_by_device for device in chosen)
             else ()
         )
+        device_plan = automatic_llama_device_plan(chosen, free_by_device)
         executable = binary
     elif engine is Engine.MLX:
         selected = Accelerator.CPU if accelerator == "cpu" else Accelerator.AUTO
         chosen = ()
         free_gpu_bytes = ()
+        device_plan = automatic_llama_device_plan((), {})
         executable = Path(sys.executable)
     else:
         raise ConfigurationError("automatic benchmark requires a resolved engine")
@@ -130,7 +141,7 @@ def benchmark_auto_settings(
         adapter / "adapters.safetensors" if adapter is not None and adapter.is_dir() else adapter
     )
     key_data = {
-        "schema": 3,
+        "schema": 4,
         "required_context": required_context,
         "model": str(model.path.resolve()),
         "shards": [
@@ -155,9 +166,21 @@ def benchmark_auto_settings(
     if not force:
         cached = _read_cache(cache, model, engine, required_context)
         if cached is not None and _gpu_profile_fits(
-            cached.profile, model.size_bytes, free_gpu_bytes
+            cached.profile,
+            model.size_bytes,
+            free_gpu_bytes,
+            device_plan.tensor_split,
         ):
-            return BenchmarkResult(cached, engine.value, selected.value, chosen, 0.0, True)
+            return BenchmarkResult(
+                cached,
+                engine.value,
+                selected.value,
+                chosen,
+                0.0,
+                True,
+                device_plan.tensor_split,
+                device_plan.main_gpu,
+            )
 
     started = time.monotonic()
     failures: list[str] = []
@@ -165,7 +188,12 @@ def benchmark_auto_settings(
         settings = select_auto_settings(model, engine=engine, profile_limit=profile)
         if required_context is not None:
             settings = _fit_required_context(settings, required_context)
-        if not _gpu_profile_fits(settings.profile, model.size_bytes, free_gpu_bytes):
+        if not _gpu_profile_fits(
+            settings.profile,
+            model.size_bytes,
+            free_gpu_bytes,
+            device_plan.tensor_split,
+        ):
             failures.append(f"{profile}: insufficient free GPU memory for training reserve")
             continue
         try:
@@ -177,6 +205,8 @@ def benchmark_auto_settings(
                     selected,
                     ",".join(chosen),
                     adapter,
+                    device_plan.tensor_split,
+                    device_plan.main_gpu,
                 )
             else:
                 _probe_mlx(model.path, settings, adapter)
@@ -184,7 +214,14 @@ def benchmark_auto_settings(
             failures.append(f"{profile}: {exc}")
             continue
         result = BenchmarkResult(
-            settings, engine.value, selected.value, chosen, time.monotonic() - started
+            settings,
+            engine.value,
+            selected.value,
+            chosen,
+            time.monotonic() - started,
+            False,
+            device_plan.tensor_split,
+            device_plan.main_gpu,
         )
         temporary = cache.with_name(f"{cache.stem}-{os.getpid()}-{time.time_ns()}.tmp")
         try:
@@ -222,7 +259,12 @@ def _fit_required_context(
     )
 
 
-def _gpu_profile_fits(profile: str, model_bytes: int, free_bytes: tuple[int, ...]) -> bool:
+def _gpu_profile_fits(
+    profile: str,
+    model_bytes: int,
+    free_bytes: tuple[int, ...],
+    tensor_split: tuple[float, ...] = (),
+) -> bool:
     if not free_bytes:
         return True
     training_reserve = {
@@ -231,11 +273,13 @@ def _gpu_profile_fits(profile: str, model_bytes: int, free_bytes: tuple[int, ...
         "performance": 6 * 1024**3,
         "maximum": 10 * 1024**3,
     }[profile]
-    device_count = len(free_bytes)
+    weights = tensor_split if len(tensor_split) == len(free_bytes) else (1.0,) * len(free_bytes)
+    total_weight = sum(weights)
     return all(
-        (model_bytes + training_reserve) / device_count + max(256 * 1024**2, available // 10)
+        (model_bytes + training_reserve) * weight / total_weight
+        + max(256 * 1024**2, available // 10)
         <= available
-        for available in free_bytes
+        for available, weight in zip(free_bytes, weights, strict=True)
     )
 
 
@@ -246,6 +290,8 @@ def _probe_llama(
     accelerator: Accelerator,
     device: str,
     adapter: Path | None,
+    tensor_split: tuple[float, ...] = (),
+    main_gpu: int = 0,
 ) -> None:
     prompt = "A short local hardware benchmark. " * min(64, max(4, settings.max_seq_length // 24))
     command = [
@@ -276,7 +322,12 @@ def _probe_llama(
     else:
         command += ["-dev", device, "-ngl", "auto"]
         if "," in device:
-            command += ["-sm", "layer"]
+            command += ["-sm", "layer", "-mg", str(main_gpu)]
+            if tensor_split:
+                command += [
+                    "-ts",
+                    ",".join(format(value, ".8g") for value in tensor_split),
+                ]
     if adapter is not None:
         command += ["--lora", str(adapter)]
     completed = subprocess.run(
@@ -290,7 +341,7 @@ def _probe_llama(
         env=offline_environment(),
     )
     if completed.returncode:
-        raise RuntimeError((completed.stderr + "\n" + completed.stdout)[-500:].strip())
+        raise RuntimeError(_native_failure(completed.stderr + "\n" + completed.stdout))
 
 
 def _probe_mlx(model: Path, settings: AutoTrainingSettings, adapter: Path | None) -> None:
@@ -321,7 +372,24 @@ def _probe_mlx(model: Path, settings: AutoTrainingSettings, adapter: Path | None
         env=offline_environment(),
     )
     if completed.returncode:
-        raise RuntimeError((completed.stderr + "\n" + completed.stdout)[-500:].strip())
+        raise RuntimeError(_native_failure(completed.stderr + "\n" + completed.stdout))
+
+
+def _native_failure(output: str) -> str:
+    """Keep actionable native diagnostics instead of only the final init lines."""
+
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    important = [
+        line
+        for line in lines
+        if re.search(
+            r"\b(?:error|failed|failure|out of memory|cannot|could not|alloc|metal|cuda|vulkan)\b",
+            line,
+            re.I,
+        )
+    ]
+    selected = important[-12:] or lines[-12:]
+    return " | ".join(selected)[-2000:] or "native inference process failed"
 
 
 def _read_cache(

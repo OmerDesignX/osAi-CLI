@@ -6,6 +6,7 @@ import math
 import re
 import subprocess
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
@@ -19,6 +20,41 @@ class DeviceSettings(Protocol):
     split_mode: str
     tensor_split: Sequence[float]
     main_gpu: int
+
+
+@dataclass(frozen=True, slots=True)
+class LlamaDevicePlan:
+    """A stable llama.cpp model-sharding plan for heterogeneous GPUs."""
+
+    devices: tuple[str, ...]
+    tensor_split: tuple[float, ...]
+    main_gpu: int
+
+
+def automatic_llama_device_plan(
+    devices: Sequence[str], free_by_device: dict[str, int]
+) -> LlamaDevicePlan:
+    """Weight shards by usable VRAM and keep non-shard buffers on the largest GPU.
+
+    llama.cpp accepts relative ``--tensor-split`` weights.  Passing usable MiB
+    keeps asymmetric cards from receiving equal model shares, while selecting
+    the roomiest card as ``--main-gpu`` leaves the smaller cards available for
+    layer shards.  If a backend cannot report memory, llama.cpp retains its own
+    automatic distribution.
+    """
+
+    selected = tuple(devices)
+    if len(selected) < 2:
+        return LlamaDevicePlan(selected, (), 0)
+    if not all(
+        isinstance(free_by_device.get(device), int) and free_by_device[device] > 0
+        for device in selected
+    ):
+        return LlamaDevicePlan(selected, (), 0)
+    available = tuple(free_by_device[device] for device in selected)
+    usable = tuple(max(1, value - max(512 * 1024**2, value // 10)) for value in available)
+    weights = tuple(round(value / 1024**2, 3) for value in usable)
+    return LlamaDevicePlan(selected, weights, max(range(len(available)), key=available.__getitem__))
 
 
 def available_llama_devices(
