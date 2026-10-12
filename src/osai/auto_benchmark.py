@@ -14,6 +14,7 @@ import json
 import math
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -341,7 +342,12 @@ def _probe_llama(
         env=offline_environment(),
     )
     if completed.returncode:
-        raise RuntimeError(_native_failure(completed.stderr + "\n" + completed.stdout))
+        raise RuntimeError(
+            _native_failure(
+                completed.stderr + "\n" + completed.stdout,
+                returncode=completed.returncode,
+            )
+        )
 
 
 def _probe_mlx(model: Path, settings: AutoTrainingSettings, adapter: Path | None) -> None:
@@ -372,10 +378,15 @@ def _probe_mlx(model: Path, settings: AutoTrainingSettings, adapter: Path | None
         env=offline_environment(),
     )
     if completed.returncode:
-        raise RuntimeError(_native_failure(completed.stderr + "\n" + completed.stdout))
+        raise RuntimeError(
+            _native_failure(
+                completed.stderr + "\n" + completed.stdout,
+                returncode=completed.returncode,
+            )
+        )
 
 
-def _native_failure(output: str) -> str:
+def _native_failure(output: str, *, returncode: int | None = None) -> str:
     """Keep actionable native diagnostics instead of only the final init lines."""
 
     lines = [line.strip() for line in output.splitlines() if line.strip()]
@@ -383,13 +394,29 @@ def _native_failure(output: str) -> str:
         line
         for line in lines
         if re.search(
-            r"\b(?:error|failed|failure|out of memory|cannot|could not|alloc|metal|cuda|vulkan)\b",
+            r"(?:\b(?:error|failed|failure|out of memory|cannot|could not|alloc|metal|"
+            r"cuda|vulkan|abort|segmentation|bus error)\b|(?:assert|fatal|traceback))",
             line,
             re.I,
         )
     ]
     selected = important[-12:] or lines[-12:]
-    return " | ".join(selected)[-2000:] or "native inference process failed"
+    detail = " | ".join(selected)[-1800:]
+    status = _native_exit_status(returncode)
+    if detail and status:
+        return f"{status}: {detail}"
+    return detail or status or "native inference process failed"
+
+
+def _native_exit_status(returncode: int | None) -> str:
+    if returncode is None:
+        return ""
+    if returncode < 0:
+        with suppress(ValueError):
+            name = signal.Signals(-returncode).name
+            return f"native inference process terminated by {name}"
+        return f"native inference process terminated by signal {-returncode}"
+    return f"native inference process exited with status {returncode}"
 
 
 def _read_cache(

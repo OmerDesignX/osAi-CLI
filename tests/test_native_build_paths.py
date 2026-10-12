@@ -95,3 +95,25 @@ def test_microsoft_compiler_build_does_not_require_portable_runtime(tmp_path):
     )
     llama_cpp._copy_windows_portable_runtime_dlls(build)
     assert not (build / "bin").exists()
+
+
+def test_discrete_metal_staging_buffers_accept_unaligned_tensor_slices():
+    root = Path(__file__).resolve().parents[1]
+    source = (
+        root / "vendor" / "llama.cpp" / "ggml" / "src" / "ggml-metal" / "ggml-metal-device.m"
+    ).read_text(encoding="utf-8")
+    setter = source.split("void ggml_metal_buffer_set_tensor", 1)[1].split(
+        "void ggml_metal_buffer_get_tensor", 1
+    )[0]
+    getter = source.split("void ggml_metal_buffer_get_tensor", 1)[1].split(
+        "bool ggml_metal_buffer_cpy_tensor", 1
+    )[0]
+
+    assert "newBufferWithBytesNoCopy:data" not in setter
+    assert "newBufferWithBytesNoCopy:data" not in getter
+    assert "newBufferWithLength:size" in setter
+    assert "memcpy([buf_src contents], data, size)" in setter
+    assert "newBufferWithLength:size" in getter
+    assert getter.index("waitUntilCompleted") < getter.index(
+        "memcpy(data, [buf_dst contents], size)"
+    )

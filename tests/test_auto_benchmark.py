@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from osai.auto_benchmark import benchmark_auto_settings
+from osai.auto_benchmark import _native_failure, benchmark_auto_settings
 from osai.config import ModelFormat
 from osai.errors import ConfigurationError
 from osai.formats import ModelInspection, QuantizationSpec
@@ -346,3 +346,18 @@ def test_successful_benchmark_survives_read_only_cache(monkeypatch, tmp_path: Pa
     selected = benchmark_auto_settings(model, engine=Engine.LLAMA_CPP, force=True)
 
     assert selected.settings.profile == "maximum"
+
+
+def test_native_failure_preserves_assertion_and_termination_signal():
+    output = "\n".join(
+        [
+            "apply_selection_policy_once: prefer use of removable GPUs",
+            "llama backend init",
+            "GGML_ASSERT(buf_src) failed at ggml-metal-device.m:2328",
+        ]
+    )
+
+    detail = _native_failure(output, returncode=-6)
+
+    assert "SIGABRT" in detail
+    assert "GGML_ASSERT(buf_src)" in detail

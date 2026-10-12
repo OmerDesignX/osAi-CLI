@@ -2321,14 +2321,14 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
     }
 
     @autoreleasepool {
-        // src
-        void * data_ptr = (void *)(uintptr_t) data; // "const cast" the src data
-        id<MTLBuffer> buf_src = [buf->dev->mtl_device newBufferWithBytesNoCopy:data_ptr
-                                                               length:size
-                                                              options:MTLResourceStorageModeShared
-                                                          deallocator:nil];
+        // newBufferWithBytesNoCopy requires page-aligned host pointers on
+        // discrete Metal GPUs. Tensor slices are not guaranteed to be aligned,
+        // so use an owned staging buffer before copying into private VRAM.
+        id<MTLBuffer> buf_src = [buf->dev->mtl_device newBufferWithLength:size
+                                                                  options:MTLResourceStorageModeShared];
 
         GGML_ASSERT(buf_src);
+        memcpy([buf_src contents], data, size);
 
         // dst
         struct ggml_metal_buffer_id bid_dst = ggml_metal_buffer_get_id(buf, tensor);
@@ -2363,6 +2363,7 @@ void ggml_metal_buffer_set_tensor(ggml_metal_buffer_t buf, struct ggml_tensor * 
 
         dispatch_semaphore_wait(completion_semaphore, DISPATCH_TIME_FOREVER);
         dispatch_release(completion_semaphore);
+        [buf_src release];
 
         //[cmd_buf waitUntilCompleted];
     }
@@ -2380,10 +2381,8 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
         bid_src.offs += offset;
 
         // dst
-        id<MTLBuffer> buf_dst = [buf->dev->mtl_device newBufferWithBytesNoCopy:data
-                                                               length:size
-                                                              options:MTLResourceStorageModeShared
-                                                          deallocator:nil];
+        id<MTLBuffer> buf_dst = [buf->dev->mtl_device newBufferWithLength:size
+                                                                  options:MTLResourceStorageModeShared];
 
         GGML_ASSERT(buf_dst);
 
@@ -2403,6 +2402,8 @@ void ggml_metal_buffer_get_tensor(ggml_metal_buffer_t buf, const struct ggml_ten
 
         [cmd_buf commit];
         [cmd_buf waitUntilCompleted];
+        memcpy(data, [buf_dst contents], size);
+        [buf_dst release];
     }
 }
 
