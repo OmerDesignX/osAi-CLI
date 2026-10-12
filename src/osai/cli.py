@@ -18,7 +18,7 @@ from .auto_benchmark import benchmark_auto_settings
 from .backends.alignment import AlignmentOptions, align_gguf, align_mlx
 from .backends.llama_cpp import build_llama_cpp, validate_adapter
 from .backends.llama_gradient import LlamaGradientOptions, train_gradient_gguf
-from .backends.llama_utils import gguf_adapter_training_shape
+from .backends.llama_utils import combine_lora_adapters, gguf_adapter_training_shape
 from .bundle import verify_model_bundle
 from .calibration import calibrate_training
 from .catalog import ModelTier, bundled_root, list_catalog, resolve_model
@@ -494,6 +494,15 @@ def build_parser() -> argparse.ArgumentParser:
     export_parser.add_argument("--output", required=True, type=Path)
     export_parser.add_argument("--dtype", choices=["f16", "f32"], default="f16")
     export_parser.set_defaults(handler=_export_gguf)
+
+    aggregate_parser = subparsers.add_parser(
+        "aggregate-gguf-adapters",
+        help="combine compatible cluster worker adapters by record count",
+    )
+    aggregate_parser.add_argument("--adapter", action="append", required=True, type=Path)
+    aggregate_parser.add_argument("--records", action="append", required=True, type=int)
+    aggregate_parser.add_argument("--output", required=True, type=Path)
+    aggregate_parser.set_defaults(handler=_aggregate_gguf_adapters)
 
     merged_parser = subparsers.add_parser(
         "export-merged", help="fuse a saved base and adapter into standalone weights"
@@ -1823,6 +1832,14 @@ def _export_gguf(args: argparse.Namespace) -> int:
             "lora_alpha": result.lora_alpha,
         }
     )
+    return 0
+
+
+def _aggregate_gguf_adapters(args: argparse.Namespace) -> int:
+    if len(args.adapter) != len(args.records):
+        raise ConfigurationError("repeat --records once for each --adapter")
+    result = combine_lora_adapters(tuple(args.adapter), tuple(args.records), args.output)
+    _print_json({"status": "completed", **result})
     return 0
 
 

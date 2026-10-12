@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -116,6 +117,7 @@ def build_llama_cpp(
                 with_vulkan,
             )
             process = run_logged(build_command, log_path=destination, cwd=root)
+            _verify_native_backend(build, selected, with_vulkan)
             break
         except TrainingError:
             if index == len(candidates) - 1:
@@ -358,6 +360,11 @@ def _configure(
         "-DLLAMA_CURL=OFF",
         "-DLLAMA_BUILD_EXAMPLES=ON",
         "-DCMAKE_BUILD_TYPE=Release",
+        # A static backend registry is considerably more reliable in packaged
+        # desktop installs. It also prevents a copied executable from silently
+        # losing Metal/CUDA/Vulkan because a companion plugin was not loaded.
+        "-DBUILD_SHARED_LIBS=OFF",
+        "-DGGML_BACKEND_DL=OFF",
         # Windows setup compiles locally: detect the host CPU rather than use
         # GGML's default AVX2/FMA flags, which crash on older x64 processors.
         # Keep other platforms unchanged (some macOS feature probes stall).
@@ -371,6 +378,51 @@ def _configure(
         if architectures:
             flags.append(f"-DCMAKE_CUDA_ARCHITECTURES={';'.join(architectures)}")
     run_logged(flags, log_path=log_path, cwd=root)
+
+
+def _verify_native_backend(
+    build: Path, accelerator: Accelerator, also_vulkan: bool = False
+) -> None:
+    """Refuse to stamp a GPU build that cannot enumerate its native devices."""
+
+    if accelerator is Accelerator.CPU:
+        return
+    suffix = ".exe" if os.name == "nt" else ""
+    candidates = (
+        build / "bin" / f"llama-completion{suffix}",
+        build / "bin" / "Release" / f"llama-completion{suffix}",
+        build / "Release" / f"llama-completion{suffix}",
+    )
+    binary = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if binary is None:
+        raise TrainingError("the native build produced no llama-completion executable")
+    try:
+        probe = subprocess.run(
+            [str(binary), "--list-devices"],
+            capture_output=True,
+            text=True,
+            # Metal can spend tens of seconds compiling its first shader
+            # library on older Intel Macs.  Keep this bounded, but do not
+            # misclassify a healthy Radeon backend as missing while it warms.
+            timeout=90,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise TrainingError(f"could not verify the {accelerator.value} backend: {exc}") from exc
+    output = probe.stdout + "\n" + (probe.stderr or "")
+    expected = {
+        Accelerator.METAL: r"^\s*MTL\d+:",
+        Accelerator.CUDA: r"^\s*CUDA\d+:",
+        Accelerator.VULKAN: r"^\s*Vulkan\d+:",
+    }[accelerator]
+    if probe.returncode or not re.search(expected, output, re.M | re.I):
+        detail = " | ".join(line.strip() for line in output.splitlines() if line.strip())
+        raise TrainingError(
+            f"the compiled {accelerator.value} backend reports no usable devices"
+            + (f": {detail[-1200:]}" if detail else "")
+        )
+    if also_vulkan and not re.search(r"^\s*Vulkan\d+:", output, re.M | re.I):
+        raise TrainingError("the combined CUDA/Vulkan build cannot enumerate its Vulkan devices")
 
 
 def _cuda_architectures() -> tuple[str, ...]:

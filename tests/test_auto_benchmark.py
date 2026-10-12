@@ -91,6 +91,10 @@ def test_benchmark_probes_all_cuda_model_shards_together(monkeypatch, tmp_path: 
         "osai.auto_benchmark.available_llama_devices",
         lambda _binary, _accelerator, **_kwargs: devices,
     )
+    monkeypatch.setattr(
+        "osai.auto_benchmark.llama_device_free_bytes",
+        lambda _binary, _accelerator: {},
+    )
     probed = []
     monkeypatch.setattr(
         "osai.auto_benchmark._probe_llama",

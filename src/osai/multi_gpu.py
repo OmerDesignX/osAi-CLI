@@ -68,18 +68,7 @@ def available_llama_devices(
 
     if binary is None or accelerator is Accelerator.CPU:
         return ()
-    try:
-        result = subprocess.run(
-            [str(binary), "--list-devices"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return ()
-    if result.returncode:
-        return ()
+    result, output = _llama_device_report(binary, accelerator)
     prefix = {
         Accelerator.CUDA: "CUDA",
         Accelerator.VULKAN: "Vulkan",
@@ -91,7 +80,7 @@ def available_llama_devices(
         dict(
             re.findall(
                 rf"^\s*({prefix}\d+):\s*(.+)$",
-                result.stdout + "\n" + (getattr(result, "stderr", "") or ""),
+                output,
                 re.M | re.I,
             )
         ).items()
@@ -123,10 +112,50 @@ def available_llama_devices(
             return tuple(device for device, _label in discrete)
     selected = tuple(device for device, _label in devices)
     if accelerator is Accelerator.CUDA and include_amd_vulkan:
-        selected += _dedicated_amd_vulkan_ids(
-            result.stdout + "\n" + (getattr(result, "stderr", "") or "")
-        )
+        selected += _dedicated_amd_vulkan_ids(output)
     return selected
+
+
+def _llama_device_report(binary: Path, accelerator: Accelerator):
+    """Run llama.cpp discovery without hiding an unusable native backend.
+
+    Returning an empty inventory for a GPU build made the desktop app report
+    only "no usable devices", which concealed loader failures and Metal access
+    problems. CPU discovery remains intentionally quiet, while a selected GPU
+    backend now includes the bounded native diagnostic in the error.
+    """
+
+    try:
+        result = subprocess.run(
+            [str(binary), "--list-devices"],
+            capture_output=True,
+            text=True,
+            # The first Metal process can compile its shader library before it
+            # can enumerate devices, especially on Intel Macs with AMD GPUs.
+            timeout=90,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ConfigurationError(
+            f"{accelerator.value} device discovery timed out; restart osAi and try again"
+        ) from exc
+    except OSError as exc:
+        raise ConfigurationError(
+            f"could not start the {accelerator.value} device probe: {exc}"
+        ) from exc
+    output = result.stdout + "\n" + (getattr(result, "stderr", "") or "")
+    if result.returncode:
+        detail = _bounded_device_diagnostic(output)
+        raise ConfigurationError(
+            f"the {accelerator.value} device probe exited with {result.returncode}"
+            + (f": {detail}" if detail else "")
+        )
+    return result, output
+
+
+def _bounded_device_diagnostic(output: str) -> str:
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    return " | ".join(lines[-6:])[-1200:]
 
 
 def _dedicated_amd_vulkan_ids(output: str) -> tuple[str, ...]:
@@ -143,18 +172,7 @@ def llama_device_free_bytes(binary: Path | None, accelerator: Accelerator) -> di
 
     if binary is None or accelerator is Accelerator.CPU:
         return {}
-    try:
-        result = subprocess.run(
-            [str(binary), "--list-devices"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return {}
-    if result.returncode:
-        return {}
+    _result, output = _llama_device_report(binary, accelerator)
     prefix = {
         Accelerator.CUDA: "CUDA",
         Accelerator.VULKAN: "Vulkan",
@@ -162,7 +180,6 @@ def llama_device_free_bytes(binary: Path | None, accelerator: Accelerator) -> di
     }.get(accelerator)
     if prefix is None:
         return {}
-    output = result.stdout + "\n" + (getattr(result, "stderr", "") or "")
     free = {
         device: int(free) * 1024**2
         for device, free in re.findall(

@@ -259,6 +259,55 @@ def _combine_lora_adapters(
     _verify_adapter(destination, architecture)
 
 
+def combine_lora_adapters(
+    adapters: tuple[Path, ...],
+    record_counts: tuple[int, ...],
+    destination: Path,
+) -> dict[str, object]:
+    """Aggregate compatible GGUF LoRA workers without touching the base model."""
+
+    if len(adapters) < 2 or len(adapters) != len(record_counts):
+        raise ConfigurationError("at least two adapters and matching record counts are required")
+    resolved = tuple(path.expanduser().resolve() for path in adapters)
+    for adapter in resolved:
+        if not adapter.is_file():
+            raise ConfigurationError(f"worker adapter does not exist: {adapter}")
+    rank, _layers, _targets, scale = gguf_adapter_training_shape(resolved[0])
+    gguf = _import_gguf()
+    reader = gguf.GGUFReader(resolved[0])
+    architecture = str(reader.get_field("general.architecture").contents())
+    alpha = float(reader.get_field(gguf.Keys.Adapter.LORA_ALPHA).contents())
+    for adapter in resolved[1:]:
+        other_rank, _other_layers, _other_targets, other_scale = gguf_adapter_training_shape(
+            adapter
+        )
+        if other_rank != rank or not math.isclose(other_scale, scale, rel_tol=1e-5):
+            raise VerificationError("worker adapters use different LoRA ranks or scales")
+    output = destination.expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    np = _import_numpy()
+    _combine_lora_adapters(
+        resolved,
+        record_counts,
+        output,
+        architecture,
+        alpha,
+        rank,
+        np,
+    )
+    combined_rank, layers, targets, combined_scale = gguf_adapter_training_shape(output)
+    return {
+        "adapter": str(output),
+        "architecture": architecture,
+        "workers": len(resolved),
+        "records": sum(record_counts),
+        "rank": combined_rank,
+        "layers": layers,
+        "targets": list(targets),
+        "scale": combined_scale,
+    }
+
+
 def _evaluate_loss(
     binary: Path,
     model: Path,

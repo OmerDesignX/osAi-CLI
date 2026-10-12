@@ -20,6 +20,7 @@ from osai.backends.llama_utils import (
     _combine_lora_adapters,
     _import_gguf,
     _write_adapter,
+    combine_lora_adapters,
     gguf_adapter_training_shape,
 )
 from osai.cli import build_parser
@@ -127,6 +128,33 @@ def test_parallel_adapter_combination_preserves_weighted_lora_delta(tmp_path: Pa
         2 * first["blk.0.ffn_down.weight.lora_b"] @ first["blk.0.ffn_down.weight.lora_a"]
     ) + 0.75 * (2 * second["blk.0.ffn_down.weight.lora_b"] @ second["blk.0.ffn_down.weight.lora_a"])
     np.testing.assert_allclose(actual, expected)
+
+    published = tmp_path / "published.gguf"
+    summary = combine_lora_adapters(paths, (1, 3), published)
+    assert summary["workers"] == 2
+    assert summary["records"] == 4
+    assert summary["rank"] == 4
+    assert published.is_file()
+
+
+def test_cluster_adapter_command_requires_matching_record_counts():
+    args = build_parser().parse_args(
+        [
+            "aggregate-gguf-adapters",
+            "--adapter",
+            "one.gguf",
+            "--adapter",
+            "two.gguf",
+            "--records",
+            "10",
+            "--records",
+            "20",
+            "--output",
+            "combined.gguf",
+        ]
+    )
+    assert args.records == [10, 20]
+    assert [path.name for path in args.adapter] == ["one.gguf", "two.gguf"]
 
 
 def test_cpu_gradient_command_disables_repack_and_devices():

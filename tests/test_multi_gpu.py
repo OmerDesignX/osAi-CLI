@@ -339,6 +339,19 @@ def test_native_device_inventory_reports_free_gpu_memory(monkeypatch, tmp_path):
     }
 
 
+def test_gpu_probe_failure_preserves_native_diagnostic(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "osai.multi_gpu.subprocess.run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=1,
+            stdout="Available devices:\n  (none)\n",
+            stderr="Metal library could not initialize Radeon GPU\n",
+        ),
+    )
+    with pytest.raises(ConfigurationError, match="Metal library could not initialize"):
+        available_llama_devices(tmp_path / "llama-completion", Accelerator.METAL)
+
+
 def test_typed_vulkan_inventory_retains_free_memory(monkeypatch, tmp_path):
     class Completed:
         returncode = 0

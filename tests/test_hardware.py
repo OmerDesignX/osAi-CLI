@@ -185,12 +185,53 @@ def test_local_windows_build_detects_cpu_without_changing_gpu_backend(
     llama_cpp._configure("cmake", tmp_path, tmp_path / "build", tmp_path / "log", accelerator)
     flags = commands[0]
     assert f"-DGGML_NATIVE={native}" in flags
+    assert "-DBUILD_SHARED_LIBS=OFF" in flags
+    assert "-DGGML_BACKEND_DL=OFF" in flags
     for backend, selected in (
         ("METAL", Accelerator.METAL),
         ("CUDA", Accelerator.CUDA),
         ("VULKAN", Accelerator.VULKAN),
     ):
         assert f"-DGGML_{backend}={'ON' if accelerator is selected else 'OFF'}" in flags
+
+
+def test_metal_build_verification_accepts_every_enumerated_gpu(monkeypatch, tmp_path):
+    binary = tmp_path / "bin" / "llama-completion"
+    binary.parent.mkdir()
+    binary.write_bytes(b"binary")
+    monkeypatch.setattr(
+        llama_cpp.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout=(
+                "Available devices:\n"
+                "  MTL0: Radeon RX 580 (4096 MiB, 3600 MiB free)\n"
+                "  MTL1: Radeon RX Vega 64 (8192 MiB, 7300 MiB free)\n"
+            ),
+            stderr="",
+        ),
+    )
+
+    llama_cpp._verify_native_backend(tmp_path, Accelerator.METAL)
+
+
+def test_gpu_build_verification_rejects_a_cpu_only_package(monkeypatch, tmp_path):
+    binary = tmp_path / "bin" / "llama-completion"
+    binary.parent.mkdir()
+    binary.write_bytes(b"binary")
+    monkeypatch.setattr(
+        llama_cpp.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="Available devices:\n  BLAS0: BLAS\n",
+            stderr="ggml_metal_init: no devices found\n",
+        ),
+    )
+
+    with pytest.raises(TrainingError, match="compiled metal backend reports no usable devices"):
+        llama_cpp._verify_native_backend(tmp_path, Accelerator.METAL)
 
 
 def test_explicit_cuda_build_failure_never_switches_backend(monkeypatch, tmp_path):
