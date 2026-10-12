@@ -196,7 +196,8 @@ def test_local_windows_build_detects_cpu_without_changing_gpu_backend(
 
 
 def test_metal_build_verification_accepts_every_enumerated_gpu(monkeypatch, tmp_path):
-    binary = tmp_path / "bin" / "llama-completion"
+    suffix = ".exe" if os.name == "nt" else ""
+    binary = tmp_path / "bin" / f"llama-completion{suffix}"
     binary.parent.mkdir()
     binary.write_bytes(b"binary")
     monkeypatch.setattr(
@@ -217,7 +218,8 @@ def test_metal_build_verification_accepts_every_enumerated_gpu(monkeypatch, tmp_
 
 
 def test_gpu_build_verification_rejects_a_cpu_only_package(monkeypatch, tmp_path):
-    binary = tmp_path / "bin" / "llama-completion"
+    suffix = ".exe" if os.name == "nt" else ""
+    binary = tmp_path / "bin" / f"llama-completion{suffix}"
     binary.parent.mkdir()
     binary.write_bytes(b"binary")
     monkeypatch.setattr(
