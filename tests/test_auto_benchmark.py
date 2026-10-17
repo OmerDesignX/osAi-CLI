@@ -7,6 +7,7 @@ from osai.config import ModelFormat
 from osai.errors import ConfigurationError
 from osai.formats import ModelInspection, QuantizationSpec
 from osai.hardware import Accelerator, Engine
+from osai.multi_gpu import LlamaDeviceInventory
 
 
 def _model(tmp_path: Path) -> ModelInspection:
@@ -22,6 +23,11 @@ def _model(tmp_path: Path) -> ModelInspection:
         block_count=32,
         context_length=4096,
     )
+
+
+def _inventory(devices, free=None, total=None):
+    free = free or {}
+    return LlamaDeviceInventory(tuple(devices), free, total or free)
 
 
 def test_benchmark_downgrades_failed_profile_and_reuses_cache(monkeypatch, tmp_path: Path):
@@ -88,12 +94,8 @@ def test_benchmark_probes_all_cuda_model_shards_together(monkeypatch, tmp_path: 
     monkeypatch.setattr("osai.auto_benchmark.select_llama_accelerator", lambda _: Accelerator.CUDA)
     devices = tuple(f"CUDA{index}" for index in range(count))
     monkeypatch.setattr(
-        "osai.auto_benchmark.available_llama_devices",
-        lambda _binary, _accelerator, **_kwargs: devices,
-    )
-    monkeypatch.setattr(
-        "osai.auto_benchmark.llama_device_free_bytes",
-        lambda _binary, _accelerator: {},
+        "osai.auto_benchmark.llama_device_inventory_details",
+        lambda _binary, _accelerator, **_kwargs: _inventory(devices),
     )
     probed = []
     monkeypatch.setattr(
@@ -122,8 +124,8 @@ def test_benchmark_rejects_integrated_vulkan_device_when_discrete_exists(
         "osai.auto_benchmark.select_llama_accelerator", lambda _: Accelerator.VULKAN
     )
     monkeypatch.setattr(
-        "osai.auto_benchmark.available_llama_devices",
-        lambda _binary, _accelerator, **_kwargs: ("Vulkan1", "Vulkan2"),
+        "osai.auto_benchmark.llama_device_inventory_details",
+        lambda _binary, _accelerator, **_kwargs: _inventory(("Vulkan1", "Vulkan2")),
     )
 
     with pytest.raises(ConfigurationError, match="unavailable"):
@@ -145,12 +147,8 @@ def test_benchmark_reserves_gpu_memory_for_backward_pass(monkeypatch, tmp_path: 
     monkeypatch.setattr("osai.auto_benchmark.llama_runtime_build", lambda: tmp_path / "native")
     monkeypatch.setattr("osai.auto_benchmark.select_llama_accelerator", lambda _: Accelerator.CUDA)
     monkeypatch.setattr(
-        "osai.auto_benchmark.available_llama_devices",
-        lambda _binary, _accelerator, **_kwargs: ("CUDA0",),
-    )
-    monkeypatch.setattr(
-        "osai.auto_benchmark.llama_device_free_bytes",
-        lambda _binary, _accelerator: {"CUDA0": 6 * 1024**3},
+        "osai.auto_benchmark.llama_device_inventory_details",
+        lambda _binary, _accelerator, **_kwargs: _inventory(("CUDA0",), {"CUDA0": 6 * 1024**3}),
     )
     probed = []
     monkeypatch.setattr(
@@ -176,15 +174,11 @@ def test_two_12_gib_gpus_select_more_context_with_model_sharding(monkeypatch, tm
     monkeypatch.setattr("osai.auto_benchmark.llama_runtime_build", lambda: tmp_path / "native")
     monkeypatch.setattr("osai.auto_benchmark.select_llama_accelerator", lambda _: Accelerator.CUDA)
     monkeypatch.setattr(
-        "osai.auto_benchmark.available_llama_devices",
-        lambda _binary, _accelerator, **_kwargs: ("CUDA0", "CUDA1"),
-    )
-    monkeypatch.setattr(
-        "osai.auto_benchmark.llama_device_free_bytes",
-        lambda _binary, _accelerator: {
-            "CUDA0": 11 * 1024**3,
-            "CUDA1": 11 * 1024**3,
-        },
+        "osai.auto_benchmark.llama_device_inventory_details",
+        lambda _binary, _accelerator, **_kwargs: _inventory(
+            ("CUDA0", "CUDA1"),
+            {"CUDA0": 11 * 1024**3, "CUDA1": 11 * 1024**3},
+        ),
     )
     probed = []
     monkeypatch.setattr(
@@ -211,15 +205,12 @@ def test_asymmetric_metal_gpus_use_vram_weighted_probe_and_largest_main(monkeypa
     monkeypatch.setattr("osai.auto_benchmark.llama_runtime_build", lambda: tmp_path / "native")
     monkeypatch.setattr("osai.auto_benchmark.select_llama_accelerator", lambda _: Accelerator.METAL)
     monkeypatch.setattr(
-        "osai.auto_benchmark.available_llama_devices",
-        lambda _binary, _accelerator, **_kwargs: ("MTL0", "MTL1"),
-    )
-    monkeypatch.setattr(
-        "osai.auto_benchmark.llama_device_free_bytes",
-        lambda _binary, _accelerator: {
-            "MTL0": 4 * 1024**3,
-            "MTL1": 8 * 1024**3,
-        },
+        "osai.auto_benchmark.llama_device_inventory_details",
+        lambda _binary, _accelerator, **_kwargs: _inventory(
+            ("MTL0", "MTL1"),
+            {"MTL0": int(3.5 * 1024**3), "MTL1": 3 * 1024**3},
+            {"MTL0": 4 * 1024**3, "MTL1": 8 * 1024**3},
+        ),
     )
     probed = []
     monkeypatch.setattr(
@@ -239,7 +230,7 @@ def test_asymmetric_metal_gpus_use_vram_weighted_probe_and_largest_main(monkeypa
 
     assert selected.devices == ("MTL0", "MTL1")
     assert selected.main_gpu == 1
-    assert selected.tensor_split[1] > selected.tensor_split[0] * 1.9
+    assert selected.tensor_split[0] > selected.tensor_split[1]
     assert probed == [("MTL0,MTL1", selected.tensor_split, 1)]
 
 
@@ -262,15 +253,11 @@ def test_two_3_gib_gpus_can_fit_a_sharded_compact_model(monkeypatch, tmp_path):
     monkeypatch.setattr("osai.auto_benchmark.llama_runtime_build", lambda: tmp_path / "native")
     monkeypatch.setattr("osai.auto_benchmark.select_llama_accelerator", lambda _: Accelerator.CUDA)
     monkeypatch.setattr(
-        "osai.auto_benchmark.available_llama_devices",
-        lambda _binary, _accelerator, **_kwargs: ("CUDA0", "CUDA1"),
-    )
-    monkeypatch.setattr(
-        "osai.auto_benchmark.llama_device_free_bytes",
-        lambda _binary, _accelerator: {
-            "CUDA0": 3 * 1024**3,
-            "CUDA1": 3 * 1024**3,
-        },
+        "osai.auto_benchmark.llama_device_inventory_details",
+        lambda _binary, _accelerator, **_kwargs: _inventory(
+            ("CUDA0", "CUDA1"),
+            {"CUDA0": 3 * 1024**3, "CUDA1": 3 * 1024**3},
+        ),
     )
     probed = []
     monkeypatch.setattr(
@@ -297,12 +284,11 @@ def test_full_context_is_probed_across_gpu_shards_with_smaller_memory_settings(
     monkeypatch.setattr("osai.auto_benchmark.llama_runtime_build", lambda: tmp_path / "native")
     monkeypatch.setattr("osai.auto_benchmark.select_llama_accelerator", lambda _: Accelerator.CUDA)
     monkeypatch.setattr(
-        "osai.auto_benchmark.available_llama_devices",
-        lambda _binary, _accelerator, **_kwargs: ("CUDA0", "CUDA1"),
-    )
-    monkeypatch.setattr(
-        "osai.auto_benchmark.llama_device_free_bytes",
-        lambda _binary, _accelerator: {"CUDA0": 11 * 1024**3, "CUDA1": 11 * 1024**3},
+        "osai.auto_benchmark.llama_device_inventory_details",
+        lambda _binary, _accelerator, **_kwargs: _inventory(
+            ("CUDA0", "CUDA1"),
+            {"CUDA0": 11 * 1024**3, "CUDA1": 11 * 1024**3},
+        ),
     )
     probed = []
     monkeypatch.setattr(

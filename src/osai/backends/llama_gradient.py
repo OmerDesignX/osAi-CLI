@@ -29,9 +29,8 @@ from ..hardware import Accelerator, select_llama_accelerator
 from ..io import OutputLock, atomic_json, fingerprint, sha256_file
 from ..multi_gpu import (
     automatic_llama_device_plan,
-    available_llama_devices,
     llama_device_arguments,
-    llama_device_free_bytes,
+    llama_device_inventory_details,
 )
 from ..offline import offline_environment
 from ..paths import llama_binary
@@ -178,11 +177,12 @@ def train_gradient_gguf(
 
     requested_accelerator = select_llama_accelerator(accelerator)
     if requested_accelerator is not Accelerator.CPU:
-        discovered = available_llama_devices(
+        inventory = llama_device_inventory_details(
             llama_binary("llama-completion"),
             requested_accelerator,
             include_amd_vulkan=accelerator == Accelerator.AUTO,
         )
+        discovered = inventory.devices
         if settings.devices and any(device not in discovered for device in settings.devices):
             raise ConfigurationError(
                 "a selected GPU is unavailable or is an integrated adapter while "
@@ -204,7 +204,8 @@ def train_gradient_gguf(
         ):
             plan = automatic_llama_device_plan(
                 settings.devices,
-                llama_device_free_bytes(llama_binary("llama-completion"), requested_accelerator),
+                inventory.free_by_device,
+                inventory.total_by_device,
             )
             if plan.tensor_split:
                 settings = replace(

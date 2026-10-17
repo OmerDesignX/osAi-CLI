@@ -12,7 +12,7 @@ from osai.multi_gpu import (
     available_llama_devices,
     llama_device_arguments,
     llama_device_free_bytes,
-    llama_device_inventory,
+    llama_device_inventory_details,
 )
 
 
@@ -137,6 +137,26 @@ def test_automatic_sharding_weights_unequal_gpus_and_uses_largest_as_main(prefix
     )
     assert command[command.index("-mg") + 1] == "1"
     assert "-ts" in command
+
+
+def test_primary_gpu_follows_total_vram_instead_of_device_index_or_temporary_load():
+    gib = 1024**3
+    plan = automatic_llama_device_plan(
+        ("MTL0", "MTL1"),
+        {"MTL0": int(3.5 * gib), "MTL1": 3 * gib},
+        {"MTL0": 4 * gib, "MTL1": 8 * gib},
+    )
+
+    assert plan.main_gpu == 1
+    assert plan.tensor_split[0] > plan.tensor_split[1]
+
+    without_free_memory = automatic_llama_device_plan(
+        ("MTL0", "MTL1"),
+        {},
+        {"MTL0": 4 * gib, "MTL1": 8 * gib},
+    )
+    assert without_free_memory.main_gpu == 1
+    assert without_free_memory.tensor_split[1] > without_free_memory.tensor_split[0]
 
 
 @pytest.mark.parametrize("count,memory_gib", [(2, 3), (2, 4), (3, 4)])
@@ -340,9 +360,7 @@ def test_native_device_inventory_reports_free_gpu_memory(monkeypatch, tmp_path):
     }
 
 
-def test_intel_metal_inventory_reads_all_devices_and_memory_with_one_probe(
-    monkeypatch, tmp_path
-):
+def test_intel_metal_inventory_reads_all_devices_and_memory_with_one_probe(monkeypatch, tmp_path):
     calls = []
     report = (
         "Available devices:\n"
@@ -355,13 +373,18 @@ def test_intel_metal_inventory_reads_all_devices_and_memory_with_one_probe(
         return SimpleNamespace(returncode=0, stdout=report, stderr="")
 
     monkeypatch.setattr("osai.multi_gpu.subprocess.run", run)
-    devices, free = llama_device_inventory(
-        tmp_path / "llama-completion", Accelerator.METAL
-    )
+    details = llama_device_inventory_details(tmp_path / "llama-completion", Accelerator.METAL)
 
     assert calls == [True]
-    assert devices == ("MTL0", "MTL1")
-    assert free == {"MTL0": 3072 * 1024**2, "MTL1": 7168 * 1024**2}
+    assert details.devices == ("MTL0", "MTL1")
+    assert details.free_by_device == {
+        "MTL0": 3072 * 1024**2,
+        "MTL1": 7168 * 1024**2,
+    }
+    assert details.total_by_device == {
+        "MTL0": 4096 * 1024**2,
+        "MTL1": 8192 * 1024**2,
+    }
 
 
 def test_gpu_probe_failure_preserves_native_diagnostic(monkeypatch, tmp_path):

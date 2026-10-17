@@ -28,8 +28,7 @@ from .formats import ModelInspection
 from .hardware import Accelerator, Engine, select_llama_accelerator
 from .multi_gpu import (
     automatic_llama_device_plan,
-    available_llama_devices,
-    llama_device_free_bytes,
+    llama_device_inventory_details,
 )
 from .offline import offline_environment
 from .paths import llama_binary, llama_runtime_build
@@ -100,9 +99,12 @@ def benchmark_auto_settings(
         binary = llama_binary("llama-completion")
         if binary is None:
             raise DependencyError("llama-completion is missing; run `osai build-llama`")
-        discovered = available_llama_devices(
-            binary, selected, include_amd_vulkan=accelerator == Accelerator.AUTO
+        inventory = llama_device_inventory_details(
+            binary,
+            selected,
+            include_amd_vulkan=accelerator == Accelerator.AUTO,
         )
+        discovered = inventory.devices
         chosen = devices or discovered
         if selected is Accelerator.CPU:
             chosen = ()
@@ -118,18 +120,29 @@ def benchmark_auto_settings(
             raise ConfigurationError("a selected GPU is unavailable to llama.cpp")
         if selected is not Accelerator.CPU and not chosen:
             raise ConfigurationError("the selected GPU backend reports no usable devices")
-        free_by_device = llama_device_free_bytes(binary, selected)
+        free_by_device = inventory.free_by_device
+        total_by_device = inventory.total_by_device
         free_gpu_bytes = (
             tuple(free_by_device[device] for device in chosen)
             if chosen and all(device in free_by_device for device in chosen)
             else ()
         )
-        device_plan = automatic_llama_device_plan(chosen, free_by_device)
+        total_gpu_bytes = (
+            tuple(total_by_device[device] for device in chosen)
+            if chosen and all(device in total_by_device for device in chosen)
+            else ()
+        )
+        device_plan = automatic_llama_device_plan(
+            chosen,
+            free_by_device,
+            total_by_device,
+        )
         executable = binary
     elif engine is Engine.MLX:
         selected = Accelerator.CPU if accelerator == "cpu" else Accelerator.AUTO
         chosen = ()
         free_gpu_bytes = ()
+        total_gpu_bytes = ()
         device_plan = automatic_llama_device_plan((), {})
         executable = Path(sys.executable)
     else:
@@ -142,7 +155,7 @@ def benchmark_auto_settings(
         adapter / "adapters.safetensors" if adapter is not None and adapter.is_dir() else adapter
     )
     key_data = {
-        "schema": 4,
+        "schema": 5,
         "required_context": required_context,
         "model": str(model.path.resolve()),
         "shards": [
@@ -152,6 +165,7 @@ def benchmark_auto_settings(
         "accelerator": selected.value,
         "devices": chosen,
         "free_gpu_gib": [value // 1024**3 for value in free_gpu_bytes],
+        "total_gpu_gib": [value // 1024**3 for value in total_gpu_bytes],
         "multi_gpu": multi_gpu,
         "memory": baseline.physical_memory_bytes,
         "cpu": os.cpu_count(),

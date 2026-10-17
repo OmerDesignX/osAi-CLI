@@ -31,30 +31,55 @@ class LlamaDevicePlan:
     main_gpu: int
 
 
+@dataclass(frozen=True, slots=True)
+class LlamaDeviceInventory:
+    """One native snapshot of device identities and memory capacity."""
+
+    devices: tuple[str, ...]
+    free_by_device: dict[str, int]
+    total_by_device: dict[str, int]
+
+
 def automatic_llama_device_plan(
-    devices: Sequence[str], free_by_device: dict[str, int]
+    devices: Sequence[str],
+    free_by_device: dict[str, int],
+    total_by_device: dict[str, int] | None = None,
 ) -> LlamaDevicePlan:
-    """Weight shards by usable VRAM and keep non-shard buffers on the largest GPU.
+    """Weight shards by usable VRAM and put shared buffers on the largest GPU.
 
     llama.cpp accepts relative ``--tensor-split`` weights.  Passing usable MiB
-    keeps asymmetric cards from receiving equal model shares, while selecting
-    the roomiest card as ``--main-gpu`` leaves the smaller cards available for
-    layer shards.  If a backend cannot report memory, llama.cpp retains its own
-    automatic distribution.
+    keeps asymmetric cards from receiving equal model shares. The primary GPU
+    is selected by physical VRAM when the backend reports it, independently of
+    device numbering or temporary load. If free memory is unavailable, total
+    VRAM also provides a stable shard weighting. If neither value is reported,
+    llama.cpp retains its own automatic distribution.
     """
 
     selected = tuple(devices)
     if len(selected) < 2:
         return LlamaDevicePlan(selected, (), 0)
-    if not all(
+    total_by_device = total_by_device or {}
+    complete_free = all(
         isinstance(free_by_device.get(device), int) and free_by_device[device] > 0
         for device in selected
-    ):
+    )
+    complete_total = all(
+        isinstance(total_by_device.get(device), int) and total_by_device[device] > 0
+        for device in selected
+    )
+    if not complete_free and not complete_total:
         return LlamaDevicePlan(selected, (), 0)
-    available = tuple(free_by_device[device] for device in selected)
+    available_source = free_by_device if complete_free else total_by_device
+    primary_source = total_by_device if complete_total else available_source
+    available = tuple(available_source[device] for device in selected)
+    physical = tuple(primary_source[device] for device in selected)
     usable = tuple(max(1, value - max(512 * 1024**2, value // 10)) for value in available)
     weights = tuple(round(value / 1024**2, 3) for value in usable)
-    return LlamaDevicePlan(selected, weights, max(range(len(available)), key=available.__getitem__))
+    return LlamaDevicePlan(
+        selected,
+        weights,
+        max(range(len(physical)), key=physical.__getitem__),
+    )
 
 
 def available_llama_devices(
@@ -66,13 +91,13 @@ def available_llama_devices(
 ) -> tuple[str, ...]:
     """Resolve native IDs, excluding integrated Vulkan adapters for training."""
 
-    devices, _free = llama_device_inventory(
+    inventory = llama_device_inventory_details(
         binary,
         accelerator,
         include_integrated=include_integrated,
         include_amd_vulkan=include_amd_vulkan,
     )
-    return devices
+    return inventory.devices
 
 
 def llama_device_inventory(
@@ -84,8 +109,26 @@ def llama_device_inventory(
 ) -> tuple[tuple[str, ...], dict[str, int]]:
     """Read device identities and memory from one bounded native probe."""
 
+    inventory = llama_device_inventory_details(
+        binary,
+        accelerator,
+        include_integrated=include_integrated,
+        include_amd_vulkan=include_amd_vulkan,
+    )
+    return inventory.devices, inventory.free_by_device
+
+
+def llama_device_inventory_details(
+    binary: Path | None,
+    accelerator: Accelerator,
+    *,
+    include_integrated: bool = False,
+    include_amd_vulkan: bool = False,
+) -> LlamaDeviceInventory:
+    """Read identities, current free memory and total VRAM in one probe."""
+
     if binary is None or accelerator is Accelerator.CPU:
-        return (), {}
+        return LlamaDeviceInventory((), {}, {})
     _result, output = _llama_device_report(binary, accelerator)
     devices = _llama_devices_from_report(
         output,
@@ -93,8 +136,12 @@ def llama_device_inventory(
         include_integrated=include_integrated,
         include_amd_vulkan=include_amd_vulkan,
     )
-    free = _llama_free_bytes_from_report(output, accelerator)
-    return devices, {device: free[device] for device in devices if device in free}
+    free, total = _llama_memory_bytes_from_report(output, accelerator)
+    return LlamaDeviceInventory(
+        devices,
+        {device: free[device] for device in devices if device in free and free[device] > 0},
+        {device: total[device] for device in devices if device in total and total[device] > 0},
+    )
 
 
 def _llama_devices_from_report(
@@ -211,34 +258,42 @@ def llama_device_free_bytes(binary: Path | None, accelerator: Accelerator) -> di
     return _llama_free_bytes_from_report(output, accelerator)
 
 
-def _llama_free_bytes_from_report(
+def _llama_free_bytes_from_report(output: str, accelerator: Accelerator) -> dict[str, int]:
+    free, _total = _llama_memory_bytes_from_report(output, accelerator)
+    return free
+
+
+def _llama_memory_bytes_from_report(
     output: str, accelerator: Accelerator
-) -> dict[str, int]:
+) -> tuple[dict[str, int], dict[str, int]]:
     prefix = {
         Accelerator.CUDA: "CUDA",
         Accelerator.VULKAN: "Vulkan",
         Accelerator.METAL: "MTL",
     }.get(accelerator)
     if prefix is None:
-        return {}
-    free = {
-        device: int(free) * 1024**2
-        for device, free in re.findall(
-            rf"^\s*({prefix}\d+):[^\n]*?\b(\d+)\s+MiB\s+free\b",
+        return {}, {}
+    memory = {
+        device: (int(total) * 1024**2, int(free) * 1024**2)
+        for device, total, free in re.findall(
+            rf"^\s*({prefix}\d+):[^\n]*\(\s*(\d+)\s+MiB\s*,\s*(\d+)\s+MiB\s+free\s*\)",
             output,
             re.M | re.I,
         )
     }
+    total = {device: values[0] for device, values in memory.items()}
+    free = {device: values[1] for device, values in memory.items()}
     if accelerator is Accelerator.CUDA:
         for device in _dedicated_amd_vulkan_ids(output):
             match = re.search(
-                rf"^\s*{re.escape(device)}:[^\n]*?\b(\d+)\s+MiB\s+free\b",
+                rf"^\s*{re.escape(device)}:[^\n]*\(\s*(\d+)\s+MiB\s*,\s*(\d+)\s+MiB\s+free\s*\)",
                 output,
                 re.M | re.I,
             )
             if match:
-                free[device] = int(match.group(1)) * 1024**2
-    return free
+                total[device] = int(match.group(1)) * 1024**2
+                free[device] = int(match.group(2)) * 1024**2
+    return free, total
 
 
 def llama_device_arguments(
