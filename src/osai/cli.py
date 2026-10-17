@@ -1751,6 +1751,7 @@ def _auto_devices(args: argparse.Namespace) -> int:
             "devices": list(inventory.devices),
             "free_bytes": inventory.free_by_device,
             "total_bytes": inventory.total_by_device,
+            "labels": inventory.labels_by_device,
         }
     )
     return 0

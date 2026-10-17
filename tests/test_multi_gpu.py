@@ -385,6 +385,23 @@ def test_intel_metal_inventory_reads_all_devices_and_memory_with_one_probe(monke
         "MTL0": 4096 * 1024**2,
         "MTL1": 8192 * 1024**2,
     }
+    assert details.labels_by_device == {
+        "MTL0": "AMD Radeon RX 580",
+        "MTL1": "AMD Radeon RX Vega 64",
+    }
+
+
+def test_primary_gpu_follows_vram_when_metal_ids_are_swapped():
+    gib = 1024**3
+    plan = automatic_llama_device_plan(
+        ("MTL1", "MTL0"),
+        {"MTL1": 3 * gib, "MTL0": 7 * gib},
+        {"MTL1": 4 * gib, "MTL0": 8 * gib},
+    )
+
+    assert plan.devices == ("MTL1", "MTL0")
+    assert plan.main_gpu == 1
+    assert plan.tensor_split[1] > plan.tensor_split[0]
 
 
 def test_gpu_probe_failure_preserves_native_diagnostic(monkeypatch, tmp_path):

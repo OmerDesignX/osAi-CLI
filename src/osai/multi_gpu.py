@@ -6,7 +6,7 @@ import math
 import re
 import subprocess
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
@@ -38,6 +38,7 @@ class LlamaDeviceInventory:
     devices: tuple[str, ...]
     free_by_device: dict[str, int]
     total_by_device: dict[str, int]
+    labels_by_device: dict[str, str] = field(default_factory=dict)
 
 
 def automatic_llama_device_plan(
@@ -137,11 +138,40 @@ def llama_device_inventory_details(
         include_amd_vulkan=include_amd_vulkan,
     )
     free, total = _llama_memory_bytes_from_report(output, accelerator)
+    labels = _llama_device_labels_from_report(output, accelerator)
     return LlamaDeviceInventory(
         devices,
         {device: free[device] for device in devices if device in free and free[device] > 0},
         {device: total[device] for device in devices if device in total and total[device] > 0},
+        {device: labels[device] for device in devices if device in labels},
     )
+
+
+def _llama_device_labels_from_report(output: str, accelerator: Accelerator) -> dict[str, str]:
+    """Return stable native IDs with human-readable physical device names."""
+
+    prefix = {
+        Accelerator.CUDA: "CUDA",
+        Accelerator.VULKAN: "Vulkan",
+        Accelerator.METAL: "MTL",
+    }.get(accelerator)
+    if prefix is None:
+        return {}
+    labels: dict[str, str] = {}
+    for device, raw_label in re.findall(
+        rf"^\s*({prefix}\d+):\s*(.+)$",
+        output,
+        re.M | re.I,
+    ):
+        label = re.sub(r"\s*\[type=(?:dedicated|integrated|other)\]\s*$", "", raw_label, flags=re.I)
+        label = re.sub(
+            r"\s*\(\s*\d+\s+MiB\s*,\s*\d+\s+MiB\s+free\s*\)\s*$",
+            "",
+            label,
+            flags=re.I,
+        ).strip()
+        labels.setdefault(device, label or device)
+    return labels
 
 
 def _llama_devices_from_report(
