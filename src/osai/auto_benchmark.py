@@ -36,12 +36,17 @@ from .paths import llama_binary, llama_runtime_build
 _PROFILES = ("maximum", "performance", "balanced", "compact")
 _CACHE_AGE_SECONDS = 12 * 60 * 60
 _PROBE_TIMEOUT_SECONDS = 180
+_MAX_PROBE_TIMEOUT_SECONDS = 900
 
 
-def _probe_timeout() -> int:
+def _probe_timeout(context: int = 0) -> int:
     # A cold model load can exceed 25 seconds even when the tiny pilot is fast.
-    # Bound a stuck inference process without rejecting healthy calibrations.
-    return _PROBE_TIMEOUT_SECONDS
+    # Large full-record contexts allocate and clear much larger KV buffers,
+    # which is especially slow on older discrete Metal cards. Keep ordinary
+    # probes tightly bounded while granting one extra minute per 8K tokens
+    # above the normal training range.
+    extra = max(0, math.ceil((context - 8192) / 8192)) * 60
+    return min(_MAX_PROBE_TIMEOUT_SECONDS, _PROBE_TIMEOUT_SECONDS + extra)
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,7 +313,7 @@ def _probe_llama(
     tensor_split: tuple[float, ...] = (),
     main_gpu: int = 0,
 ) -> None:
-    prompt = "A short local hardware benchmark. " * min(64, max(4, settings.max_seq_length // 24))
+    prompt = "A short local hardware benchmark."
     command = [
         str(binary),
         "-m",
@@ -351,7 +356,7 @@ def _probe_llama(
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=_probe_timeout(),
+        timeout=_probe_timeout(settings.max_seq_length),
         check=False,
         env=offline_environment(),
     )
@@ -365,7 +370,7 @@ def _probe_llama(
 
 
 def _probe_mlx(model: Path, settings: AutoTrainingSettings, adapter: Path | None) -> None:
-    prompt = "A short local hardware benchmark. " * min(64, max(4, settings.max_seq_length // 24))
+    prompt = "A short local hardware benchmark."
     command = [
         sys.executable,
         "-m",

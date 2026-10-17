@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from osai.auto_benchmark import _native_failure, benchmark_auto_settings
+from osai.auto_benchmark import _native_failure, _probe_timeout, benchmark_auto_settings
 from osai.config import ModelFormat
 from osai.errors import ConfigurationError
 from osai.formats import ModelInspection, QuantizationSpec
@@ -28,6 +28,12 @@ def _model(tmp_path: Path) -> ModelInspection:
 def _inventory(devices, free=None, total=None):
     free = free or {}
     return LlamaDeviceInventory(tuple(devices), free, total or free)
+
+
+def test_large_full_context_probes_allow_slow_discrete_metal_allocation():
+    assert _probe_timeout(2048) == 180
+    assert _probe_timeout(61_588) == 600
+    assert _probe_timeout(1_000_000) == 900
 
 
 def test_benchmark_downgrades_failed_profile_and_reuses_cache(monkeypatch, tmp_path: Path):
