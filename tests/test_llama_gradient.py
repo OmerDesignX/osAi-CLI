@@ -197,6 +197,45 @@ def test_gradient_command_preserves_every_selected_gpu(count, accelerator, prefi
     assert command[command.index("-sm") + 1] == "layer"
 
 
+@pytest.mark.parametrize(
+    "devices,tensor_split,main_gpu",
+    [
+        (("MTL0", "MTL1"), (3584.0, 3584.0), 0),
+        (("MTL0", "MTL1"), (3584.0, 7372.8), 1),
+        (("MTL0", "MTL1", "MTL2"), (3584.0, 3584.0, 3584.0), 0),
+    ],
+)
+def test_full_context_evaluation_command_keeps_every_model_shard(devices, tensor_split, main_gpu):
+    options = LlamaGradientOptions(
+        context=61_588,
+        batch_size=1,
+        multi_gpu="on",
+        devices=devices,
+        split_mode="layer",
+        tensor_split=tensor_split,
+        main_gpu=main_gpu,
+        calibration_pilot=True,
+    )
+
+    command = _gradient_command(
+        Path("llama-finetune"),
+        Path("base.gguf"),
+        Path("adapter.gguf"),
+        Path("test.txt"),
+        Path("unused.gguf"),
+        options,
+        Accelerator.METAL,
+    )
+
+    assert command[command.index("-c") + 1] == "61588"
+    assert command[command.index("-dev") + 1] == ",".join(devices)
+    assert command[command.index("-sm") + 1] == "layer"
+    assert command[command.index("-mg") + 1] == str(main_gpu)
+    assert command[command.index("-ts") + 1] == ",".join(
+        format(value, ".8g") for value in tensor_split
+    )
+
+
 def test_gradient_log_parsers():
     output = (
         "train: [done] data=0000064/0000064 loss=0.8\r\n"

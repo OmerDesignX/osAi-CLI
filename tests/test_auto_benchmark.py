@@ -2,12 +2,17 @@ from pathlib import Path
 
 import pytest
 
-from osai.auto_benchmark import _native_failure, _probe_timeout, benchmark_auto_settings
+from osai.auto_benchmark import (
+    _gpu_profile_fits,
+    _native_failure,
+    _probe_timeout,
+    benchmark_auto_settings,
+)
 from osai.config import ModelFormat
 from osai.errors import ConfigurationError
 from osai.formats import ModelInspection, QuantizationSpec
 from osai.hardware import Accelerator, Engine
-from osai.multi_gpu import LlamaDeviceInventory
+from osai.multi_gpu import LlamaDeviceInventory, automatic_llama_device_plan
 
 
 def _model(tmp_path: Path) -> ModelInspection:
@@ -34,6 +39,23 @@ def test_large_full_context_probes_allow_slow_discrete_metal_allocation():
     assert _probe_timeout(2048) == 180
     assert _probe_timeout(61_588) == 600
     assert _probe_timeout(1_000_000) == 900
+
+
+@pytest.mark.parametrize("memory_gib", [(4, 4), (8, 4), (4, 4, 4), (8, 4, 3)])
+def test_compact_full_context_admission_uses_combined_heterogeneous_vram(memory_gib):
+    gib = 1024**3
+    devices = tuple(f"MTL{index}" for index in range(len(memory_gib)))
+    free = {device: amount * gib for device, amount in zip(devices, memory_gib, strict=True)}
+    plan = automatic_llama_device_plan(devices, free, free)
+
+    assert sum(memory_gib) >= 8
+    assert len(plan.tensor_split) == len(devices)
+    assert _gpu_profile_fits(
+        "compact",
+        int(2.5 * gib),
+        tuple(free[device] for device in devices),
+        plan.tensor_split,
+    )
 
 
 def test_benchmark_downgrades_failed_profile_and_reuses_cache(monkeypatch, tmp_path: Path):

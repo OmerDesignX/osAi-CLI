@@ -411,23 +411,16 @@ def train_gradient_gguf(
                     settings,
                 )
             if settings.calibration_pilot and test_corpus is not None:
-                evaluation_settings = (
-                    replace(
-                        settings,
-                        multi_gpu="off",
-                        devices=(settings.devices[0],),
-                        tensor_split=(),
-                        main_gpu=0,
-                    )
-                    if settings.devices and training_accelerator is not Accelerator.CPU
-                    else settings
-                )
+                # Evaluation loads the same frozen base and context as training.
+                # Preserve the complete model-sharding plan: collapsing this to
+                # devices[0] makes a 4 + 4 GiB pair behave like one 4 GiB card and
+                # can produce a non-finite loss before a valid pilot even starts.
                 initial_test_loss, evaluation_accelerator = _run_supervised_evaluation(
                     binary,
                     base.path,
                     initial_adapter,
                     test_corpus,
-                    evaluation_settings,
+                    settings,
                     layout.logs / "evaluate-pilot-before.log",
                     training_accelerator,
                 )
@@ -556,7 +549,7 @@ def train_gradient_gguf(
                         base.path,
                         final_adapter,
                         test_corpus,
-                        evaluation_settings,
+                        settings,
                         layout.logs / "evaluate-pilot-after.log",
                         training_accelerator,
                     )
@@ -566,23 +559,14 @@ def train_gradient_gguf(
                     test_loss = None
                 evaluation_accelerator = training_accelerator
             elif settings.mask_prompt:
-                evaluation_settings = (
-                    replace(
-                        settings,
-                        multi_gpu="off",
-                        devices=(settings.devices[0],),
-                        tensor_split=(),
-                        main_gpu=0,
-                    )
-                    if settings.devices and training_accelerator is not Accelerator.CPU
-                    else settings
-                )
+                # Keep validation on the same GPU shards as the completed run so
+                # full-context jobs do not fail only while measuring final loss.
                 final_loss, evaluation_accelerator = _run_supervised_evaluation(
                     binary,
                     base.path,
                     final_adapter,
                     train_corpus,
-                    evaluation_settings,
+                    settings,
                     layout.logs / "evaluate-after.log",
                     training_accelerator,
                 )
@@ -592,7 +576,7 @@ def train_gradient_gguf(
                         base.path,
                         final_adapter,
                         test_corpus,
-                        evaluation_settings,
+                        settings,
                         layout.logs / "evaluate-test.log",
                         evaluation_accelerator,
                     )
