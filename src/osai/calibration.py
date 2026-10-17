@@ -36,6 +36,7 @@ _MAX_TRAIN_ROWS = 4
 _MAX_TEST_ROWS = 2
 _PILOT_EPOCHS = 3
 _MAX_INSPECTED_ROWS_PER_FILE = 256
+_EVALUATION_CONTEXT_OVERHEAD = 512
 
 
 @dataclass(frozen=True, slots=True)
@@ -297,6 +298,24 @@ def sample_training_data(
     return len(training), counts["train"], typical_chars
 
 
+def _sample_evaluation_context(sample: Path, maximum_context: int, batch_size: int) -> int:
+    """Size calibration scoring for its bounded records, not the full training window."""
+
+    largest_record_bytes = max(
+        (
+            len(normalized_record_text(row).encode("utf-8"))
+            for _, path in dataset_files(sample)
+            for row in _source_rows(path)
+        ),
+        default=0,
+    )
+    minimum = min(maximum_context, max(256, batch_size))
+    required = max(minimum, largest_record_bytes + _EVALUATION_CONTEXT_OVERHEAD)
+    bounded = min(maximum_context, required)
+    rounded = math.ceil(bounded / batch_size) * batch_size
+    return min(maximum_context, rounded)
+
+
 def calibrate_training(
     model_source: Path,
     model: ModelInspection,
@@ -379,6 +398,7 @@ def calibrate_training(
                     while True:
                         batch = settings.gguf_batch_size
                         context = math.ceil(required_context / batch) * batch
+                        evaluation_context = _sample_evaluation_context(sample, context, batch)
                         try:
                             native = train_gradient_gguf(
                                 model_source,
@@ -405,6 +425,7 @@ def calibrate_training(
                                     main_gpu=effective_main_gpu,
                                     auto_settings=False,
                                     calibration_pilot=True,
+                                    evaluation_context=evaluation_context,
                                 ),
                                 accelerator=benchmark.accelerator,
                             )

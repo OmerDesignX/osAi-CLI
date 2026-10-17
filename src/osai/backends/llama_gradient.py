@@ -56,6 +56,7 @@ _PROGRESS_RE = re.compile(r"data=\d+/(\d+)")
 _SUPERVISED_STEP_RE = re.compile(r"supervised optimizer step labels=\d+")
 _CHECKPOINT_RE = re.compile(r"checkpoint epoch=(\d+)\s+best_train_loss=([0-9.eE+-]+)")
 _SUPERVISED_EVAL_RE = re.compile(r"eval_loss=([0-9.eE+-]+)")
+_NONFINITE_SUPERVISED_EVAL_RE = re.compile(r"eval_loss=(?:nan|[+-]?inf)", re.IGNORECASE)
 _SUPERVISED_LABELS_RE = re.compile(r"assistant-only loss enabled for (\d+) labels")
 _ELAPSED_RE = re.compile(r"\bt=(\d+):(\d+):(\d+)")
 _SUPPORTED_TARGETS = frozenset(DEFAULT_TARGETS)
@@ -86,6 +87,7 @@ class LlamaGradientOptions:
     main_gpu: int = 0
     auto_settings: bool = False
     calibration_pilot: bool = False
+    evaluation_context: int | None = None
 
     def validate(self) -> None:
         integers = {
@@ -103,6 +105,15 @@ class LlamaGradientOptions:
             raise ConfigurationError("llama.cpp gradient context must be at least 32")
         if self.context % self.batch_size:
             raise ConfigurationError("gradient batch size must divide the context size")
+        if self.evaluation_context is not None:
+            if not 32 <= self.evaluation_context <= self.context:
+                raise ConfigurationError(
+                    "calibration evaluation context must be between 32 and the training context"
+                )
+            if self.evaluation_context % self.batch_size:
+                raise ConfigurationError(
+                    "gradient batch size must divide the calibration evaluation context"
+                )
         if self.scale <= 0 or self.learning_rate <= 0:
             raise ConfigurationError("scale and learning rate must be positive")
         if self.optimizer not in {"sgd", "adamw"}:
@@ -411,21 +422,27 @@ def train_gradient_gguf(
                     settings,
                 )
             if settings.calibration_pilot and test_corpus is not None:
-                # Evaluation loads the same frozen base and context as training.
-                # Preserve the complete model-sharding plan: collapsing this to
-                # devices[0] makes a 4 + 4 GiB pair behave like one 4 GiB card and
-                # can produce a non-finite loss before a valid pilot even starts.
+                # Scoring only needs to contain the bounded pilot records. Keep the
+                # full device-sharding plan, but do not allocate the full training
+                # context for a tiny validation sample: some native GPU backends
+                # return a non-finite loss for that otherwise unnecessary window.
+                evaluation_settings = _calibration_evaluation_options(settings)
+                print(
+                    "osai: calibration scoring "
+                    f"context={evaluation_settings.context}; "
+                    f"full-context pilot={settings.context}",
+                    flush=True,
+                )
                 initial_test_loss, evaluation_accelerator = _run_supervised_evaluation(
                     binary,
                     base.path,
                     initial_adapter,
                     test_corpus,
-                    settings,
+                    evaluation_settings,
                     layout.logs / "evaluate-pilot-before.log",
                     training_accelerator,
+                    fallback_on_nonfinite=True,
                 )
-                if evaluation_accelerator is not training_accelerator:
-                    raise TrainingError("GPU pilot evaluation fell back to CPU")
 
             log_path = layout.logs / "train.log"
             if not resume:
@@ -544,17 +561,17 @@ def train_gradient_gguf(
             if settings.calibration_pilot:
                 final_loss = epoch_losses[-1]
                 if test_corpus is not None:
+                    evaluation_settings = _calibration_evaluation_options(settings)
                     test_loss, evaluation_accelerator = _run_supervised_evaluation(
                         binary,
                         base.path,
                         final_adapter,
                         test_corpus,
-                        settings,
+                        evaluation_settings,
                         layout.logs / "evaluate-pilot-after.log",
                         training_accelerator,
+                        fallback_on_nonfinite=True,
                     )
-                    if evaluation_accelerator is not training_accelerator:
-                        raise TrainingError("GPU pilot evaluation fell back to CPU")
                 else:
                     test_loss = None
                 evaluation_accelerator = training_accelerator
@@ -821,6 +838,7 @@ def _run_supervised_evaluation(
     accelerator: Accelerator,
     *,
     example_weights: tuple[float, ...] | None = None,
+    fallback_on_nonfinite: bool = False,
 ) -> tuple[float, Accelerator]:
     """Run supervised evaluation and report the accelerator actually used."""
 
@@ -844,8 +862,13 @@ def _run_supervised_evaluation(
         )
     try:
         run_logged(command, log_path=log_path, env=environment)
+        output = log_path.read_text(encoding="utf-8", errors="replace")
+        return _parse_supervised_loss(output, log_path), accelerator
     except TrainingError:
-        if accelerator is Accelerator.CPU or not _retryable_accelerator_failure(log_path):
+        nonfinite = fallback_on_nonfinite and _nonfinite_supervised_evaluation(log_path)
+        if accelerator is Accelerator.CPU or not (
+            nonfinite or _retryable_accelerator_failure(log_path)
+        ):
             raise
         print(f"osai: {accelerator.value} evaluation failed; retrying with CPU")
         accelerator = Accelerator.CPU
@@ -861,6 +884,27 @@ def _run_supervised_evaluation(
         run_logged(command, log_path=log_path, env=environment)
     output = log_path.read_text(encoding="utf-8", errors="replace")
     return _parse_supervised_loss(output, log_path), accelerator
+
+
+def _nonfinite_supervised_evaluation(log_path: Path) -> bool:
+    if not log_path.is_file():
+        return False
+    output = log_path.read_text(encoding="utf-8", errors="replace")
+    return _NONFINITE_SUPERVISED_EVAL_RE.search(output) is not None
+
+
+def _calibration_evaluation_options(
+    settings: LlamaGradientOptions,
+) -> LlamaGradientOptions:
+    """Use the sampled-data window for scoring without changing the training pilot."""
+
+    if settings.evaluation_context is None:
+        return settings
+    return replace(
+        settings,
+        context=settings.evaluation_context,
+        evaluation_context=None,
+    )
 
 
 def _parse_supervised_loss(output: str, log_path: Path) -> float:

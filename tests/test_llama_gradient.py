@@ -5,6 +5,7 @@ import pytest
 from osai.auto_settings import select_auto_settings
 from osai.backends.llama_gradient import (
     LlamaGradientOptions,
+    _calibration_evaluation_options,
     _gradient_command,
     _lower_auto_context,
     _memory_failure,
@@ -13,6 +14,7 @@ from osai.backends.llama_gradient import (
     _parse_optimizer_steps,
     _parse_supervised_loss,
     _retryable_accelerator_failure,
+    _run_supervised_evaluation,
     _validate_hybrid_training_path,
     _validate_memory_budget,
 )
@@ -25,7 +27,7 @@ from osai.backends.llama_utils import (
 )
 from osai.cli import build_parser
 from osai.config import ModelFormat
-from osai.errors import ConfigurationError
+from osai.errors import ConfigurationError, TrainingError
 from osai.formats import ModelInspection, QuantizationSpec
 from osai.hardware import Accelerator, Engine
 
@@ -33,6 +35,13 @@ from osai.hardware import Accelerator, Engine
 def test_gradient_options_reject_non_divisible_batch():
     with pytest.raises(ConfigurationError, match="divide"):
         LlamaGradientOptions(context=32, batch_size=6).validate()
+
+
+def test_gradient_options_reject_invalid_calibration_evaluation_context():
+    with pytest.raises(ConfigurationError, match="evaluation context"):
+        LlamaGradientOptions(context=1024, batch_size=8, evaluation_context=1032).validate()
+    with pytest.raises(ConfigurationError, match="divide"):
+        LlamaGradientOptions(context=1024, batch_size=8, evaluation_context=258).validate()
 
 
 def test_gradient_options_reject_unknown_projection():
@@ -234,6 +243,74 @@ def test_full_context_evaluation_command_keeps_every_model_shard(devices, tensor
     assert command[command.index("-ts") + 1] == ",".join(
         format(value, ".8g") for value in tensor_split
     )
+
+
+def test_calibration_scoring_bounds_context_without_losing_model_shards():
+    options = LlamaGradientOptions(
+        context=61_588,
+        batch_size=1,
+        multi_gpu="on",
+        devices=("MTL0", "MTL1"),
+        tensor_split=(3584.0, 7372.8),
+        main_gpu=1,
+        calibration_pilot=True,
+        evaluation_context=2048,
+    )
+
+    evaluation = _calibration_evaluation_options(options)
+    command = _gradient_command(
+        Path("llama-finetune"),
+        Path("base.gguf"),
+        Path("adapter.gguf"),
+        Path("test.txt"),
+        Path("unused.gguf"),
+        evaluation,
+        Accelerator.METAL,
+    )
+
+    assert evaluation.context == 2048
+    assert evaluation.evaluation_context is None
+    assert command[command.index("-c") + 1] == "2048"
+    assert command[command.index("-dev") + 1] == "MTL0,MTL1"
+    assert command[command.index("-mg") + 1] == "1"
+
+
+def test_calibration_scoring_retries_nonfinite_gpu_loss_on_cpu(monkeypatch, tmp_path: Path):
+    calls = []
+
+    def run(command, *, log_path, env):
+        calls.append((command, env.copy()))
+        if len(calls) == 1:
+            log_path.write_text("I eval_loss=nan eval_loss_uncertainty=nan\n", encoding="utf-8")
+            raise TrainingError("GPU evaluation returned a non-finite loss")
+        log_path.write_text("I eval_loss=0.25 eval_loss_uncertainty=0.01\n", encoding="utf-8")
+
+    monkeypatch.setattr("osai.backends.llama_gradient.run_logged", run)
+    settings = LlamaGradientOptions(
+        context=2048,
+        batch_size=1,
+        devices=("MTL0", "MTL1"),
+        multi_gpu="on",
+        tensor_split=(3584.0, 7372.8),
+        main_gpu=1,
+    )
+
+    loss, accelerator = _run_supervised_evaluation(
+        Path("llama-finetune"),
+        Path("base.gguf"),
+        Path("adapter.gguf"),
+        Path("test.txt"),
+        settings,
+        tmp_path / "evaluate.log",
+        Accelerator.METAL,
+        fallback_on_nonfinite=True,
+    )
+
+    assert loss == pytest.approx(0.25)
+    assert accelerator is Accelerator.CPU
+    assert calls[0][0][calls[0][0].index("-dev") + 1] == "MTL0,MTL1"
+    assert calls[1][0][calls[1][0].index("-dev") + 1] == "none"
+    assert all(call[1]["OSAI_MAX_SEQ_LENGTH"] == "2048" for call in calls)
 
 
 def test_gradient_log_parsers():

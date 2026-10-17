@@ -8,6 +8,7 @@ from osai.auto_benchmark import BenchmarkResult
 from osai.auto_settings import select_auto_settings
 from osai.calibration import (
     _pilot_microbatch,
+    _sample_evaluation_context,
     _sample_source_rows,
     calibrate_training,
     candidate_rates,
@@ -60,6 +61,23 @@ def test_calibration_samples_all_selected_files_without_altering_them(tmp_path: 
     assert len((source / "part-0.jsonl").read_text().splitlines()) == 14
 
 
+def test_calibration_scores_the_sample_in_a_bounded_context(tmp_path: Path):
+    source = _data(tmp_path)
+    sample = tmp_path / "pilot"
+    sample_training_data(source, sample, context=61_588)
+
+    evaluation_context = _sample_evaluation_context(sample, 61_588, 8)
+
+    assert 256 <= evaluation_context < 61_588
+    assert evaluation_context % 8 == 0
+    largest_record_bytes = max(
+        len(line.encode("utf-8"))
+        for path in sample.glob("*.jsonl")
+        for line in path.read_text(encoding="utf-8").splitlines()
+    )
+    assert evaluation_context >= largest_record_bytes
+
+
 def test_quick_calibration_reads_each_file_with_a_bounded_sample(tmp_path: Path):
     source = _data(tmp_path)
     visited = []
@@ -106,6 +124,8 @@ def test_full_dataset_calibration_reduces_short_pilot_rate(monkeypatch, tmp_path
     progress = []
 
     def pilot(_model, _sample, output, *, options, accelerator):
+        assert options.evaluation_context is not None
+        assert options.evaluation_context < options.context
         tried.append(options.learning_rate)
         manifest = output.parent / "manifest.json"
         manifest.write_text(json.dumps({"options": {"context": options.context}}))
