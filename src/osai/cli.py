@@ -48,7 +48,7 @@ from .model_download import (
     ensure_official_model,
 )
 from .model_tools import export_bundle
-from .multi_gpu import available_llama_devices, llama_device_free_bytes
+from .multi_gpu import llama_device_inventory
 from .paths import llama_binary, project_root
 from .rollouts import RolloutSettings
 from .session import (
@@ -1740,12 +1740,11 @@ def _auto_devices(args: argparse.Namespace) -> int:
     report = detect_hardware()
     accelerator = select_llama_accelerator(args.accelerator, report)
     binary = llama_binary("llama-completion")
-    devices = available_llama_devices(
+    devices, free = llama_device_inventory(
         binary,
         accelerator,
         include_amd_vulkan=args.accelerator == "auto",
     )
-    free = llama_device_free_bytes(binary, accelerator)
     _print_json(
         {
             "accelerator": accelerator.value,

@@ -12,6 +12,7 @@ from osai.multi_gpu import (
     available_llama_devices,
     llama_device_arguments,
     llama_device_free_bytes,
+    llama_device_inventory,
 )
 
 
@@ -337,6 +338,30 @@ def test_native_device_inventory_reports_free_gpu_memory(monkeypatch, tmp_path):
     assert llama_device_free_bytes(tmp_path / "llama-completion", Accelerator.METAL) == {
         "MTL1": 6144 * 1024**2
     }
+
+
+def test_intel_metal_inventory_reads_all_devices_and_memory_with_one_probe(
+    monkeypatch, tmp_path
+):
+    calls = []
+    report = (
+        "Available devices:\n"
+        "  MTL0: AMD Radeon RX 580 (4096 MiB, 3072 MiB free)\n"
+        "  MTL1: AMD Radeon RX Vega 64 (8192 MiB, 7168 MiB free)\n"
+    )
+
+    def run(*_args, **_kwargs):
+        calls.append(True)
+        return SimpleNamespace(returncode=0, stdout=report, stderr="")
+
+    monkeypatch.setattr("osai.multi_gpu.subprocess.run", run)
+    devices, free = llama_device_inventory(
+        tmp_path / "llama-completion", Accelerator.METAL
+    )
+
+    assert calls == [True]
+    assert devices == ("MTL0", "MTL1")
+    assert free == {"MTL0": 3072 * 1024**2, "MTL1": 7168 * 1024**2}
 
 
 def test_gpu_probe_failure_preserves_native_diagnostic(monkeypatch, tmp_path):

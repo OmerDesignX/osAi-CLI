@@ -66,9 +66,44 @@ def available_llama_devices(
 ) -> tuple[str, ...]:
     """Resolve native IDs, excluding integrated Vulkan adapters for training."""
 
+    devices, _free = llama_device_inventory(
+        binary,
+        accelerator,
+        include_integrated=include_integrated,
+        include_amd_vulkan=include_amd_vulkan,
+    )
+    return devices
+
+
+def llama_device_inventory(
+    binary: Path | None,
+    accelerator: Accelerator,
+    *,
+    include_integrated: bool = False,
+    include_amd_vulkan: bool = False,
+) -> tuple[tuple[str, ...], dict[str, int]]:
+    """Read device identities and memory from one bounded native probe."""
+
     if binary is None or accelerator is Accelerator.CPU:
-        return ()
-    result, output = _llama_device_report(binary, accelerator)
+        return (), {}
+    _result, output = _llama_device_report(binary, accelerator)
+    devices = _llama_devices_from_report(
+        output,
+        accelerator,
+        include_integrated=include_integrated,
+        include_amd_vulkan=include_amd_vulkan,
+    )
+    free = _llama_free_bytes_from_report(output, accelerator)
+    return devices, {device: free[device] for device in devices if device in free}
+
+
+def _llama_devices_from_report(
+    output: str,
+    accelerator: Accelerator,
+    *,
+    include_integrated: bool = False,
+    include_amd_vulkan: bool = False,
+) -> tuple[str, ...]:
     prefix = {
         Accelerator.CUDA: "CUDA",
         Accelerator.VULKAN: "Vulkan",
@@ -173,6 +208,12 @@ def llama_device_free_bytes(binary: Path | None, accelerator: Accelerator) -> di
     if binary is None or accelerator is Accelerator.CPU:
         return {}
     _result, output = _llama_device_report(binary, accelerator)
+    return _llama_free_bytes_from_report(output, accelerator)
+
+
+def _llama_free_bytes_from_report(
+    output: str, accelerator: Accelerator
+) -> dict[str, int]:
     prefix = {
         Accelerator.CUDA: "CUDA",
         Accelerator.VULKAN: "Vulkan",
