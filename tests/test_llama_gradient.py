@@ -15,6 +15,7 @@ from osai.backends.llama_gradient import (
     _parse_supervised_loss,
     _retryable_accelerator_failure,
     _run_supervised_evaluation,
+    _stored_options,
     _validate_hybrid_training_path,
     _validate_memory_budget,
 )
@@ -42,6 +43,14 @@ def test_gradient_options_reject_invalid_calibration_evaluation_context():
         LlamaGradientOptions(context=1024, batch_size=8, evaluation_context=1032).validate()
     with pytest.raises(ConfigurationError, match="divide"):
         LlamaGradientOptions(context=1024, batch_size=8, evaluation_context=258).validate()
+
+
+def test_normal_session_serialization_stays_compatible_with_older_resumes():
+    normal = _stored_options(LlamaGradientOptions())
+    calibration = _stored_options(LlamaGradientOptions(evaluation_context=32))
+
+    assert "evaluation_context" not in normal
+    assert calibration["evaluation_context"] == 32
 
 
 def test_gradient_options_reject_unknown_projection():

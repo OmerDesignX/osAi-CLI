@@ -144,6 +144,15 @@ class LlamaGradientResult:
     device_speeds: tuple[float, ...] = ()
 
 
+def _stored_options(settings: LlamaGradientOptions) -> dict[str, Any]:
+    """Serialize settings without changing signatures for older non-calibration sessions."""
+
+    options = asdict(settings)
+    if options["evaluation_context"] is None:
+        options.pop("evaluation_context")
+    return options
+
+
 def train_gradient_gguf(
     model: str | Path,
     data: str | Path,
@@ -236,7 +245,7 @@ def train_gradient_gguf(
         )
     if settings.multi_gpu != "off" and len(settings.devices) > 1 and settings.split_mode != "layer":
         raise ConfigurationError("model-sharded GGUF training currently requires layer splitting")
-    requested_options = json.loads(json.dumps(asdict(settings)))
+    requested_options = json.loads(json.dumps(_stored_options(settings)))
     if resume:
         assert previous_resume is not None
         if previous_resume.get("requested_options") != requested_options:
@@ -275,7 +284,7 @@ def train_gradient_gguf(
         "base_storage": "packed GGUF; frozen and never fully dequantized",
         "model": base.as_dict(),
         "dataset": asdict(dataset),
-        "options": asdict(settings),
+        "options": _stored_options(settings),
         "accelerator_requested": requested_accelerator.value,
         "accelerator": training_accelerator.value,
         "accelerator_fallback_from": fallback_from,
@@ -382,7 +391,7 @@ def train_gradient_gguf(
                 "model": [asdict(item) for item in before],
                 "dataset": str(dataset.path),
                 "corpus_sha256": sha256_file(train_corpus),
-                "options": asdict(settings),
+                "options": _stored_options(settings),
                 "requested_options": requested_options,
                 "accelerator": training_accelerator.value,
                 "initial_digest": initial_digest,
@@ -520,7 +529,7 @@ def train_gradient_gguf(
                         and _memory_failure(log_path, attempt_offset)
                     ):
                         settings = _lower_auto_context(settings, training_env, manifest)
-                        resume_signature["options"] = asdict(settings)
+                        resume_signature["options"] = _stored_options(settings)
                         atomic_json(resume_input, resume_signature)
                         atomic_json(manifest_path, manifest)
                         trained_adapter.unlink(missing_ok=True)
