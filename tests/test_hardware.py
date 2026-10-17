@@ -163,20 +163,23 @@ def test_cuda_build_targets_every_installed_gpu_architecture(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "system,accelerator,native",
+    "system,machine,accelerator,native",
     [
-        ("Windows", Accelerator.CPU, "ON"),
-        ("Windows", Accelerator.VULKAN, "ON"),
-        ("Windows", Accelerator.CUDA, "ON"),
-        ("Darwin", Accelerator.METAL, "OFF"),
-        ("Linux", Accelerator.CPU, "OFF"),
-        ("Linux", Accelerator.CUDA, "OFF"),
+        ("Windows", "AMD64", Accelerator.CPU, "ON"),
+        ("Windows", "AMD64", Accelerator.VULKAN, "ON"),
+        ("Windows", "AMD64", Accelerator.CUDA, "ON"),
+        ("Darwin", "x86_64", Accelerator.METAL, "ON"),
+        ("Darwin", "arm64", Accelerator.METAL, "OFF"),
+        ("Linux", "x86_64", Accelerator.CPU, "ON"),
+        ("Linux", "x86_64", Accelerator.CUDA, "ON"),
+        ("Linux", "aarch64", Accelerator.CPU, "OFF"),
     ],
 )
-def test_local_windows_build_detects_cpu_without_changing_gpu_backend(
-    monkeypatch, tmp_path, system, accelerator, native
+def test_local_native_build_matches_x86_cpu_without_changing_gpu_backend(
+    monkeypatch, tmp_path, system, machine, accelerator, native
 ):
     monkeypatch.setattr(llama_cpp.platform, "system", lambda: system)
+    monkeypatch.setattr(llama_cpp.platform, "machine", lambda: machine)
     monkeypatch.setattr(llama_cpp, "_cuda_architectures", lambda: ())
     commands = []
     monkeypatch.setattr(

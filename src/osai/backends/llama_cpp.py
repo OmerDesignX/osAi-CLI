@@ -348,6 +348,14 @@ def _configure(
     accelerator: Accelerator,
     also_vulkan: bool = False,
 ) -> None:
+    machine = platform.machine().lower()
+    native_cpu = platform.system() == "Windows" or machine in {
+        "amd64",
+        "i386",
+        "i686",
+        "x86",
+        "x86_64",
+    }
     flags = [
         cmake,
         "-S",
@@ -365,10 +373,12 @@ def _configure(
         # losing Metal/CUDA/Vulkan because a companion plugin was not loaded.
         "-DBUILD_SHARED_LIBS=OFF",
         "-DGGML_BACKEND_DL=OFF",
-        # Windows setup compiles locally: detect the host CPU rather than use
-        # GGML's default AVX2/FMA flags, which crash on older x64 processors.
-        # Keep other platforms unchanged (some macOS feature probes stall).
-        f"-DGGML_NATIVE={'ON' if platform.system() == 'Windows' else 'OFF'}",
+        # These native binaries are built on the machine that will run them.
+        # Let x86 builds detect that exact CPU instead of accepting ggml's
+        # non-native AVX2/FMA defaults. The latter terminate with SIGILL on
+        # pre-AVX2 Intel Macs before Metal can load the model. Keep ARM builds
+        # non-native because some macOS ARM feature probes can stall.
+        f"-DGGML_NATIVE={'ON' if native_cpu else 'OFF'}",
         f"-DGGML_METAL={'ON' if accelerator is Accelerator.METAL else 'OFF'}",
         f"-DGGML_CUDA={'ON' if accelerator is Accelerator.CUDA else 'OFF'}",
         f"-DGGML_VULKAN={'ON' if accelerator is Accelerator.VULKAN or also_vulkan else 'OFF'}",
