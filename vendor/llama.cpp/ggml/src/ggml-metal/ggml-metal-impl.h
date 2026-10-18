@@ -280,6 +280,32 @@ typedef struct {
 } ggml_metal_kargs_repeat;
 
 typedef struct {
+    int32_t ncols;
+    int32_t rows_per_channel;
+    int32_t nrows;
+    int32_t n_past;
+} ggml_metal_kargs_diag_mask;
+
+typedef struct {
+    int32_t ncols;
+    int32_t nrows;
+    float   scale;
+} ggml_metal_kargs_soft_max_back;
+
+typedef struct {
+    int32_t  ncols;
+    int32_t  out_rows;
+    int32_t  grad_rows;
+    int32_t  batches;
+    uint64_t grad_nb1;
+    uint64_t grad_nb2;
+    uint64_t rows_nb0;
+    uint64_t rows_nb1;
+    uint64_t dst_nb1;
+    uint64_t dst_nb2;
+} ggml_metal_kargs_get_rows_back;
+
+typedef struct {
     int64_t  nk0;
     int64_t  ne00;
     int64_t  ne01;
@@ -1382,5 +1408,10 @@ typedef struct {
     int32_t nclasses;
     int32_t nrows;
 } ggml_metal_kargs_cross_entropy_loss_back;
+
+typedef struct {
+    int32_t nclasses;
+    int32_t nrows;
+} ggml_metal_kargs_cross_entropy_loss;
 
 #endif // GGML_METAL_IMPL

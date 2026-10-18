@@ -693,3 +693,119 @@ kernel void kernel_cross_entropy_loss_back_f32(
         dst[off + col] = (softmax * label_sum - labels[off + col]) * scale;
     }
 }
+
+template<bool zero>
+kernel void kernel_diag_mask_f32(
+        constant ggml_metal_kargs_diag_mask & args,
+        device const float * src,
+        device       float * dst,
+        uint gid [[thread_position_in_grid]]) {
+    const ulong count = (ulong) args.ncols * args.nrows;
+    if ((ulong) gid >= count) {
+        return;
+    }
+    const int col = gid % args.ncols;
+    const int row = (gid / args.ncols) % args.rows_per_channel;
+    dst[gid] = col > args.n_past + row ? (zero ? 0.0f : -INFINITY) : src[gid];
+}
+
+typedef decltype(kernel_diag_mask_f32<false>) kernel_diag_mask_t;
+template [[host_name("kernel_diag_mask_inf_f32")]]
+kernel kernel_diag_mask_t kernel_diag_mask_f32<false>;
+template [[host_name("kernel_diag_mask_zero_f32")]]
+kernel kernel_diag_mask_t kernel_diag_mask_f32<true>;
+
+kernel void kernel_get_rows_back_f32(
+        constant ggml_metal_kargs_get_rows_back & args,
+        device const char * grad,
+        device const char * rows,
+        device       char * dst,
+        uint gid [[thread_position_in_grid]]) {
+    const ulong count = (ulong) args.ncols * args.out_rows * args.batches;
+    if ((ulong) gid >= count) {
+        return;
+    }
+    ulong rem = gid;
+    const int col = rem % args.ncols; rem /= args.ncols;
+    const int out_row = rem % args.out_rows;
+    const int batch = rem / args.out_rows;
+    float sum = 0.0f;
+    for (int row = 0; row < args.grad_rows; ++row) {
+        const int index = *(device const int32_t *)
+            (rows + row*args.rows_nb0 + batch*args.rows_nb1);
+        if (index == out_row) {
+            sum += *(device const float *)
+                (grad + col*sizeof(float) + row*args.grad_nb1 + batch*args.grad_nb2);
+        }
+    }
+    *(device float *)
+        (dst + col*sizeof(float) + out_row*args.dst_nb1 + batch*args.dst_nb2) = sum;
+}
+
+kernel void kernel_cross_entropy_loss_row_f32(
+        constant ggml_metal_kargs_cross_entropy_loss & args,
+        device const float * logits,
+        device const float * labels,
+        device       float * rows,
+        threadgroup  float * scratch [[threadgroup(0)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint nth [[threads_per_threadgroup]]) {
+    if (row >= (uint) args.nrows) {
+        return;
+    }
+    const uint off = row * args.nclasses;
+    float local_max = -INFINITY;
+    for (uint col = tid; col < (uint) args.nclasses; col += nth) {
+        local_max = max(local_max, logits[off + col]);
+    }
+    scratch[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = nth >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) scratch[tid] = max(scratch[tid], scratch[tid + stride]);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float max_logit = scratch[0];
+
+    float local_exp = 0.0f;
+    for (uint col = tid; col < (uint) args.nclasses; col += nth) {
+        local_exp += exp(logits[off + col] - max_logit);
+    }
+    scratch[tid] = local_exp;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = nth >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) scratch[tid] += scratch[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float log_sum = log(scratch[0]);
+
+    float local_loss = 0.0f;
+    for (uint col = tid; col < (uint) args.nclasses; col += nth) {
+        local_loss += (logits[off + col] - max_logit - log_sum) * labels[off + col];
+    }
+    scratch[tid] = local_loss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = nth >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) scratch[tid] += scratch[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) rows[row] = -scratch[0] / (float) args.nrows;
+}
+
+kernel void kernel_cross_entropy_loss_reduce_f32(
+        constant ggml_metal_kargs_cross_entropy_loss & args,
+        device const float * rows,
+        device       float * dst,
+        threadgroup  float * scratch [[threadgroup(0)]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint nth [[threads_per_threadgroup]]) {
+    float sum = 0.0f;
+    for (uint row = tid; row < (uint) args.nrows; row += nth) sum += rows[row];
+    scratch[tid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = nth >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) scratch[tid] += scratch[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0) dst[0] = scratch[0];
+}

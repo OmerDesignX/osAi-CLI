@@ -1626,6 +1626,15 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 ggml_is_contiguous(op) &&
                 ggml_are_same_shape(op->src[1], op->src[2]) &&
                 ggml_are_same_shape(op->src[1], op);
+        case GGML_OP_CROSS_ENTROPY_LOSS:
+            return (op->src[0]->type == GGML_TYPE_F32) &&
+                (op->src[1]->type == GGML_TYPE_F32) &&
+                (op->type == GGML_TYPE_F32) &&
+                ggml_is_contiguous(op->src[0]) &&
+                ggml_is_contiguous(op->src[1]) &&
+                ggml_is_contiguous(op) &&
+                ggml_are_same_shape(op->src[0], op->src[1]) &&
+                ggml_is_scalar(op);
         case GGML_OP_GLU:
             switch (ggml_get_glu_op(op)) {
                 case GGML_GLU_OP_REGLU:
@@ -1683,6 +1692,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_REPEAT:
         case GGML_OP_CONV_TRANSPOSE_1D:
             return true;
+        case GGML_OP_REPEAT_BACK:
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                op->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(op);
         case GGML_OP_CONV_TRANSPOSE_2D:
             return ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) &&
                 (op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_F32) &&
@@ -1709,6 +1722,18 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_GROUP_NORM:
         case GGML_OP_L2_NORM:
             return has_simdgroup_reduction && ggml_is_contiguous_rows(op->src[0]);
+        case GGML_OP_SOFT_MAX_BACK: {
+            float max_bias = 0.0f;
+            memcpy(&max_bias, (const float *) op->op_params + 1, sizeof(float));
+            return max_bias == 0.0f &&
+                op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                op->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(op->src[0]) &&
+                ggml_is_contiguous(op->src[1]) &&
+                ggml_is_contiguous(op) &&
+                ggml_are_same_shape(op->src[0], op->src[1]);
+        }
         case GGML_OP_COUNT_EQUAL:
             return has_simdgroup_reduction &&
                 op->src[0]->type == GGML_TYPE_I32 &&
@@ -1946,6 +1971,13 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             }
         case GGML_OP_GET_ROWS:
             return op->src[0]->type != GGML_TYPE_NVFP4;
+        case GGML_OP_GET_ROWS_BACK:
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_I32 &&
+                op->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(op->src[0]) &&
+                ggml_is_contiguous(op) &&
+                op->ne[2] == 1 && op->ne[3] == 1;
         case GGML_OP_SET_ROWS:
             {
                 if (op->src[0]->type == GGML_TYPE_F16) {
@@ -1974,6 +2006,13 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             }
         case GGML_OP_DIAG:
             return true;
+        case GGML_OP_DIAG_MASK_INF:
+        case GGML_OP_DIAG_MASK_ZERO:
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                op->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(op->src[0]) &&
+                ggml_is_contiguous(op) &&
+                ggml_are_same_shape(op->src[0], op);
         case GGML_OP_OPT_STEP_ADAMW:
             return op->src[0]->type == GGML_TYPE_F32 &&
                 op->src[1]->type == GGML_TYPE_F32 &&

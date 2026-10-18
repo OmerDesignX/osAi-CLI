@@ -226,3 +226,34 @@ template [[host_name("kernel_repeat_bf16")]] kernel kernel_repeat_t kernel_repea
 #endif
 template [[host_name("kernel_repeat_i32")]] kernel kernel_repeat_t kernel_repeat<int>;
 template [[host_name("kernel_repeat_i16")]] kernel kernel_repeat_t kernel_repeat<short>;
+
+kernel void kernel_repeat_back_f32(
+        constant ggml_metal_kargs_repeat & args,
+        device const char * src0,
+        device       char * dst,
+        uint gid [[thread_position_in_grid]]) {
+    const ulong count = (ulong) args.ne0 * args.ne1 * args.ne2 * args.ne3;
+    if ((ulong) gid >= count) {
+        return;
+    }
+
+    ulong rem = gid;
+    const int i0 = rem % args.ne0; rem /= args.ne0;
+    const int i1 = rem % args.ne1; rem /= args.ne1;
+    const int i2 = rem % args.ne2; rem /= args.ne2;
+    const int i3 = rem;
+
+    float sum = 0.0f;
+    for (int r3 = i3; r3 < args.ne03; r3 += args.ne3) {
+        for (int r2 = i2; r2 < args.ne02; r2 += args.ne2) {
+            for (int r1 = i1; r1 < args.ne01; r1 += args.ne1) {
+                for (int r0 = i0; r0 < args.ne00; r0 += args.ne0) {
+                    sum += *(device const float *)
+                        (src0 + r0*args.nb00 + r1*args.nb01 + r2*args.nb02 + r3*args.nb03);
+                }
+            }
+        }
+    }
+    *(device float *)
+        (dst + i0*args.nb0 + i1*args.nb1 + i2*args.nb2 + i3*args.nb3) = sum;
+}

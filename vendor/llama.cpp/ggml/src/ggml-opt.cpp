@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cinttypes>
+#include <cstring>
 #include <array>
 #include <filesystem>
 #include <fstream>
@@ -67,6 +68,7 @@ struct ggml_opt_context {
     struct ggml_cgraph * gb_opt  = nullptr;
     bool static_graphs           = false;
     bool eval_ready              = false;
+    bool placement_reported      = false;
     std::vector<struct ggml_tensor *> grad_accs;
     std::vector<struct ggml_tensor *> grad_m;
     std::vector<struct ggml_tensor *> grad_v;
@@ -1251,6 +1253,52 @@ void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     }
 
     ggml_backend_sched_alloc_graph(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
+
+    if (graph == opt_ctx->gb_opt && !opt_ctx->placement_reported) {
+        int accelerator_nodes = 0;
+        int cpu_nodes = 0;
+        int other_nodes = 0;
+        std::map<std::string, int> cpu_ops;
+        ggml_backend_t primary_backend = ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0);
+        const char * primary_name = primary_backend ? ggml_backend_name(primary_backend) : "unknown";
+        const bool primary_is_cpu = std::strstr(primary_name, "CPU") || std::strstr(primary_name, "BLAS");
+
+        for (int i = 0; i < opt_ctx->allocated_graph_copy->n_nodes; ++i) {
+            struct ggml_tensor * node = opt_ctx->allocated_graph_copy->nodes[i];
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(opt_ctx->backend_sched, node);
+            const char * backend_name = backend ? ggml_backend_name(backend) : nullptr;
+
+            if (backend_name && (std::strstr(backend_name, "CPU") || std::strstr(backend_name, "BLAS"))) {
+                ++cpu_nodes;
+                ++cpu_ops[ggml_op_name(node->op)];
+            } else if (backend_name) {
+                ++accelerator_nodes;
+            } else {
+                ++other_nodes;
+            }
+        }
+
+        GGML_LOG_INFO("osai: training graph placement primary=%s accelerator=%d cpu=%d other=%d\n",
+                primary_name, accelerator_nodes, cpu_nodes, other_nodes);
+        if (accelerator_nodes > 0 && cpu_nodes > 0) {
+            std::ostringstream cpu_summary;
+            int displayed = 0;
+            for (const auto & entry : cpu_ops) {
+                if (displayed++ == 8) {
+                    cpu_summary << ", ...";
+                    break;
+                }
+                if (cpu_summary.tellp() > 0) {
+                    cpu_summary << ", ";
+                }
+                cpu_summary << entry.first << "=" << entry.second;
+            }
+            GGML_LOG_INFO("osai: CPU bookkeeping nodes retained: %s\n", cpu_summary.str().c_str());
+        } else if (!primary_is_cpu && accelerator_nodes == 0 && cpu_nodes > 0) {
+            GGML_LOG_WARN("osai: GPU training placement failed; this graph is running on the CPU\n");
+        }
+        opt_ctx->placement_reported = true;
+    }
     opt_ctx->allocated_graph = graph;
 
     opt_ctx->eval_ready = true;

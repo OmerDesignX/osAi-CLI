@@ -215,6 +215,41 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_repeat(ggml_meta
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_repeat_back(
+        ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_REPEAT_BACK);
+    const char * base = "kernel_repeat_back_f32";
+    auto res = ggml_metal_library_get_pipeline(lib, base);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
+    }
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_diag_mask(
+        ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_DIAG_MASK_INF || op->op == GGML_OP_DIAG_MASK_ZERO);
+    const char * base = op->op == GGML_OP_DIAG_MASK_INF
+        ? "kernel_diag_mask_inf_f32"
+        : "kernel_diag_mask_zero_f32";
+    auto res = ggml_metal_library_get_pipeline(lib, base);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
+    }
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_get_rows_back(
+        ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_GET_ROWS_BACK);
+    const char * base = "kernel_get_rows_back_f32";
+    auto res = ggml_metal_library_get_pipeline(lib, base);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
+    }
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_concat(ggml_metal_library_t lib, ggml_type tsrc) {
     char base[256];
     char name[256];
@@ -476,6 +511,17 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max(ggml_me
 
     res.smem = 32*sizeof(float);
 
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_soft_max_back(
+        ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_SOFT_MAX_BACK);
+    const char * base = "kernel_soft_max_back_f32";
+    auto res = ggml_metal_library_get_pipeline(lib, base);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
+    }
     return res;
 }
 
@@ -2303,6 +2349,28 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cross_entropy_lo
 
     const char * base = "kernel_cross_entropy_loss_back_f32";
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, base);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
+    }
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cross_entropy_loss_row(
+        ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_CROSS_ENTROPY_LOSS);
+    const char * base = "kernel_cross_entropy_loss_row_f32";
+    auto res = ggml_metal_library_get_pipeline(lib, base);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
+    }
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cross_entropy_loss_reduce(
+        ggml_metal_library_t lib, const ggml_tensor * op) {
+    GGML_ASSERT(op->op == GGML_OP_CROSS_ENTROPY_LOSS);
+    const char * base = "kernel_cross_entropy_loss_reduce_f32";
+    auto res = ggml_metal_library_get_pipeline(lib, base);
     if (!res.pipeline) {
         res = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
     }

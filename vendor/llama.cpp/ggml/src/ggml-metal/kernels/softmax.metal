@@ -221,3 +221,35 @@ template [[host_name("kernel_soft_max_f16")]]   kernel kernel_soft_max_t   kerne
 template [[host_name("kernel_soft_max_f32")]]   kernel kernel_soft_max_t   kernel_soft_max<float>;
 template [[host_name("kernel_soft_max_f16_4")]] kernel kernel_soft_max_4_t kernel_soft_max_4<half4>;
 template [[host_name("kernel_soft_max_f32_4")]] kernel kernel_soft_max_4_t kernel_soft_max_4<float4>;
+
+kernel void kernel_soft_max_back_f32(
+        constant ggml_metal_kargs_soft_max_back & args,
+        device const float * grad,
+        device const float * forward,
+        device       float * dst,
+        threadgroup  float * scratch [[threadgroup(0)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint nth [[threads_per_threadgroup]]) {
+    if (row >= (uint) args.nrows) {
+        return;
+    }
+    const uint off = row * args.ncols;
+    float local_dot = 0.0f;
+    for (uint col = tid; col < (uint) args.ncols; col += nth) {
+        local_dot += grad[off + col] * forward[off + col];
+    }
+    scratch[tid] = local_dot;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = nth >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float dot = scratch[0];
+    for (uint col = tid; col < (uint) args.ncols; col += nth) {
+        dst[off + col] = args.scale *
+            (grad[off + col] - dot) * forward[off + col];
+    }
+}
