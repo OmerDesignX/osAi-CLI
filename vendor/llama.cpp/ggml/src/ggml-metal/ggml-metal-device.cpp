@@ -2272,6 +2272,43 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_silu_back(ggml_m
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_out_prod(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_OUT_PROD);
+    GGML_UNUSED(op);
+
+    const char * base = "kernel_out_prod_f32";
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, base);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
+    }
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_rms_norm_back(ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_RMS_NORM_BACK);
+    GGML_UNUSED(op);
+
+    const char * base = "kernel_rms_norm_back_f32";
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, base);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
+    }
+    return res;
+}
+
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_cross_entropy_loss_back(
+        ggml_metal_library_t lib, const ggml_tensor * op) {
+    assert(op->op == GGML_OP_CROSS_ENTROPY_LOSS_BACK);
+    GGML_UNUSED(op);
+
+    const char * base = "kernel_cross_entropy_loss_back_f32";
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, base);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, base, base, nullptr);
+    }
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_memset(ggml_metal_library_t lib, const ggml_tensor *  op) {
     GGML_ASSERT(op->type == GGML_TYPE_I64);
 

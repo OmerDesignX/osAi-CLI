@@ -306,3 +306,49 @@ kernel void kernel_group_norm_f32(
         dst[j] *= scale;
     }
 }
+
+kernel void kernel_rms_norm_back_f32(
+        constant ggml_metal_kargs_rms_norm_back & args,
+        device const float * grad,
+        device const float * x,
+        device       float * dst,
+        threadgroup  float * scratch [[threadgroup(0)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint nth [[threads_per_threadgroup]]) {
+    if (row >= (uint) args.nrows) {
+        return;
+    }
+
+    const uint off = row * args.ncols;
+    threadgroup float * sum_xx = scratch;
+    threadgroup float * sum_xg = scratch + nth;
+
+    float local_xx = 0.0f;
+    float local_xg = 0.0f;
+    for (uint col = tid; col < (uint) args.ncols; col += nth) {
+        const float xi = x[off + col];
+        const float gi = grad[off + col];
+        local_xx = fma(xi, xi, local_xx);
+        local_xg = fma(xi, gi, local_xg);
+    }
+    sum_xx[tid] = local_xx;
+    sum_xg[tid] = local_xg;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = nth >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            sum_xx[tid] += sum_xx[tid + stride];
+            sum_xg[tid] += sum_xg[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float scale_g = rsqrt(sum_xx[0] / (float) args.ncols + args.eps);
+    const float scale_x = -scale_g * sum_xg[0] /
+        (sum_xx[0] + (float) args.ncols * args.eps);
+
+    for (uint col = tid; col < (uint) args.ncols; col += nth) {
+        dst[off + col] = scale_g * grad[off + col] + scale_x * x[off + col];
+    }
+}

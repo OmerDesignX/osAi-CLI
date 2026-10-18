@@ -167,6 +167,17 @@ static bool lora_param_filter(const ggml_tensor * tensor, void * userdata) {
     return ends_with(suffix_a) || ends_with(suffix_b);
 }
 
+static bool osai_uses_metal_devices(const common_params & params) {
+    return std::any_of(params.devices.begin(), params.devices.end(), [](ggml_backend_dev_t dev) {
+        if (dev == nullptr) {
+            return false;
+        }
+        const std::string name = ggml_backend_dev_name(dev);
+        const std::string description = ggml_backend_dev_description(dev);
+        return name.rfind("MTL", 0) == 0 || description.find("Metal") != std::string::npos;
+    });
+}
+
 static bool osai_role_marker_at(
         const std::string & record,
         size_t              offset,
@@ -464,6 +475,11 @@ int main(int argc, char ** argv) {
 
     llama_backend_init();
     llama_numa_init(params.numa);
+    if (osai_uses_metal_devices(params)) {
+        LOG_INF("osai: Metal training kernels active for OUT_PROD, RMS_NORM_BACK, "
+                "CROSS_ENTROPY_LOSS_BACK and optimizer updates; CPU remains for "
+                "dataset and tokenizer orchestration only\n");
+    }
     // load the model and apply lora adapter, if any
     auto llama_init = common_init_from_params(params);
 

@@ -593,3 +593,103 @@ kernel void kernel_dsv4_hc_post_f32(
         *(device float *) (dst + i0*args.nb_d0 + idst*args.nb_d1 + it*args.nb_d2) = result[idst];
     }
 }
+
+// F32 training primitive used by LoRA gradients.  This intentionally avoids
+// simdgroup matrix/reduction features so it can run on Intel-era AMD Metal
+// GPUs as well as Apple Silicon.
+kernel void kernel_out_prod_f32(
+        constant ggml_metal_kargs_out_prod & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        uint gid [[thread_position_in_grid]]) {
+    const ulong ne = (ulong) args.ne0 * args.ne1 * args.ne2 * args.ne3;
+    if ((ulong) gid >= ne) {
+        return;
+    }
+
+    ulong rem = gid;
+    const int i0 = rem % args.ne0; rem /= args.ne0;
+    const int i1 = rem % args.ne1; rem /= args.ne1;
+    const int i2 = rem % args.ne2; rem /= args.ne2;
+    const int i3 = rem;
+
+    const int i02 = i2 / (args.ne2 / args.ne02);
+    const int i03 = i3 / (args.ne3 / args.ne03);
+
+    float sum = 0.0f;
+    for (int k = 0; k < args.ne01; ++k) {
+        const device float * a = (device const float *)
+            (src0 + i0*args.nb00 + k*args.nb01 + i02*args.nb02 + i03*args.nb03);
+        const device float * b = (device const float *)
+            (src1 + i1*args.nb10 + k*args.nb11 + i2*args.nb12 + i3*args.nb13);
+        sum = fma(*a, *b, sum);
+    }
+
+    *(device float *) (dst + i0*args.nb0 + i1*args.nb1 + i2*args.nb2 + i3*args.nb3) = sum;
+}
+
+kernel void kernel_cross_entropy_loss_back_f32(
+        constant ggml_metal_kargs_cross_entropy_loss_back & args,
+        device const float * grad,
+        device const float * logits,
+        device const float * labels,
+        device       float * dst,
+        threadgroup  float * scratch [[threadgroup(0)]],
+        uint row [[threadgroup_position_in_grid]],
+        uint tid [[thread_position_in_threadgroup]],
+        uint nth [[threads_per_threadgroup]]) {
+    if (row >= (uint) args.nrows) {
+        return;
+    }
+
+    const uint off = row * args.nclasses;
+    float local_max = -INFINITY;
+    for (uint col = tid; col < (uint) args.nclasses; col += nth) {
+        local_max = max(local_max, logits[off + col]);
+    }
+    scratch[tid] = local_max;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = nth >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] = max(scratch[tid], scratch[tid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float max_logit = scratch[0];
+
+    float local_exp = 0.0f;
+    for (uint col = tid; col < (uint) args.nclasses; col += nth) {
+        local_exp += exp(logits[off + col] - max_logit);
+    }
+    scratch[tid] = local_exp;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = nth >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inv_sum = 1.0f / scratch[0];
+
+    // osAi's generalized CE accepts one-hot, weighted, and fully masked rows.
+    float local_labels = 0.0f;
+    for (uint col = tid; col < (uint) args.nclasses; col += nth) {
+        local_labels += labels[off + col];
+    }
+    scratch[tid] = local_labels;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = nth >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            scratch[tid] += scratch[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float label_sum = scratch[0];
+    const float scale = grad[0] / (float) args.nrows;
+
+    for (uint col = tid; col < (uint) args.nclasses; col += nth) {
+        const float softmax = exp(logits[off + col] - max_logit) * inv_sum;
+        dst[off + col] = (softmax * label_sum - labels[off + col]) * scale;
+    }
+}

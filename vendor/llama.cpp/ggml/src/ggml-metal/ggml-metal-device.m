@@ -1592,6 +1592,40 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 ggml_is_contiguous(op->src[1]) &&
                 ggml_is_contiguous(op) &&
                 ggml_are_same_shape(op->src[0], op->src[1]);
+        case GGML_OP_OUT_PROD:
+            return (op->src[0]->type == GGML_TYPE_F32) &&
+                (op->src[1]->type == GGML_TYPE_F32) &&
+                (op->type == GGML_TYPE_F32) &&
+                (op->src[0]->nb[0] == sizeof(float)) &&
+                (op->src[1]->nb[0] == sizeof(float)) &&
+                (op->nb[0] == sizeof(float)) &&
+                (op->ne[0] == op->src[0]->ne[0]) &&
+                (op->ne[1] == op->src[1]->ne[0]) &&
+                (op->ne[2] == op->src[1]->ne[2]) &&
+                (op->ne[3] == op->src[1]->ne[3]) &&
+                (op->ne[2] % op->src[0]->ne[2] == 0) &&
+                (op->ne[3] % op->src[0]->ne[3] == 0);
+        case GGML_OP_RMS_NORM_BACK:
+            return (op->src[0]->type == GGML_TYPE_F32) &&
+                (op->src[1]->type == GGML_TYPE_F32) &&
+                (op->type == GGML_TYPE_F32) &&
+                ggml_is_contiguous(op->src[0]) &&
+                ggml_is_contiguous(op->src[1]) &&
+                ggml_is_contiguous(op) &&
+                ggml_are_same_shape(op->src[0], op->src[1]) &&
+                ggml_are_same_shape(op->src[0], op);
+        case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
+            return (op->src[0]->type == GGML_TYPE_F32) &&
+                (op->src[1]->type == GGML_TYPE_F32) &&
+                (op->src[2]->type == GGML_TYPE_F32) &&
+                (op->type == GGML_TYPE_F32) &&
+                ggml_is_scalar(op->src[0]) &&
+                ggml_is_contiguous(op->src[0]) &&
+                ggml_is_contiguous(op->src[1]) &&
+                ggml_is_contiguous(op->src[2]) &&
+                ggml_is_contiguous(op) &&
+                ggml_are_same_shape(op->src[1], op->src[2]) &&
+                ggml_are_same_shape(op->src[1], op);
         case GGML_OP_GLU:
             switch (ggml_get_glu_op(op)) {
                 case GGML_GLU_OP_REGLU:
@@ -1941,8 +1975,23 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_DIAG:
             return true;
         case GGML_OP_OPT_STEP_ADAMW:
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_F32 &&
+                op->src[3]->type == GGML_TYPE_F32 &&
+                op->src[4]->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(op->src[0]) &&
+                ggml_is_contiguous(op->src[1]) &&
+                ggml_is_contiguous(op->src[2]) &&
+                ggml_is_contiguous(op->src[3]) &&
+                ggml_is_contiguous(op->src[4]);
         case GGML_OP_OPT_STEP_SGD:
-            return has_simdgroup_reduction;
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(op->src[0]) &&
+                ggml_is_contiguous(op->src[1]) &&
+                ggml_is_contiguous(op->src[2]);
         default:
             return false;
     }

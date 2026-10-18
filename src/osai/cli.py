@@ -906,6 +906,19 @@ def _fine_tune(args: argparse.Namespace) -> dict[str, Any]:
                 explicitly_selected=args.gguf_batch_size is not None,
             ),
         )
+        # Calibration may raise the usable Metal/CUDA/Vulkan microbatch after
+        # its real training probe. Re-emit the final values so GUI clients do
+        # not keep showing the conservative pre-calibration estimate.
+        print(
+            "osai: auto settings "
+            f"profile={config.auto_profile} "
+            f"budget={config.memory_budget_bytes / 2**30:.1f}GiB "
+            f"context={config.max_seq_length} batch={config.batch_size} "
+            f"gguf_batch={config.gguf_batch_size} layers={config.num_layers} "
+            f"rank={config.rank} threads={config.gguf_threads}",
+            file=sys.stderr,
+            flush=True,
+        )
         print(
             f"osai: calibrated learning rate={calibrated.learning_rate:.2e} "
             f"pilot_loss={calibrated.first_loss:.4f}->{calibrated.last_loss:.4f}",
