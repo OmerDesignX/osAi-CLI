@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,7 +17,7 @@ from osai.calibration import (
     sample_training_data,
 )
 from osai.config import ModelFormat
-from osai.errors import ConfigurationError
+from osai.errors import ConfigurationError, TrainingError
 from osai.formats import ModelInspection, QuantizationSpec
 from osai.hardware import Engine
 
@@ -181,6 +182,95 @@ def test_pilot_microbatch_uses_full_context_headroom_without_model_byte_proxy(mo
         lambda *_: {"CUDA0": 12 * gib, "CUDA1": 12 * gib},
     )
     assert _pilot_microbatch(settings, model, benchmark) == 128
+
+
+def test_metal_pilot_starts_with_a_conservative_microbatch(monkeypatch):
+    gib = 1024**3
+    settings = SimpleNamespace(
+        memory_budget_bytes=64 * gib, max_seq_length=61588, gguf_batch_size=1
+    )
+    model = SimpleNamespace(size_bytes=int(2.5 * gib), context_length=262144)
+    benchmark = SimpleNamespace(devices=("MTL0", "MTL1"), accelerator="metal")
+    monkeypatch.setattr(
+        "osai.calibration.llama_device_free_bytes",
+        lambda *_: {"MTL0": 4 * gib, "MTL1": 8 * gib},
+    )
+
+    assert _pilot_microbatch(settings, model, benchmark) == 64
+
+
+def test_metal_calibration_retries_nonfinite_loss_without_reducing_context(
+    monkeypatch, tmp_path: Path
+):
+    gib = 1024**3
+    model = _model(tmp_path)
+    settings = select_auto_settings(model, engine=Engine.LLAMA_CPP, memory_bytes=64 * gib)
+    settings = replace(settings, max_seq_length=4096, gguf_batch_size=1)
+    benchmark = BenchmarkResult(
+        settings,
+        "llama.cpp",
+        "metal",
+        ("MTL0", "MTL1"),
+        0.1,
+        tensor_split=(3584.0, 7372.8),
+        main_gpu=1,
+    )
+    requested = []
+    progress = []
+    monkeypatch.setattr(
+        "osai.calibration.llama_device_free_bytes",
+        lambda *_: {"MTL0": 4 * gib, "MTL1": 8 * gib},
+    )
+
+    def pilot(_model, _sample, output, *, options, accelerator):
+        requested.append(options)
+        if len(requested) == 1:
+            logs = output / "logs"
+            logs.mkdir(parents=True)
+            (logs / "train.log").write_text(
+                "osai: non-finite supervised loss; stopping before another checkpoint\n",
+                encoding="utf-8",
+            )
+            raise TrainingError("native Metal training failed")
+        manifest = output.parent / "metal-manifest.json"
+        manifest.write_text(
+            json.dumps(
+                {
+                    "options": {
+                        "context": options.context,
+                        "batch_size": options.batch_size,
+                    },
+                    "model_sharded_training": {"devices": ["MTL0", "MTL1"]},
+                }
+            ),
+            encoding="utf-8",
+        )
+        return SimpleNamespace(
+            losses=(0.5, 0.4, 0.3),
+            manifest=manifest,
+            accelerator=accelerator,
+            initial_test_loss=0.5,
+            test_loss=0.3,
+        )
+
+    monkeypatch.setattr("osai.calibration.train_gradient_gguf", pilot)
+    result = calibrate_training(
+        model.path,
+        model,
+        _data(tmp_path),
+        benchmark,
+        engine=Engine.LLAMA_CPP,
+        multi_gpu="on",
+        require_full_context=True,
+        progress=progress.append,
+    )
+
+    assert [options.batch_size for options in requested] == [64, 32]
+    assert all(options.context >= 4096 for options in requested)
+    assert all(options.devices == ("MTL0", "MTL1") for options in requested)
+    assert result.settings.max_seq_length >= 4096
+    assert any("Metal numerical limit" in message for message in progress)
+    assert any("full training pilot remains" in message for message in progress)
 
 
 def test_calibration_bounds_long_examples_without_rewriting_training_data(tmp_path: Path):

@@ -21,7 +21,12 @@ from pathlib import Path
 
 from .auto_benchmark import BenchmarkResult
 from .auto_settings import AutoTrainingSettings
-from .backends.llama_gradient import LlamaGradientOptions, _memory_failure, train_gradient_gguf
+from .backends.llama_gradient import (
+    LlamaGradientOptions,
+    _memory_failure,
+    _nonfinite_supervised_training,
+    train_gradient_gguf,
+)
 from .backends.mlx import MlxBackend
 from .config import ModelFormat, TrainingConfig
 from .dataset import normalize_sft_example, normalized_record_text
@@ -37,6 +42,7 @@ _MAX_TEST_ROWS = 2
 _PILOT_EPOCHS = 3
 _MAX_INSPECTED_ROWS_PER_FILE = 256
 _EVALUATION_CONTEXT_OVERHEAD = 512
+_METAL_PILOT_MAX_MICROBATCH = 64
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,7 +157,17 @@ def _pilot_microbatch(
             and math.ceil(settings.max_seq_length / candidate) * candidate > model.context_length
         ):
             candidate //= 2
-    return max(settings.gguf_batch_size, candidate)
+    candidate = max(settings.gguf_batch_size, candidate)
+    if benchmark.accelerator == "metal":
+        # Older discrete Metal GPUs can load a very large context successfully
+        # but lose numerical stability when the first backward graph contains a
+        # wide token microbatch. This limits only tokens per optimizer pass; the
+        # context, model shards and selected devices remain unchanged.
+        candidate = min(
+            candidate,
+            max(settings.gguf_batch_size, _METAL_PILOT_MAX_MICROBATCH),
+        )
+    return candidate
 
 
 def _pilot_record(record: dict, context: int, excerpt_chars: int, rng: random.Random) -> dict:
@@ -399,6 +415,11 @@ def calibrate_training(
                         batch = settings.gguf_batch_size
                         context = math.ceil(required_context / batch) * batch
                         evaluation_context = _sample_evaluation_context(sample, context, batch)
+                        notify(
+                            "phase=pilot detail=Scoring the bounded sample at "
+                            f"{evaluation_context} tokens; full training pilot remains "
+                            f"{context} tokens with microbatch {batch}"
+                        )
                         try:
                             native = train_gradient_gguf(
                                 model_source,
@@ -431,12 +452,21 @@ def calibrate_training(
                             )
                             break
                         except OsAiError:
-                            logs = (output / "logs").glob("train*.log")
-                            if batch <= 1 or not any(_memory_failure(log) for log in logs):
+                            logs = tuple((output / "logs").glob("train*.log"))
+                            memory_failure = any(_memory_failure(log) for log in logs)
+                            metal_numerical_failure = benchmark.accelerator == "metal" and any(
+                                _nonfinite_supervised_training(log) for log in logs
+                            )
+                            if batch <= 1 or not (memory_failure or metal_numerical_failure):
                                 raise
                             settings = replace(settings, gguf_batch_size=max(1, batch // 2))
+                            reason = (
+                                "Metal numerical limit"
+                                if metal_numerical_failure
+                                else "GPU memory limit"
+                            )
                             notify(
-                                "phase=pilot detail=GPU memory limit; retrying with "
+                                f"phase=pilot detail={reason}; retrying the same full context with "
                                 f"microbatch {settings.gguf_batch_size}"
                             )
                             output = root / f"trial-{index}-batch-{settings.gguf_batch_size}"

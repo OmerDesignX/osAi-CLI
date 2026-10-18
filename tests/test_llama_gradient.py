@@ -9,6 +9,7 @@ from osai.backends.llama_gradient import (
     _gradient_command,
     _lower_auto_context,
     _memory_failure,
+    _nonfinite_supervised_training,
     _parse_best_checkpoint,
     _parse_epoch_losses,
     _parse_optimizer_steps,
@@ -122,6 +123,16 @@ def test_auto_context_retries_gpu_memory_errors_without_losing_labels(tmp_path: 
     assert environment["OSAI_MAX_SEQ_LENGTH"] == "512"
     assert manifest["options"]["context"] == 512
     assert manifest["auto_context_retries"][0]["reason"]
+
+
+def test_nonfinite_training_failure_is_distinct_and_offset_aware(tmp_path: Path):
+    log = tmp_path / "train.log"
+    marker = "osai: non-finite supervised loss; stopping before another checkpoint"
+    log.write_text(marker, encoding="utf-8")
+    assert _nonfinite_supervised_training(log)
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write("\nunsupported ggml op for backward pass")
+    assert not _nonfinite_supervised_training(log, len(marker))
 
 
 def test_parallel_adapter_combination_preserves_weighted_lora_delta(tmp_path: Path):

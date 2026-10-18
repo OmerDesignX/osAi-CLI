@@ -57,6 +57,9 @@ _SUPERVISED_STEP_RE = re.compile(r"supervised optimizer step labels=\d+")
 _CHECKPOINT_RE = re.compile(r"checkpoint epoch=(\d+)\s+best_train_loss=([0-9.eE+-]+)")
 _SUPERVISED_EVAL_RE = re.compile(r"eval_loss=([0-9.eE+-]+)")
 _NONFINITE_SUPERVISED_EVAL_RE = re.compile(r"eval_loss=(?:nan|[+-]?inf)", re.IGNORECASE)
+_NONFINITE_SUPERVISED_TRAIN_RE = re.compile(
+    r"non-finite supervised loss|train_loss=(?:nan|[+-]?inf)", re.IGNORECASE
+)
 _SUPERVISED_LABELS_RE = re.compile(r"assistant-only loss enabled for (\d+) labels")
 _ELAPSED_RE = re.compile(r"\bt=(\d+):(\d+):(\d+)")
 _SUPPORTED_TARGETS = frozenset(DEFAULT_TARGETS)
@@ -1061,6 +1064,17 @@ def _memory_failure(log_path: Path, offset: int = 0) -> bool:
             "out of memory",
         )
     )
+
+
+def _nonfinite_supervised_training(log_path: Path, offset: int = 0) -> bool:
+    """Recognize a numerical training failure without treating it as an OOM."""
+
+    if not log_path.is_file():
+        return False
+    with log_path.open("rb") as handle:
+        handle.seek(max(offset, log_path.stat().st_size - 16_384))
+        tail = handle.read().decode("utf-8", errors="replace")
+    return _NONFINITE_SUPERVISED_TRAIN_RE.search(tail) is not None
 
 
 def _retryable_accelerator_failure(log_path: Path, offset: int = 0) -> bool:
