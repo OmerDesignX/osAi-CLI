@@ -20,6 +20,7 @@ from ..hardware import (
     select_llama_accelerator,
 )
 from ..io import atomic_json
+from ..multi_gpu import _native_device_probe_timeout
 from ..offline import offline_environment
 from ..paths import llama_binary, llama_cpp_root, llama_runtime_build
 from ..process import ProcessResult, run_logged
@@ -411,10 +412,7 @@ def _verify_native_backend(
             [str(binary), "--list-devices"],
             capture_output=True,
             text=True,
-            # Metal can spend tens of seconds compiling its first shader
-            # library on older Intel Macs.  Keep this bounded, but do not
-            # misclassify a healthy Radeon backend as missing while it warms.
-            timeout=90,
+            timeout=_native_device_probe_timeout(accelerator),
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:

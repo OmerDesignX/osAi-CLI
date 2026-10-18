@@ -220,6 +220,27 @@ def test_metal_build_verification_accepts_every_enumerated_gpu(monkeypatch, tmp_
     llama_cpp._verify_native_backend(tmp_path, Accelerator.METAL)
 
 
+def test_metal_build_verification_allows_legacy_shader_warmup(monkeypatch, tmp_path):
+    suffix = ".exe" if os.name == "nt" else ""
+    binary = tmp_path / "bin" / f"llama-completion{suffix}"
+    binary.parent.mkdir()
+    binary.write_bytes(b"binary")
+    observed = {}
+
+    def run(*_args, **kwargs):
+        observed["timeout"] = kwargs["timeout"]
+        return SimpleNamespace(
+            returncode=0,
+            stdout="Available devices:\n  MTL0: Radeon RX 580\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(llama_cpp.subprocess, "run", run)
+    llama_cpp._verify_native_backend(tmp_path, Accelerator.METAL)
+
+    assert observed["timeout"] == 15 * 60
+
+
 def test_gpu_build_verification_rejects_a_cpu_only_package(monkeypatch, tmp_path):
     suffix = ".exe" if os.name == "nt" else ""
     binary = tmp_path / "bin" / f"llama-completion{suffix}"

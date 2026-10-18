@@ -8,12 +8,19 @@ from osai.config import ModelFormat, TrainingConfig
 from osai.errors import ConfigurationError
 from osai.hardware import Accelerator
 from osai.multi_gpu import (
+    _native_device_probe_timeout,
     automatic_llama_device_plan,
     available_llama_devices,
     llama_device_arguments,
     llama_device_free_bytes,
     llama_device_inventory_details,
 )
+
+
+def test_legacy_metal_discovery_gets_a_longer_shader_warmup_window():
+    assert _native_device_probe_timeout(Accelerator.METAL) == 15 * 60
+    assert _native_device_probe_timeout(Accelerator.CUDA) == 90
+    assert _native_device_probe_timeout(Accelerator.VULKAN) == 90
 
 
 def _config(tmp_path: Path, **changes) -> TrainingConfig:

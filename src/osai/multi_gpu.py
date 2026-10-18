@@ -242,9 +242,7 @@ def _llama_device_report(binary: Path, accelerator: Accelerator):
             [str(binary), "--list-devices"],
             capture_output=True,
             text=True,
-            # The first Metal process can compile its shader library before it
-            # can enumerate devices, especially on Intel Macs with AMD GPUs.
-            timeout=90,
+            timeout=_native_device_probe_timeout(accelerator),
             check=False,
         )
     except subprocess.TimeoutExpired as exc:
@@ -263,6 +261,15 @@ def _llama_device_report(binary: Path, accelerator: Accelerator):
             + (f": {detail}" if detail else "")
         )
     return result, output
+
+
+def _native_device_probe_timeout(accelerator: Accelerator) -> int:
+    """Allow legacy Metal drivers to finish their one-time shader warmup."""
+
+    # Intel Macs with multiple discrete AMD GPUs can spend several minutes in
+    # Metal's shader compiler before llama.cpp prints its device inventory.
+    # CUDA and Vulkan enumeration should remain fast enough to fail promptly.
+    return 15 * 60 if accelerator is Accelerator.METAL else 90
 
 
 def _bounded_device_diagnostic(output: str) -> str:
